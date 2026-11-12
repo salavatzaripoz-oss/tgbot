@@ -33,60 +33,32 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 ai_client = AsyncOpenAI(api_key=AI_API_KEY, base_url=AI_BASE_URL)
 
-# --- БАЗА МОДЕЛЕЙ (С поддержкой статуса доступности) ---
+# --- БАЗА МОДЕЛЕЙ ---
 DEFAULT_MODEL = "gpt-6-luna"
 
 models_db = {
-    "deepseek-flash": {"name": "DeepSeek Flash", "premium": False, "vision": False, "available": True},
-    "deepseek-v4.1-flash-1017": {"name": "DeepSeek v4.1", "premium": False, "vision": False, "available": True},
-    "gemini-3.5-flash-lite": {"name": "Gemini 3.5 Lite", "premium": False, "vision": False, "available": True},
-    "gemini-3.6-flash": {"name": "Gemini 3.6 Flash", "premium": False, "vision": True, "available": True},
-    "gemini-3.8-flash": {"name": "Gemini 3.8 Flash", "premium": False, "vision": True, "available": True},
-    "gpt-6-luna": {"name": "GPT-6 Luna", "premium": False, "vision": True, "available": True},
-    "gpt-6-so": {"name": "GPT-6 SO", "premium": False, "vision": True, "available": True},
-    "sonnet-5": {"name": "Claude 5 Sonnet", "premium": False, "vision": True, "available": True},
-    "fable-5.1": {"name": "Claude 5.1 Fable", "premium": False, "vision": False, "available": True},
-    "gpt-6.1-sol": {"name": "GPT-6.1 Sol", "premium": True, "vision": True, "available": True},
-    "gpt-6-astra": {"name": "GPT-6 Astra", "premium": True, "vision": True, "available": True},
-    "opus-5.5": {"name": "Claude 5.5 Opus", "premium": True, "vision": True, "available": True},
-    "opus-5": {"name": "Claude 5 Opus", "premium": True, "vision": True, "available": True},
-    "sonnet-5.5": {"name": "Claude 5.5 Sonnet", "premium": True, "vision": True, "available": True},
-    "gemini-4-argon": {"name": "Gemini 4 Argon", "premium": True, "vision": True, "available": True},
-    "grok-4.7": {"name": "Grok 4.7", "premium": True, "vision": True, "available": True},
-    "deepseek-r1": {"name": "DeepSeek R1", "premium": True, "vision": False, "available": True}
+    "deepseek-flash": {"name": "DeepSeek Flash", "premium": False, "vision": False},
+    "deepseek-v4.1-flash-1017": {"name": "DeepSeek v4.1", "premium": False, "vision": False},
+    "gemini-3.5-flash-lite": {"name": "Gemini 3.5 Lite", "premium": False, "vision": False},
+    "gemini-3.6-flash": {"name": "Gemini 3.6 Flash", "premium": False, "vision": True},
+    "gemini-3.8-flash": {"name": "Gemini 3.8 Flash", "premium": False, "vision": True},
+    "gpt-6-luna": {"name": "GPT-6 Luna", "premium": False, "vision": True},
+    "gpt-6-so": {"name": "GPT-6 SO", "premium": False, "vision": True},
+    "sonnet-5": {"name": "Claude 5 Sonnet", "premium": False, "vision": True},
+    "fable-5.1": {"name": "Claude 5.1 Fable", "premium": False, "vision": False},
+    "gpt-6.1-sol": {"name": "GPT-6.1 Sol", "premium": True, "vision": True},
+    "gpt-6-astra": {"name": "GPT-6 Astra", "premium": True, "vision": True},
+    "opus-5.5": {"name": "Claude 5.5 Opus", "premium": True, "vision": True},
+    "opus-5": {"name": "Claude 5 Opus", "premium": True, "vision": True},
+    "sonnet-5.5": {"name": "Claude 5.5 Sonnet", "premium": True, "vision": True},
+    "gemini-4-argon": {"name": "Gemini 4 Argon", "premium": True, "vision": True},
+    "grok-4.7": {"name": "Grok 4.7", "premium": True, "vision": True},
+    "deepseek-r1": {"name": "DeepSeek R1", "premium": True, "vision": False}
 }
 
 users_db = {}
 anti_spam = {}
 admin_reply_target = {}
-
-# --- ФОНОВЫЙ ПИНГЕР МОДЕЛЕЙ ---
-async def model_checker_loop():
-    global DEFAULT_MODEL
-    while True:
-        for m_id in list(models_db.keys()):
-            try:
-                # Тестовый микро-запрос для проверки работоспособности
-                await ai_client.chat.completions.create(
-                    model=m_id,
-                    messages=[{"role": "user", "content": "ping"}],
-                    max_tokens=1
-                )
-                models_db[m_id]["available"] = True
-            except Exception:
-                models_db[m_id]["available"] = False
-                # Если дефолтная модель упала — ищем первую рабочую бесплатную
-                if m_id == DEFAULT_MODEL:
-                    for alt_id, alt_data in models_db.items():
-                        if alt_data["available"] and not alt_data["premium"]:
-                            DEFAULT_MODEL = alt_id
-                            break
-            
-            # ВАЖНО: пауза 3 секунды между моделями, чтобы провайдер не забанил за спам
-            await asyncio.sleep(3) 
-            
-        # Ждем 3 минуты перед следующим полным кругом проверки
-        await asyncio.sleep(180) 
 
 # --- УПРАВЛЕНИЕ ЮЗЕРАМИ ---
 def get_user(user_id: int) -> dict:
@@ -126,7 +98,7 @@ def get_user(user_id: int) -> dict:
         user["reset_date"] = now + timedelta(days=30)
         
     curr = user["current_model"]
-    if curr not in models_db or not models_db[curr]["available"] or (models_db[curr]["premium"] and not user["is_sub"]):
+    if curr not in models_db or (models_db[curr]["premium"] and not user["is_sub"]):
         user["current_model"] = DEFAULT_MODEL
         
     return user
@@ -284,10 +256,6 @@ async def menu_models(message: Message):
     buttons = []
     
     for m_id, data in models_db.items():
-        if not data["available"]:
-            buttons.append([InlineKeyboardButton(text=f"🔴 {data['name']} (Офлайн)", callback_data="ignore")])
-            continue
-            
         prefix = "✅ " if u["current_model"] == m_id else ""
         lock = " 🔒" if data["premium"] and not u["is_sub"] else ""
         vis = " 🖼" if data["vision"] else ""
@@ -720,8 +688,6 @@ async def handle_requests(message: Message):
         await temp.edit_text(f"❌ Ошибка API: {str(e)}")
 
 async def main():
-    # Запуск пингера моделей в фоне
-    asyncio.create_task(model_checker_loop()) 
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

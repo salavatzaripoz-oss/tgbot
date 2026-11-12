@@ -66,10 +66,10 @@ async def model_checker_loop():
     while True:
         for m_id in list(models_db.keys()):
             try:
-                # Отправляем микро-запрос для проверки работоспособности
+                # Тестовый микро-запрос для проверки работоспособности
                 await ai_client.chat.completions.create(
                     model=m_id,
-                    messages=[{"role": "user", "content": "1"}],
+                    messages=[{"role": "user", "content": "ping"}],
                     max_tokens=1
                 )
                 models_db[m_id]["available"] = True
@@ -81,7 +81,12 @@ async def model_checker_loop():
                         if alt_data["available"] and not alt_data["premium"]:
                             DEFAULT_MODEL = alt_id
                             break
-        await asyncio.sleep(5) # Пауза между проверками моделей
+            
+            # ВАЖНО: пауза 3 секунды между моделями, чтобы провайдер не забанил за спам
+            await asyncio.sleep(3) 
+            
+        # Ждем 3 минуты перед следующим полным кругом проверки
+        await asyncio.sleep(180) 
 
 # --- УПРАВЛЕНИЕ ЮЗЕРАМИ ---
 def get_user(user_id: int) -> dict:
@@ -546,7 +551,7 @@ async def handle_requests(message: Message):
         u["state"] = None
         return await message.answer(f"✅ Тема Школы: {u['school']['topic']}", reply_markup=get_school_main_kb(u))
 
-    # Анти-спам
+    # Анти-спам с сообщением юзеру
     now = datetime.now()
     if uid in anti_spam and (now - anti_spam[uid]).total_seconds() < 2.5: 
         return await message.answer("⏳ Пожалуйста, не спамьте. Подождите пару секунд.")
@@ -641,7 +646,13 @@ async def handle_requests(message: Message):
     if u["web_search"] and raw_text:
         net = await search_internet(raw_text)
         if net: 
-            sys_prompt += f"\n[ДАННЫЕ ИЗ ИНТЕРНЕТА]:\n{net}\nТЫ ИМЕЕШЬ доступ к интернету. Обязательно используй эти данные в ответе!"
+            sys_prompt += (
+                f"\n\n[ВНИМАНИЕ! ТЕБЕ ДАН ДОСТУП В ИНТЕРНЕТ]\n"
+                f"Пользователь запросил свежие данные. Вот результаты поиска:\n{net}\n"
+                f"ОБЯЗАТЕЛЬНО используй эту информацию для ответа. Никогда не говори, что у тебя нет доступа к сети!"
+            )
+        else:
+            sys_prompt += "\n\n[Системное сообщение: Поиск включен, но результатов не найдено. Отвечай по своей базе знаний.]"
         
     messages_payload = [{"role": "system", "content": sys_prompt}]
     

@@ -16,15 +16,25 @@ SUB_LIMIT = int(os.getenv("SUB_LIMIT"))
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT")
 
 # In-memory БД для моделей (можно добавлять/редактировать в рантайме)
+# In-memory БД для моделей
 models_db = {
-    "gpt-4o-mini": {"name": "GPT-4o Mini", "premium": False, "vision": True},
-    "gpt-4o": {"name": "GPT-4o", "premium": True, "vision": True},
-    "claude-3-5-sonnet-20241022": {"name": "Claude 3.5 Sonnet", "premium": True, "vision": True},
-    "claude-3-haiku-20240307": {"name": "Claude 3 Haiku", "premium": False, "vision": False},
-    "gemini-1.5-pro": {"name": "Gemini 1.5 Pro", "premium": True, "vision": True},
-    "gemini-1.5-flash": {"name": "Gemini 1.5 Flash", "premium": False, "vision": True},
-    "deepseek-chat": {"name": "DeepSeek V3", "premium": False, "vision": False},
-    "deepseek-reasoner": {"name": "DeepSeek R1", "premium": True, "vision": False}
+    "gpt-6.1-sol": {"name": "GPT-6.1 Sol", "premium": True, "vision": True},
+    "gpt-6-astra": {"name": "GPT-6 Astra", "premium": True, "vision": True},
+    "gpt-6-so": {"name": "GPT-6 SO", "premium": False, "vision": True},
+    "gpt-6-luna": {"name": "GPT-6 Luna", "premium": False, "vision": True},
+    "opus-5.5": {"name": "Claude 5.5 Opus", "premium": True, "vision": True},
+    "opus-5": {"name": "Claude 5 Opus", "premium": True, "vision": True},
+    "sonnet-5.5": {"name": "Claude 5.5 Sonnet", "premium": True, "vision": True},
+    "sonnet-5": {"name": "Claude 5 Sonnet", "premium": False, "vision": True},
+    "fable-5.1": {"name": "Claude 5.1 Fable", "premium": False, "vision": False},
+    "gemini-4-argon": {"name": "Gemini 4 Argon", "premium": True, "vision": True},
+    "gemini-3.8-flash": {"name": "Gemini 3.8 Flash", "premium": False, "vision": True},
+    "gemini-3.6-flash": {"name": "Gemini 3.6 Flash", "premium": False, "vision": True},
+    "gemini-3.5-flash-lite": {"name": "Gemini 3.5 Flash Lite", "premium": False, "vision": False},
+    "grok-4.7": {"name": "Grok 4.7", "premium": True, "vision": True},
+    "deepseek-flash": {"name": "DeepSeek Flash", "premium": False, "vision": False},
+    "deepseek-v4.1-flash-1017": {"name": "DeepSeek v4.1", "premium": False, "vision": False},
+    "deepseek-r1": {"name": "DeepSeek R1", "premium": True, "vision": False}
 }
 
 users_db = {}

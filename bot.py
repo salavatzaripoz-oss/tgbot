@@ -81,20 +81,33 @@ async def model_checker_loop():
                         if alt_data["available"] and not alt_data["premium"]:
                             DEFAULT_MODEL = alt_id
                             break
-            await asyncio.sleep(3) # Пауза между проверками моделей
+        await asyncio.sleep(5) # Пауза между проверками моделей
 
 # --- УПРАВЛЕНИЕ ЮЗЕРАМИ ---
 def get_user(user_id: int) -> dict:
     now = datetime.now()
     if user_id not in users_db:
         users_db[user_id] = {
-            "is_sub": False, "sub_end": None, "tokens": 0, "reset_date": now + timedelta(days=30),
-            "current_model": DEFAULT_MODEL, "custom_prompt": "", "web_search": False,
-            "banned": False, "strikes": 0, "history": [], "state": None,
+            "is_sub": False, 
+            "sub_end": None, 
+            "tokens": 0, 
+            "reset_date": now + timedelta(days=30),
+            "current_model": DEFAULT_MODEL, 
+            "custom_prompt": "", 
+            "web_search": False,
+            "banned": False, 
+            "strikes": 0, 
+            "history": [], 
+            "state": None,
             "school": {
-                "active": False, "grade": "9 класс", "quarter": "1 четверть",
-                "level": "Средний", "hw_type": "Письменное", "topic": "Общая",
-                "training_mode": False, "training_samples": []
+                "active": False, 
+                "grade": "9 класс", 
+                "quarter": "1 четверть",
+                "level": "Средний", 
+                "hw_type": "Письменное", 
+                "topic": "Общая",
+                "training_mode": False, 
+                "training_samples": []
             }
         }
     user = users_db[user_id]
@@ -102,6 +115,7 @@ def get_user(user_id: int) -> dict:
     if user["is_sub"] and user["sub_end"] and now > user["sub_end"]:
         user["is_sub"] = False
         user["sub_end"] = None
+        
     if now >= user["reset_date"]:
         user["tokens"] = 0
         user["reset_date"] = now + timedelta(days=30)
@@ -117,32 +131,43 @@ def get_main_kb(user_id: int):
     u = get_user(user_id)
     web_Icon = "🟢 ВКЛ" if u["web_search"] else "🔴 ВЫКЛ"
     school_Icon = "🎓 Школа (Активна)" if u["school"]["active"] else "🎓 Режим Школы"
+    
     kb = [
         [KeyboardButton(text="🧠 Модели ИИ"), KeyboardButton(text="👤 Профиль")],
         [KeyboardButton(text=school_Icon), KeyboardButton(text=f"🌐 Поиск: {web_Icon}")],
         [KeyboardButton(text="⚙️ Свой промпт"), KeyboardButton(text="🧹 Очистить память")],
         [KeyboardButton(text="💎 Подписка / Связь")]
     ]
-    if user_id == ADMIN_ID: kb.append([KeyboardButton(text="👑 Админ-панель")])
+    
+    if user_id == ADMIN_ID: 
+        kb.append([KeyboardButton(text="👑 Админ-панель")])
+        
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 def get_school_main_kb(u: dict):
     s = u["school"]
     status = "🟢 ВКЛЮЧЕН" if s["active"] else "🔴 ВЫКЛЮЧЕН"
+    
     buttons = [
         [InlineKeyboardButton(text=f"Статус режима: {status}", callback_data="sch_toggle")],
-        [InlineKeyboardButton(text=f"🏫 Класс: {s['grade']}", callback_data="sch_menu_grade"),
-         InlineKeyboardButton(text=f"📅 Четверть: {s['quarter']}", callback_data="sch_menu_quarter")],
-        [InlineKeyboardButton(text=f"📊 Уровень: {s['level']}", callback_data="sch_menu_level"),
-         InlineKeyboardButton(text=f"📝 Д/З: {s['hw_type']}", callback_data="sch_menu_hw")],
+        [
+            InlineKeyboardButton(text=f"🏫 Класс: {s['grade']}", callback_data="sch_menu_grade"),
+            InlineKeyboardButton(text=f"📅 Четверть: {s['quarter']}", callback_data="sch_menu_quarter")
+        ],
+        [
+            InlineKeyboardButton(text=f"📊 Уровень: {s['level']}", callback_data="sch_menu_level"),
+            InlineKeyboardButton(text=f"📝 Д/З: {s['hw_type']}", callback_data="sch_menu_hw")
+        ],
         [InlineKeyboardButton(text=f"📌 Тема: {s['topic'][:20]}", callback_data="sch_topic")]
     ]
+    
     if s["hw_type"] == "Письменное":
         train_st = "🟢 ВКЛ" if s["training_mode"] else "🔴 ВЫКЛ"
         cnt = len(s["training_samples"])
         buttons.append([InlineKeyboardButton(text=f"🧠 Режим Обучения: {train_st} (Примеров: {cnt})", callback_data="sch_train_toggle")])
         if cnt > 0:
             buttons.append([InlineKeyboardButton(text="🗑 Очистить примеры", callback_data="sch_train_clear")])
+            
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
@@ -153,20 +178,29 @@ async def extract_document_text(message: Message) -> str:
     file = await bot.get_file(doc.file_id)
     bio = io.BytesIO()
     await bot.download_file(file.file_path, destination=bio)
-    try: return bio.getvalue().decode("utf-8")
-    except UnicodeDecodeError: return bio.getvalue().decode("cp1251", errors="ignore")
+    try: 
+        return bio.getvalue().decode("utf-8")
+    except UnicodeDecodeError: 
+        return bio.getvalue().decode("cp1251", errors="ignore")
 
 async def search_internet(query: str) -> str:
-    if not SEARCH_AVAILABLE: return ""
+    if not SEARCH_AVAILABLE: 
+        return ""
+        
     def fetch():
-        with DDGS() as ddgs: return list(ddgs.text(query, max_results=3))
+        with DDGS() as ddgs: 
+            return list(ddgs.text(query, max_results=3))
+            
     try:
         results = await asyncio.to_thread(fetch)
-        if not results: return ""
+        if not results: 
+            return ""
         text = "АКТУАЛЬНЫЕ ДАННЫЕ ИЗ СЕТИ:\n"
-        for r in results: text += f"- {r.get('body')}\n"
+        for r in results: 
+            text += f"- {r.get('body')}\n"
         return text
-    except Exception: return ""
+    except Exception: 
+        return ""
 
 async def photo_to_base64(file_id: str) -> str:
     file = await bot.get_file(file_id)
@@ -176,7 +210,9 @@ async def photo_to_base64(file_id: str) -> str:
     return f"data:image/jpeg;base64,{encoded}"
 
 async def check_censorship(text: str) -> tuple[bool, str]:
-    if not text or len(text.strip()) < 3: return True, ""
+    if not text or len(text.strip()) < 3: 
+        return True, ""
+        
     try:
         resp = await ai_client.chat.completions.create(
             model=DEFAULT_MODEL,
@@ -187,54 +223,82 @@ async def check_censorship(text: str) -> tuple[bool, str]:
             max_tokens=20
         )
         ans = resp.choices[0].message.content.strip()
-        if ans.startswith("UNSAFE"): return False, ans.split("|", 1)[-1].strip() if "|" in ans else "Ответь безопасно."
+        if ans.startswith("UNSAFE"): 
+            if "|" in ans:
+                return False, ans.split("|", 1)[-1].strip()
+            else:
+                return False, "Ответь безопасно."
         return True, ""
-    except: return True, ""
+    except Exception: 
+        return True, ""
 
 # --- БАЗОВЫЕ КОМАНДЫ ---
 @dp.message(CommandStart())
 async def start_cmd(message: Message):
     u = get_user(message.from_user.id)
-    if u["banned"]: return await message.answer("🚫 Вы заблокированы.")
+    if u["banned"]: 
+        return await message.answer("🚫 Вы заблокированы.")
     u["state"] = None
     await message.answer("👋 **Добро пожаловать в ШколоAI!**", reply_markup=get_main_kb(message.from_user.id), parse_mode="Markdown")
 
 @dp.message(F.text == "🧹 Очистить память")
 async def clear_memory(message: Message):
-    get_user(message.from_user.id)["history"] = []
+    u = get_user(message.from_user.id)
+    u["history"] = []
     await message.answer("🧹 **Контекст очищен!** ИИ забыл предыдущий диалог (полезно при смене темы).", parse_mode="Markdown")
 
 @dp.message(F.text == "👤 Профиль")
 @dp.message(Command("stats"))
 async def show_profile(message: Message):
-    uid = message.from_user.id; u = get_user(uid)
+    uid = message.from_user.id
+    u = get_user(uid)
     limit = SUB_LIMIT if u["is_sub"] else FREE_LIMIT
     pct = (u["tokens"] / limit) * 100 if limit > 0 else 100
     st = "💎 Premium" if u["is_sub"] else "🆓 Бесплатно"
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💎 Купить подписку", callback_data="buy_sub_prompt")]]) if not u["is_sub"] else None
-    await message.answer(f"👤 **Профиль**\n🏷 Статус: {st}\n🧠 Модель: {models_db.get(u['current_model'], {}).get('name')}\n📊 Токены: `{u['tokens']} / {limit}` ({pct:.1f}%)\n🔄 Сброс: {u['reset_date'].strftime('%d.%m.%Y')}", reply_markup=kb, parse_mode="Markdown")
+    
+    kb = None
+    if not u["is_sub"]:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💎 Купить подписку", callback_data="buy_sub_prompt")]
+        ])
+        
+    await message.answer(
+        f"👤 **Профиль**\n"
+        f"🏷 Статус: {st}\n"
+        f"🧠 Модель: {models_db.get(u['current_model'], {}).get('name')}\n"
+        f"📊 Токены: `{u['tokens']} / {limit}` ({pct:.1f}%)\n"
+        f"🔄 Сброс: {u['reset_date'].strftime('%d.%m.%Y')}", 
+        reply_markup=kb, 
+        parse_mode="Markdown"
+    )
 
 # --- МЕНЮ МОДЕЛЕЙ ---
 @dp.message(F.text == "🧠 Модели ИИ")
 async def menu_models(message: Message):
     u = get_user(message.from_user.id)
     buttons = []
+    
     for m_id, data in models_db.items():
         if not data["available"]:
             buttons.append([InlineKeyboardButton(text=f"🔴 {data['name']} (Офлайн)", callback_data="ignore")])
             continue
+            
         prefix = "✅ " if u["current_model"] == m_id else ""
         lock = " 🔒" if data["premium"] and not u["is_sub"] else ""
         vis = " 🖼" if data["vision"] else ""
+        
         buttons.append([InlineKeyboardButton(text=f"{prefix}{data['name']}{vis}{lock}", callback_data=f"setmod_{m_id}")])
+        
     await message.answer("🧠 **Выберите нейросеть:**", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
 
 @dp.callback_query(F.data.startswith("setmod_"))
 async def cb_set_model(callback: CallbackQuery):
     m_id = callback.data.replace("setmod_", "")
     u = get_user(callback.from_user.id)
+    
     if models_db[m_id]["premium"] and not u["is_sub"] and callback.from_user.id != ADMIN_ID:
         return await callback.answer("🔒 Нужна подписка Premium!", show_alert=True)
+        
     u["current_model"] = m_id
     await callback.message.edit_text(f"✅ Выбрана модель: **{models_db[m_id]['name']}**", parse_mode="Markdown")
 
@@ -243,33 +307,48 @@ async def cb_set_model(callback: CallbackQuery):
 async def menu_custom_prompt(message: Message):
     u = get_user(message.from_user.id)
     u["state"] = "wait_prompt"
+    
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🗑 Сбросить промпт", callback_data="reset_prompt")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_state")]
     ])
-    await message.answer(f"⚙️ **Ваш текущий промпт:** _{u['custom_prompt'] or 'Стандартный'}_\nНапишите в чат новый системный промпт:", reply_markup=kb, parse_mode="Markdown")
+    
+    current_prompt = u['custom_prompt'] if u['custom_prompt'] else 'Стандартный'
+    await message.answer(f"⚙️ **Ваш текущий промпт:** _{current_prompt}_\nНапишите в чат новый системный промпт:", reply_markup=kb, parse_mode="Markdown")
 
 @dp.callback_query(F.data == "reset_prompt")
 async def cb_reset_prompt(callback: CallbackQuery):
-    get_user(callback.from_user.id)["custom_prompt"] = ""
+    u = get_user(callback.from_user.id)
+    u["custom_prompt"] = ""
     await callback.message.edit_text("✅ Промпт сброшен.")
 
 @dp.callback_query(F.data == "cancel_state")
 async def cb_cancel_state(callback: CallbackQuery):
-    get_user(callback.from_user.id)["state"] = None
+    u = get_user(callback.from_user.id)
+    u["state"] = None
     await callback.message.edit_text("❌ Действие отменено.")
 
 # --- ПОДПИСКА И СВЯЗЬ ---
 @dp.message(F.text == "💎 Подписка / Связь")
 async def menu_subscription(message: Message):
-    get_user(message.from_user.id)["state"] = "support_chat"
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_state")]])
+    u = get_user(message.from_user.id)
+    u["state"] = "support_chat"
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_state")]
+    ])
+    
     await message.answer("💎 **Premium (100к токенов + Топ ИИ)**\n\n✍️ Напишите любое сообщение админу прямо сейчас для оформления или связи:", reply_markup=kb, parse_mode="Markdown")
 
 @dp.callback_query(F.data == "buy_sub_prompt")
 async def cb_buy_sub_prompt(callback: CallbackQuery):
-    get_user(callback.from_user.id)["state"] = "support_chat"
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_state")]])
+    u = get_user(callback.from_user.id)
+    u["state"] = "support_chat"
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_state")]
+    ])
+    
     await callback.message.answer("✍️ **Напишите сообщение администратору:**", reply_markup=kb, parse_mode="Markdown")
     await callback.answer()
 
@@ -277,45 +356,67 @@ async def cb_buy_sub_prompt(callback: CallbackQuery):
 @dp.message(F.text == "👑 Админ-панель")
 @dp.message(Command("admin"))
 async def admin_panel_cmd(message: Message):
-    if message.from_user.id != ADMIN_ID: return
+    if message.from_user.id != ADMIN_ID: 
+        return
     await message.answer("👑 **Админка**\n`/give_sub <ID> <дней>`\n`/ban <ID>`", parse_mode="Markdown")
 
 @dp.message(Command("give_sub"))
 async def cmd_give_sub(message: Message):
-    if message.from_user.id != ADMIN_ID: return
+    if message.from_user.id != ADMIN_ID: 
+        return
+        
     try:
         _, tid, days = message.text.split()
-        tid, days = int(tid), int(days)
+        tid = int(tid)
+        days = int(days)
         u = get_user(tid)
-        u["is_sub"], u["sub_end"] = True, datetime.now() + timedelta(days=days)
+        u["is_sub"] = True
+        u["sub_end"] = datetime.now() + timedelta(days=days)
         await message.answer(f"✅ Выдано `{tid}` на {days} дней.", parse_mode="Markdown")
-        try: await bot.send_message(tid, f"🎉 Вам выдана подписка Premium на {days} дней!")
-        except: pass
-    except: await message.answer("Формат: `/give_sub ID 30`", parse_mode="Markdown")
+        try: 
+            await bot.send_message(tid, f"🎉 Вам выдана подписка Premium на {days} дней!")
+        except Exception: 
+            pass
+    except Exception: 
+        await message.answer("Формат: `/give_sub ID 30`", parse_mode="Markdown")
 
 @dp.message(Command("ban"))
 async def cmd_ban_user(message: Message):
-    if message.from_user.id != ADMIN_ID: return
+    if message.from_user.id != ADMIN_ID: 
+        return
+        
     try:
         tid = int(message.text.split()[1])
-        get_user(tid)["banned"] = not get_user(tid)["banned"]
+        u = get_user(tid)
+        u["banned"] = not u["banned"]
         await message.answer(f"✅ Статус бана `{tid}` изменен.", parse_mode="Markdown")
-    except: await message.answer("Формат: `/ban ID`", parse_mode="Markdown")
+    except Exception: 
+        await message.answer("Формат: `/ban ID`", parse_mode="Markdown")
 
 @dp.callback_query(F.data.startswith("adm_"))
 async def cb_admin_actions(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID: return
+    if callback.from_user.id != ADMIN_ID: 
+        return
+        
     data = callback.data
+    
     if data.startswith("adm_ban_"):
-        get_user(int(data.replace("adm_ban_", "")))["banned"] = True
+        tid = int(data.replace("adm_ban_", ""))
+        u = get_user(tid)
+        u["banned"] = True
         await callback.answer("Пользователь забанен!")
+        
     elif data.startswith("adm_sub_"):
         tid = int(data.replace("adm_sub_", ""))
         u = get_user(tid)
-        u["is_sub"], u["sub_end"] = True, datetime.now() + timedelta(days=30)
+        u["is_sub"] = True
+        u["sub_end"] = datetime.now() + timedelta(days=30)
         await callback.answer("Подписка выдана!")
-        try: await bot.send_message(tid, "🎉 Выдана подписка Premium!")
-        except: pass
+        try: 
+            await bot.send_message(tid, "🎉 Выдана подписка Premium!")
+        except Exception: 
+            pass
+            
     elif data.startswith("adm_reply_"):
         tid = int(data.replace("adm_reply_", ""))
         admin_reply_target[ADMIN_ID] = tid
@@ -325,24 +426,38 @@ async def cb_admin_actions(callback: CallbackQuery):
 # --- ШКОЛА СЕТКИ ---
 @dp.message(F.text.startswith("🎓"))
 async def menu_school(message: Message):
-    await message.answer("🎓 **Режим Школа**", reply_markup=get_school_main_kb(get_user(message.from_user.id)), parse_mode="Markdown")
+    u = get_user(message.from_user.id)
+    await message.answer("🎓 **Режим Школа**", reply_markup=get_school_main_kb(u), parse_mode="Markdown")
 
 @dp.callback_query(F.data.startswith("sch_menu_"))
 async def cb_school_menus(callback: CallbackQuery):
     action = callback.data.replace("sch_menu_", "")
     buttons = []
+    
     if action == "grade":
         row = []
         for i in range(1, 12):
             row.append(InlineKeyboardButton(text=f"{i} кл", callback_data=f"sch_set_grade_{i} класс"))
-            if len(row) == 4: buttons.append(row); row = []
-        if row: buttons.append(row)
+            if len(row) == 4: 
+                buttons.append(row)
+                row = []
+        if row: 
+            buttons.append(row)
+            
     elif action == "quarter":
-        for i in range(1, 5): buttons.append([InlineKeyboardButton(text=f"{i} четверть", callback_data=f"sch_set_quarter_{i} четверть")])
+        for i in range(1, 5): 
+            buttons.append([InlineKeyboardButton(text=f"{i} четверть", callback_data=f"sch_set_quarter_{i} четверть")])
+            
     elif action == "level":
-        for l in ["Начальный (просто)", "Средний", "Продвинутый (Олимпиада)"]: buttons.append([InlineKeyboardButton(text=l, callback_data=f"sch_set_level_{l}")])
+        levels = ["Начальный (просто)", "Средний", "Продвинутый (Олимпиада)"]
+        for l in levels: 
+            buttons.append([InlineKeyboardButton(text=l, callback_data=f"sch_set_level_{l}")])
+            
     elif action == "hw":
-        for h in ["Письменное", "Проект", "Творческое", "Пересказ"]: buttons.append([InlineKeyboardButton(text=h, callback_data=f"sch_set_hw_{h}")])
+        hws = ["Письменное", "Проект", "Творческое", "Пересказ"]
+        for h in hws: 
+            buttons.append([InlineKeyboardButton(text=h, callback_data=f"sch_set_hw_{h}")])
+            
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="sch_back_main")])
     await callback.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
@@ -350,22 +465,31 @@ async def cb_school_menus(callback: CallbackQuery):
 async def cb_school_set(callback: CallbackQuery):
     u = get_user(callback.from_user.id)
     param, val = callback.data.replace("sch_set_", "").split("_", 1)
-    if param in ["grade", "quarter", "level", "hw"]: u["school"][param] = val
+    
+    if param in ["grade", "quarter", "level", "hw"]: 
+        u["school"][param] = val
+        
     await callback.message.edit_reply_markup(reply_markup=get_school_main_kb(u))
 
 @dp.callback_query(F.data == "sch_back_main")
 async def cb_school_back(callback: CallbackQuery):
-    await callback.message.edit_reply_markup(reply_markup=get_school_main_kb(get_user(callback.from_user.id)))
+    u = get_user(callback.from_user.id)
+    await callback.message.edit_reply_markup(reply_markup=get_school_main_kb(u))
 
 @dp.callback_query(F.data.startswith("sch_"))
 async def cb_school_others(callback: CallbackQuery):
     u = get_user(callback.from_user.id)
-    if callback.data == "sch_toggle": u["school"]["active"] = not u["school"]["active"]
+    
+    if callback.data == "sch_toggle": 
+        u["school"]["active"] = not u["school"]["active"]
     elif callback.data == "sch_topic":
         u["state"] = "school_topic"
         return await callback.message.answer("📌 Введите название темы:")
-    elif callback.data == "sch_train_toggle": u["school"]["training_mode"] = not u["school"]["training_mode"]
-    elif callback.data == "sch_train_clear": u["school"]["training_samples"].clear()
+    elif callback.data == "sch_train_toggle": 
+        u["school"]["training_mode"] = not u["school"]["training_mode"]
+    elif callback.data == "sch_train_clear": 
+        u["school"]["training_samples"].clear()
+        
     await callback.message.edit_reply_markup(reply_markup=get_school_main_kb(u))
 
 # --- ПЕРЕКЛЮЧАТЕЛИ ---
@@ -373,13 +497,17 @@ async def cb_school_others(callback: CallbackQuery):
 async def toggle_web(message: Message):
     u = get_user(message.from_user.id)
     u["web_search"] = not u["web_search"]
-    await message.answer(f"🌐 Поиск: {'ВКЛ' if u['web_search'] else 'ВЫКЛ'}", reply_markup=get_main_kb(message.from_user.id))
+    status_text = 'ВКЛ' if u['web_search'] else 'ВЫКЛ'
+    await message.answer(f"🌐 Поиск: {status_text}", reply_markup=get_main_kb(message.from_user.id))
 
 # --- ГЛАВНЫЙ ОБРАБОТЧИК ---
 @dp.message(F.text | F.photo | F.document)
 async def handle_requests(message: Message):
-    uid = message.from_user.id; u = get_user(uid)
-    if u["banned"]: return
+    uid = message.from_user.id
+    u = get_user(uid)
+    
+    if u["banned"]: 
+        return
 
     # Ответ админа
     if uid == ADMIN_ID and ADMIN_ID in admin_reply_target and message.text:
@@ -387,13 +515,17 @@ async def handle_requests(message: Message):
         try:
             await bot.send_message(target_id, f"👨‍💻 **Администратор:**\n\n{message.text}", parse_mode="Markdown")
             return await message.answer("✅ Ответ доставлен.")
-        except Exception as e: return await message.answer(f"❌ Ошибка отправки: {e}")
+        except Exception as e: 
+            return await message.answer(f"❌ Ошибка отправки: {e}")
 
     # Чат поддержки
     if u["state"] == "support_chat" and message.text:
         u["state"] = None
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✍️ Ответить", callback_data=f"adm_reply_{uid}"), InlineKeyboardButton(text="💎 Выдать Sub (30д)", callback_data=f"adm_sub_{uid}")],
+            [
+                InlineKeyboardButton(text="✍️ Ответить", callback_data=f"adm_reply_{uid}"), 
+                InlineKeyboardButton(text="💎 Выдать Sub (30д)", callback_data=f"adm_sub_{uid}")
+            ],
             [InlineKeyboardButton(text="🚫 Бан", callback_data=f"adm_ban_{uid}")]
         ])
         await bot.send_message(ADMIN_ID, f"📩 **Связь от `{uid}`**:\n\n{message.text}", reply_markup=kb, parse_mode="Markdown")
@@ -402,22 +534,28 @@ async def handle_requests(message: Message):
     # Свой промпт
     if u["state"] == "wait_prompt" and message.text:
         is_safe, rule = await check_censorship(message.text)
-        if not is_safe: return await message.answer("❌ Промпт не прошел цензуру.")
-        u["custom_prompt"], u["state"] = message.text[:400], None
+        if not is_safe: 
+            return await message.answer("❌ Промпт не прошел цензуру.")
+        u["custom_prompt"] = message.text[:400]
+        u["state"] = None
         return await message.answer("✅ Промпт сохранен!")
 
     # Тема школы
     if u["state"] == "school_topic" and message.text:
-        u["school"]["topic"] = message.text[:50]; u["state"] = None
+        u["school"]["topic"] = message.text[:50]
+        u["state"] = None
         return await message.answer(f"✅ Тема Школы: {u['school']['topic']}", reply_markup=get_school_main_kb(u))
 
     # Анти-спам
     now = datetime.now()
-    if uid in anti_spam and (now - anti_spam[uid]).total_seconds() < 2: return
+    if uid in anti_spam and (now - anti_spam[uid]).total_seconds() < 2: 
+        return
     anti_spam[uid] = now
 
+    # Лимиты
     limit = SUB_LIMIT if u["is_sub"] else FREE_LIMIT
-    if u["tokens"] >= limit and uid != ADMIN_ID: return await message.answer("❌ Лимит токенов исчерпан.")
+    if u["tokens"] >= limit and uid != ADMIN_ID: 
+        return await message.answer("❌ Лимит токенов исчерпан.")
 
     # Обработка документов
     raw_text = message.text or message.caption or ""
@@ -434,57 +572,94 @@ async def handle_requests(message: Message):
             try:
                 res = await ai_client.chat.completions.create(
                     model=vis_mod,
-                    messages=[{"role": "user", "content": [{"type": "text", "text": "Разбери алгоритм и оформление решения с этого фото:"}, {"type": "image_url", "image_url": {"url": b64_img}}]}]
+                    messages=[
+                        {
+                            "role": "user", 
+                            "content": [
+                                {"type": "text", "text": "Разбери алгоритм и оформление решения с этого фото:"}, 
+                                {"type": "image_url", "image_url": {"url": b64_img}}
+                            ]
+                        }
+                    ]
                 )
                 s["training_samples"].append(f"[Пример]: {res.choices[0].message.content}")
                 u["tokens"] += res.usage.total_tokens if res.usage else 200
-            except Exception as e: return await message.answer(f"❌ Ошибка распознавания: {e}")
+            except Exception as e: 
+                return await message.answer(f"❌ Ошибка распознавания: {e}")
         else:
             s["training_samples"].append(f"[Пример текста]: {raw_text}")
-        return await message.answer(f"🧠 Пример #{len(s['training_samples'])} сохранен! Отключи Режим Обучения для решения ДЗ.", reply_markup=get_school_main_kb(u))
+            
+        return await message.answer(
+            f"🧠 Пример #{len(s['training_samples'])} сохранен! Отключи Режим Обучения для решения ДЗ.", 
+            reply_markup=get_school_main_kb(u)
+        )
 
     # Цензура
     is_safe, safety_rule = await check_censorship(raw_text)
     if not is_safe:
         u["strikes"] += 1
         if u["strikes"] >= 3:
-            try: await bot.send_message(ADMIN_ID, f"⚠️ Бан-лог: {uid} | Запрос: {raw_text[:200]}")
-            except: pass
+            try: 
+                await bot.send_message(ADMIN_ID, f"⚠️ Бан-лог: {uid} | Запрос: {raw_text[:200]}")
+            except Exception: 
+                pass
 
     # Кубик Школы
     dice_style = ""
     if s["active"] and s["hw_type"] in ["Проект", "Творческое", "Пересказ"]:
-        dm = await message.answer_dice("🎲"); await asyncio.sleep(2.2)
-        styles = {1: "Строго научно", 2: "Креативно с примерами", 3: "С тезисами и планом", 4: "Сторителлинг", 5: "Аналитически за и против", 6: "Подробно на 5+"}
+        dm = await message.answer_dice("🎲")
+        await asyncio.sleep(2.2)
+        styles = {
+            1: "Строго научно", 
+            2: "Креативно с примерами", 
+            3: "С тезисами и планом", 
+            4: "Сторителлинг", 
+            5: "Аналитически за и против", 
+            6: "Подробно на 5+"
+        }
         dice_style = styles.get(dm.dice.value, "")
         await message.answer(f"🎲 Выпало {dm.dice.value}! Стиль: {dice_style}")
 
     # Сборка промпта
     sys_prompt = BASE_SYSTEM_PROMPT
-    if u["custom_prompt"]: sys_prompt += f"\nСвой промпт юзера: {u['custom_prompt']}"
+    if u["custom_prompt"]: 
+        sys_prompt += f"\nСвой промпт юзера: {u['custom_prompt']}"
+        
     if s["active"]:
         sys_prompt += f"\n[ШКОЛА]: Ученик {s['grade']}, {s['quarter']}, уровень: {s['level']}. Тема: {s['topic']}. Тип: {s['hw_type']}."
-        if dice_style: sys_prompt += f" Стиль выполнения: {dice_style}."
+        if dice_style: 
+            sys_prompt += f" Стиль выполнения: {dice_style}."
+            
         if s["topic"] != "Общая":
             edu_ctx = await search_internet(f"школьная программа {s['grade']} тема {s['topic']} что должны знать")
-            if edu_ctx: sys_prompt += f"\n[ЗНАНИЯ КЛАССА]: {edu_ctx}"
+            if edu_ctx: 
+                sys_prompt += f"\n[ЗНАНИЯ КЛАССА]: {edu_ctx}"
+                
         if s["hw_type"] == "Письменное" and s["training_samples"]:
             sys_prompt += "\nИспользуй строго этот метод решения: " + "\n".join(s["training_samples"][-5:])
             
     if u["web_search"] and raw_text:
         net = await search_internet(raw_text)
-        if net: sys_prompt += f"\n[ДАННЫЕ ИЗ ИНТЕРНЕТА]:\n{net}\nТЫ ИМЕЕШЬ доступ к интернету. Обязательно используй эти данные в ответе!"
+        if net: 
+            sys_prompt += f"\n[ДАННЫЕ ИЗ ИНТЕРНЕТА]:\n{net}\nТЫ ИМЕЕШЬ доступ к интернету. Обязательно используй эти данные в ответе!"
         
     messages_payload = [{"role": "system", "content": sys_prompt}]
     
     # История
-    for msg in u["history"]: messages_payload.append(msg)
+    for msg in u["history"]: 
+        messages_payload.append(msg)
     
     # Содержимое
     if message.photo:
         mod = u["current_model"] if models_db[u["current_model"]]["vision"] else "gpt-6-luna"
         b64 = await photo_to_base64(message.photo[-1].file_id)
-        current_msg = {"role": "user", "content": [{"type": "text", "text": raw_text or "Опиши фото"}, {"type": "image_url", "image_url": {"url": b64}}]}
+        current_msg = {
+            "role": "user", 
+            "content": [
+                {"type": "text", "text": raw_text or "Опиши фото"}, 
+                {"type": "image_url", "image_url": {"url": b64}}
+            ]
+        }
         messages_payload.append(current_msg)
     else:
         current_msg = {"role": "user", "content": raw_text}
@@ -492,32 +667,50 @@ async def handle_requests(message: Message):
 
     # Отправка и стриминг
     temp = await message.answer("⏳ Думаю...")
-    resp_text = ""; last_ed = time.time()
+    resp_text = ""
+    last_ed = time.time()
     
     try:
-        stream = await ai_client.chat.completions.create(model=u["current_model"], messages=messages_payload, stream=True)
+        stream = await ai_client.chat.completions.create(
+            model=u["current_model"], 
+            messages=messages_payload, 
+            stream=True
+        )
+        
         async for chunk in stream:
             if chunk.choices and chunk.choices[0].delta.content:
                 resp_text += chunk.choices[0].delta.content
                 if time.time() - last_ed > 1.2 and resp_text:
-                    try: await temp.edit_text(resp_text[:4000] + " ✍️"); last_ed = time.time()
-                    except: pass
+                    try: 
+                        await temp.edit_text(resp_text[:4000] + " ✍️")
+                        last_ed = time.time()
+                    except Exception: 
+                        pass
         
-        try: await temp.delete()
-        except: pass
+        try: 
+            await temp.delete()
+        except Exception: 
+            pass
         
-        for i in range(0, len(resp_text), 4000): await message.answer(resp_text[i:i+4000])
+        for i in range(0, len(resp_text), 4000): 
+            await message.answer(resp_text[i:i+4000])
         
-        u["history"].append({"role": "user", "content": raw_text if not message.photo else "[Фото/Документ]"})
+        # Запись в память
+        user_hist = raw_text if not message.photo else "[Фото/Документ]"
+        u["history"].append({"role": "user", "content": user_hist})
         u["history"].append({"role": "assistant", "content": resp_text})
-        if len(u["history"]) > 10: u["history"] = u["history"][-10:] # Ограничение памяти до 5 последних пар
+        
+        if len(u["history"]) > 10: 
+            u["history"] = u["history"][-10:] # Ограничение памяти
+            
         u["tokens"] += max(50, len(resp_text) // 3)
 
     except Exception as e:
         await temp.edit_text(f"❌ Ошибка API: {str(e)}")
 
 async def main():
-    asyncio.create_task(model_checker_loop()) # Запуск пингера моделей в фоне
+    # Запуск пингера моделей в фоне
+    asyncio.create_task(model_checker_loop()) 
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

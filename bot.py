@@ -6,6 +6,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from openai import AsyncOpenAI
 
+# Переменные читаются напрямую из среды BotHost (dotenv удален)
 bot = Bot(token=os.getenv("BOT_TOKEN"))
 dp = Dispatcher()
 ai_client = AsyncOpenAI(api_key=os.getenv("AI_API_KEY"), base_url=os.getenv("AI_BASE_URL"))
@@ -15,7 +16,6 @@ FREE_LIMIT = int(os.getenv("FREE_LIMIT"))
 SUB_LIMIT = int(os.getenv("SUB_LIMIT"))
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT")
 
-# In-memory БД для моделей (можно добавлять/редактировать в рантайме)
 # In-memory БД для моделей
 models_db = {
     "gpt-6.1-sol": {"name": "GPT-6.1 Sol", "premium": True, "vision": True},
@@ -48,7 +48,7 @@ def get_user(user_id: int) -> dict:
             "sub_end": None, 
             "tokens": 0, 
             "reset_date": now + timedelta(days=30),
-            "current_model": "gpt-4o-mini"
+            "current_model": "gpt-6-luna" # Базовая бесплатная модель
         }
     
     user = users_db[user_id]
@@ -63,10 +63,10 @@ def get_user(user_id: int) -> dict:
         user["tokens"] = 0
         user["reset_date"] = now + timedelta(days=30)
         
-    # Защита, если текущая модель удалена админом или стала платной
+    # Защита, если текущая модель удалена или стала платной без подписки
     current = user["current_model"]
     if current not in models_db or (models_db[current]["premium"] and not user["is_sub"]):
-        user["current_model"] = "gpt-4o-mini" # Возврат на базу
+        user["current_model"] = "gpt-6-luna" 
         
     return user
 

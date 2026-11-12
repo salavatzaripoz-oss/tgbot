@@ -548,8 +548,8 @@ async def handle_requests(message: Message):
 
     # Анти-спам
     now = datetime.now()
-    if uid in anti_spam and (now - anti_spam[uid]).total_seconds() < 2: 
-        return
+    if uid in anti_spam and (now - anti_spam[uid]).total_seconds() < 2.5: 
+        return await message.answer("⏳ Пожалуйста, не спамьте. Подождите пару секунд.")
     anti_spam[uid] = now
 
     # Лимиты

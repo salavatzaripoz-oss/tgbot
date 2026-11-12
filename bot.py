@@ -650,8 +650,13 @@ async def handle_requests(message: Message):
     last_ed = time.time()
     
     try:
+        # ЗАЩИТА: Если пользователь кинул фото, а текущая модель слепая — принудительно ставим gpt-6-luna
+        active_model = u["current_model"]
+        if message.photo and not models_db.get(active_model, {}).get("vision", False):
+            active_model = "gpt-6-luna"
+
         stream = await ai_client.chat.completions.create(
-            model=u["current_model"], 
+            model=active_model, 
             messages=messages_payload, 
             stream=True
         )

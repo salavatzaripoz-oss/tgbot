@@ -37,7 +37,7 @@ dp = Dispatcher()
 ai_client = AsyncOpenAI(api_key=AI_API_KEY, base_url=AI_BASE_URL)
 
 # --- БАЗА МОДЕЛЕЙ (Базовая — самая экономная deepseek-flash) ---
-DEFAULT_MODEL = "deepseek-flash"
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
 
 models_db = {
     "deepseek-flash": {"name": "DeepSeek Flash (Базовая ⚡)", "premium": False, "vision": False},

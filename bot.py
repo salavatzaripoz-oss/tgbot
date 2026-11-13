@@ -1245,43 +1245,31 @@ async def create_chat_completion(**kwargs):
 # --- РАСПОЗНАВАНИЕ ИЗОБРАЖЕНИЙ (VISION) ---
 VISION_REFUSAL_MARKERS = (
     "не могу просматривать", "не вижу изображен", "не могу увидеть",
-    "не могу анализировать изображ", "не умею анализировать изображ",
-    "не поддерживаю изображения", "модель не поддерживает изображения",
     "cannot see the image", "can't view images", "unable to view",
-    "cannot analyze images", "can't analyze images", "image input is not supported",
-    "does not support image", "doesn't support images", "text-only model",
     "я текстовая модель", "не умею работать с изображениями",
     "не могу открыть изображен", "пришлите текст"
 )
 
 
 def get_vision_fallback_models(preferred_model: str) -> list[str]:
-    """Возвращает все модели, которым администратор явно включил Vision.
+    candidates = []
+    if preferred_model:
+        candidates.append(preferred_model)
 
-    Флаг models_db[model_id]["vision"] — единственный источник информации
-    о поддержке картинок. Сначала пробуем выбранную пользователем модель,
-    затем остальные модели с Vision в заданном приоритете и порядке каталога.
-    """
     priority_vision = [
         "gpt-6-luna", "gemini-3.8-flash", "gemini-3.6-flash",
         "gpt-6-so", "sonnet-5", "gpt-6.1-sol", "gemini-4-argon",
-        "opus-5.5", "sonnet-5.5", "grok-4.7", "gpt-6-astra", "opus-5"
+        "opus-5.5", "sonnet-5.5", "grok-4.7"
     ]
-    available = [model_id for model_id, info in models_db.items() if info.get("vision")]
-    ordered: list[str] = []
+    for m in priority_vision:
+        if m in models_db and m not in candidates:
+            candidates.append(m)
 
-    if preferred_model in available:
-        ordered.append(preferred_model)
+    for m, info in models_db.items():
+        if info.get("vision") and m not in candidates:
+            candidates.append(m)
 
-    for model_id in priority_vision:
-        if model_id in available and model_id not in ordered:
-            ordered.append(model_id)
-
-    for model_id in available:
-        if model_id not in ordered:
-            ordered.append(model_id)
-
-    return ordered
+    return candidates or [DEFAULT_MODEL]
 
 
 def _vision_content_to_text(content: Any) -> str:
@@ -1320,16 +1308,13 @@ async def create_vision_completion(
     sys_prompt: str,
     history: list[dict],
     user_text: str,
-    b64_image: str,
-    user: dict,
-    progress_callback: Callable[[str, int, int], Awaitable[None]] | None = None,
-) -> dict:
-    """Последовательно пробует доступные Vision-модели до первого полезного ответа.
+    b64_image: str
+) -> str:
+    """Отправляет уменьшенное корректно размеченное изображение в Vision API.
 
-    Используется только каталог моделей с включённым флагом ``vision``.
-    Токены каждого ответа/отказа суммируются. Стоимость каждого вызова резервируется
-    до запроса и сверяется по usage после ответа. В пределах одной операции действует
-    общий предел 20% месячного бюджета подписки, а не отдельные 20% на каждую модель.
+    Не запускает каскад десятков моделей и не обрывает нормальный ответ коротким
+    asyncio.wait_for. Сначала используется выбранная Vision-модель, затем одна
+    резервная. Подробности отказа провайдера сохраняются в лог.
     """
     prompt_text = user_text.strip() if user_text and user_text.strip() else (
         "Внимательно изучи изображение. Если на нём текст, задача или код — распознай "
@@ -1344,11 +1329,21 @@ async def create_vision_completion(
             context_lines.append(f"{role}: {content[:250]}")
     context = "Контекст диалога:\n" + "\n".join(context_lines) + "\n\n" if context_lines else ""
 
-    candidates = get_vision_fallback_models(preferred_model)
+    candidates = []
+    if preferred_model and models_db.get(preferred_model, {}).get("vision"):
+        candidates.append(preferred_model)
+    # Берём только одну резервную модель, а не перебираем всю базу.
+    fallback_model = next(
+        (model_id for model_id in get_vision_fallback_models(preferred_model)
+         if model_id != preferred_model and models_db.get(model_id, {}).get("vision")),
+        None
+    )
+    if fallback_model:
+        candidates.append(fallback_model)
     if not candidates:
         raise RuntimeError(
-            "В каталоге нет моделей с включённой поддержкой изображений. "
-            "В админ-панели моделей включите флаг Vision хотя бы для одной модели."
+            f"Для выбранной модели «{preferred_model}» не заявлена поддержка изображений, "
+            "а резервная Vision-модель не настроена. Выберите модель с поддержкой фото."
         )
 
     payload = [
@@ -1359,179 +1354,59 @@ async def create_vision_completion(
         ]}
     ]
 
-    # 2 000 единиц — консервативная оценка изображения 1600 px при detail=auto.
-    # Реальные значения prompt_tokens от провайдера имеют приоритет над оценкой.
-    estimated_input = max(
-        2000,
-        estimate_request_tokens(sys_prompt) + estimate_request_tokens(context + prompt_text) + 2000,
-    )
-    max_output_tokens = 1800
-    estimated_call_cost = (
-        estimate_ai_cost_rub(estimated_input, max_output_tokens) * 1.20
-        + VISION_IMAGE_COST_RUB
-    )
-
-    failures: list[str] = []
-    models_tried: list[str] = []
-    total_input_tokens = 0
-    total_output_tokens = 0
-    operation_cost_rub = 0.0
-    api_attempts = 0
-    stop_chain = False
-
-    for model_index, model_id in enumerate(candidates, start=1):
-        model_name = models_db.get(model_id, {}).get("name", model_id)
-        if progress_callback:
-            try:
-                await progress_callback(str(model_name), model_index, len(candidates))
-            except Exception:
-                pass
-
-        # Второй base URL пробуем только если первый явно не нашёл маршрут.
-        route_clients = [ai_clients[0]]
-        route_labels = ["primary"]
-        route_index = 0
-        model_failed = False
-
-        while route_index < len(route_clients):
-            plan = normalize_plan(user)
-            if plan != "free" and operation_cost_rub + estimated_call_cost > request_cost_cap(user) + 1e-9:
-                failures.append(
-                    f"Продолжение остановлено: суммарная оценка попыток превысила лимит "
-                    f"{request_cost_cap(user):.2f} ₽ на одну операцию (20% бюджета тарифа)."
-                )
-                stop_chain = True
-                break
-
-            affordable, budget_error = can_afford_request(
-                user,
-                estimated_input,
-                max_output_tokens,
-                extra_cost_rub=VISION_IMAGE_COST_RUB,
+    failures = []
+    # Альтернативный URL пробуем только при явной ошибке маршрута. При сетевой
+    # ошибке/таймауте не повторяем изображение другой моделью: провайдер мог уже
+    # принять и тарифицировать запрос.
+    for model_index, model_id in enumerate(candidates):
+        client = ai_clients[0]
+        try:
+            response = await client.chat.completions.create(
+                model=model_id,
+                messages=payload,
+                max_tokens=1800,
+                stream=False
             )
-            if not affordable:
-                failures.append(f"Продолжение остановлено по бюджету: {budget_error}")
-                stop_chain = True
-                break
+            answer = _vision_content_to_text(response.choices[0].message.content)
+            if answer and not any(marker in answer.lower() for marker in VISION_REFUSAL_MARKERS):
+                return answer
+            failures.append(f"{model_id}: API вернул пустой ответ или отказ по изображению")
+        except Exception as exc:
+            status = getattr(exc, "status_code", None)
+            reason = _format_vision_error(exc)
+            failures.append(f"{model_id}: {reason}")
+            print(f"[VISION] {model_id}: {reason}")
 
-            reserved = reserve_request_cost(
-                user,
-                estimated_input,
-                max_output_tokens,
-                extra_cost_rub=VISION_IMAGE_COST_RUB,
-            )
-            api_attempts += 1
-            models_tried.append(model_id)
-            print(
-                f"[VISION] Попытка {api_attempts}: {model_id} "
-                f"({model_index}/{len(candidates)}), url={route_labels[route_index]}"
-            )
-
-            try:
-                response = await route_clients[route_index].chat.completions.create(
-                    model=model_id,
-                    messages=payload,
-                    max_tokens=max_output_tokens,
-                    stream=False,
-                )
-                answer = _vision_content_to_text(response.choices[0].message.content)
-                usage = getattr(response, "usage", None)
-                prompt_used = getattr(usage, "prompt_tokens", None) if usage else None
-                completion_used = getattr(usage, "completion_tokens", None) if usage else None
-
-                if prompt_used is None or completion_used is None:
-                    total_reported = getattr(usage, "total_tokens", None) if usage else None
-                    if total_reported is not None:
-                        prompt_used = min(int(total_reported), estimated_input)
-                        completion_used = max(0, int(total_reported) - int(prompt_used))
-                    else:
-                        prompt_used = estimated_input
-                        completion_used = estimate_request_tokens(answer) if answer else 40
-
-                prompt_used = max(0, int(prompt_used))
-                completion_used = max(0, int(completion_used))
-                total_input_tokens += prompt_used
-                total_output_tokens += completion_used
-                actual_cost = record_ai_usage(
-                    user,
-                    prompt_used,
-                    completion_used,
-                    extra_cost_rub=VISION_IMAGE_COST_RUB,
-                    reserved_cost_rub=reserved,
-                )
-                operation_cost_rub += actual_cost
-
-                if answer and not any(marker in answer.lower() for marker in VISION_REFUSAL_MARKERS):
-                    print(
-                        f"[VISION] Успех: {model_id}; попыток={api_attempts}; "
-                        f"токены={total_input_tokens + total_output_tokens}; "
-                        f"расход={operation_cost_rub:.4f} ₽"
+            # 404/405 могут означать, что провайдер ожидает другой вариант base URL.
+            # 400/422 обычно указывают, что модель не принимает vision payload.
+            if status in (404, 405) and len(ai_clients) > 1:
+                try:
+                    response = await ai_clients[1].chat.completions.create(
+                        model=model_id,
+                        messages=payload,
+                        max_tokens=1800,
+                        stream=False
                     )
-                    return {
-                        "answer": answer,
-                        "input_tokens": total_input_tokens,
-                        "output_tokens": total_output_tokens,
-                        "total_tokens": total_input_tokens + total_output_tokens,
-                        "attempts": api_attempts,
-                        "models_tried": models_tried,
-                        "cost_rub": operation_cost_rub,
-                    }
-
-                failures.append(f"{model_id}: модель вернула пустой ответ или отказ по изображению")
-                model_failed = True
+                    answer = _vision_content_to_text(response.choices[0].message.content)
+                    if answer and not any(marker in answer.lower() for marker in VISION_REFUSAL_MARKERS):
+                        return answer
+                    failures.append(f"{model_id} / резервный URL: пустой ответ или отказ")
+                except Exception as fallback_exc:
+                    fallback_reason = _format_vision_error(fallback_exc)
+                    failures.append(f"{model_id} / резервный URL: {fallback_reason}")
+                    print(f"[VISION] {model_id} / резервный URL: {fallback_reason}")
+            elif status not in (400, 404, 405, 422):
+                # Не делаем второй платный запрос, когда неизвестно, получил ли
+                # первый провайдер изображение. Пользователь увидит точную ошибку.
                 break
 
-            except Exception as exc:
-                status = getattr(exc, "status_code", None)
-                reason = _format_vision_error(exc)
-                failures.append(f"{model_id}: {reason}")
-                print(f"[VISION] {model_id}: {reason}")
+        print(f"[VISION] Модель {model_index + 1}/{len(candidates)} завершена")
 
-                # 404/405 — вероятная ошибка варианта маршрута; проверяем второй URL
-                # той же модели. Сам отказ маршрута не учитываем как оплаченный.
-                if status in (404, 405):
-                    record_ai_usage(user, 0, 0, 0.0, reserved_cost_rub=reserved)
-                    if route_index == 0 and len(ai_clients) > 1:
-                        route_clients.append(ai_clients[1])
-                        route_labels.append("alternate")
-                        route_index += 1
-                        continue
-                    model_failed = True
-                    break
-
-                # Явные ошибки формата/прав/авторизации обычно не тарифицируются.
-                if status in (400, 401, 403, 413, 415, 422):
-                    record_ai_usage(user, 0, 0, 0.0, reserved_cost_rub=reserved)
-                else:
-                    # При таймауте/5xx провайдер мог принять запрос, поэтому
-                    # учитываем консервативную стоимость входа и изображения.
-                    total_input_tokens += estimated_input
-                    operation_cost_rub += record_ai_usage(
-                        user,
-                        estimated_input,
-                        0,
-                        extra_cost_rub=VISION_IMAGE_COST_RUB,
-                        reserved_cost_rub=reserved,
-                    )
-
-                if status in (401, 403):
-                    failures.append("Ключ API не имеет доступа; перебор прекращён")
-                    stop_chain = True
-                    break
-
-                model_failed = True
-                break
-
-        if stop_chain:
-            break
-        if not model_failed and route_index >= len(route_clients):
-            break
-
-    details = " | ".join(failures[-10:])
+    details = " | ".join(failures[-4:])
     raise RuntimeError(
-        "Ни одна из доступных Vision-моделей не смогла обработать изображение. "
-        f"Проверено моделей: {len(set(models_tried))}; API-вызовов: {api_attempts}. "
-        f"Причины: {details or 'нет подходящих моделей или исчерпан бюджет'}"
+        "Vision API не обработал изображение. "
+        "Проверьте, что AI_BASE_URL поддерживает /chat/completions с image_url, "
+        f"ключ API имеет доступ к Vision, а модель поддерживает картинки. Детали: {details}"
     )
 
 
@@ -1735,16 +1610,6 @@ def request_cost_cap(user: dict) -> float:
     return monthly_cost_cap(user) * MAX_REQUEST_COST_RATIO
 
 
-def usage_percent(user: dict) -> float:
-    """Процент использованного лимита; внутренние единицы никогда не показываем."""
-    plan = normalize_plan(user)
-    limit = bot_config["free_limit"] if plan == "free" else bot_config["sub_limit"] * (2 if plan == "max" else 1)
-    if limit <= 0:
-        return 100.0
-    used = max(0, int(user.get("tokens", 0) or 0))
-    return round(min(100.0, (used / limit) * 100.0), 1)
-
-
 def estimate_ai_cost_rub(input_tokens: int, output_tokens: int) -> float:
     return max(0.0, input_tokens) / 1000 * AI_INPUT_RUB_PER_1K + max(0.0, output_tokens) / 1000 * AI_OUTPUT_RUB_PER_1K
 
@@ -1833,7 +1698,7 @@ def check_and_consume_image_quota(user: dict, usage_type: str) -> tuple[bool, st
     )
     used = int(user.get(field, 0) or 0)
     if used >= limit:
-        return False, f"Дневной лимит {label} для {plan.upper()} исчерпан (100%)."
+        return False, f"Дневной лимит {label} для {plan.upper()} исчерпан: {used}/{limit}."
     user[field] = used + 1
     return True, ""
 
@@ -2246,7 +2111,7 @@ def get_admin_main_kb():
         [InlineKeyboardButton(text=rev_btn_text, callback_data="adm_reviews_page_0")],
         [
             InlineKeyboardButton(text="📊 Статистика", callback_data="adm_panel_stats"),
-            InlineKeyboardButton(text="🎚 Лимиты использования", callback_data="adm_panel_limits")
+            InlineKeyboardButton(text="🎚 Лимиты токенов", callback_data="adm_panel_limits")
         ],
         [
             InlineKeyboardButton(text="🧠 Управление моделями", callback_data="adm_panel_models"),
@@ -2921,7 +2786,8 @@ async def show_profile(message: Message):
     uid = message.from_user.id
     u = get_user(uid)
     plan = normalize_plan(u)
-    pct = usage_percent(u)
+    limit = bot_config["free_limit"] if plan == "free" else (bot_config["sub_limit"] if plan == "pro" else bot_config["sub_limit"] * 2)
+    pct = (u["tokens"] / limit) * 100 if limit > 0 else 100
     st = {"free": "🆓 Free", "pro": "💎 Pro — 49 ₽/мес.", "max": "🚀 Max — 99 ₽/мес."}[plan]
     sub_until = f"\n⏳ До: {u['sub_end'].strftime('%d.%m.%Y %H:%M')}" if u.get("sub_end") else ""
     cost_cap = monthly_cost_cap(u)
@@ -2942,7 +2808,7 @@ async def show_profile(message: Message):
         f"🎮 Roblox Studio: {'🟢 Подключен (' + html.escape(rbx_place) + ')' if rbx_online else '🔴 Не подключен'}\n"
         f"🎨 Изображения сегодня: {u.get('image_analysis_count', 0)} анализов / {u.get('image_generation_count', 0)} генераций\n"
         f"🎨 Доступ к изображениям: {'✅ Pro/Max' if plan != 'free' or uid == ADMIN_ID else '🔒 Только Pro/Max'}\n"
-        f"📊 Использование лимита: <b>{pct:.1f}%</b>\n"
+        f"📊 Токены: <code>{u['tokens']} / {limit}</code> ({pct:.1f}%)\n"
         f"💳 Расходы подписки: <code>{spent:.2f} / {cost_cap:.2f} ₽</code> (осталось {remain:.2f} ₽)\n"
         f"🔄 Сброс лимита: {u['reset_date'].strftime('%d.%m.%Y')}",
         reply_markup=kb,
@@ -3260,7 +3126,7 @@ async def cb_adm_stats(callback: CallbackQuery):
     expected_revenue = pro_u * PLAN_CONFIG["pro"]["price_rub"] + max_u * PLAN_CONFIG["max"]["price_rub"]
     subscription_cost_ceiling = expected_revenue * 0.50
     ban_u = sum(1 for v in users_db.values() if v["banned"])
-    average_usage = round(sum(usage_percent(v) for v in users_db.values()) / len(users_db), 1) if users_db else 0.0
+    total_tokens = sum(v["tokens"] for v in users_db.values())
     total_rev = len(reviews_db)
     avg_rev = round(sum(r["score"] for r in reviews_db) / total_rev, 1) if total_rev > 0 else 0.0
     active_rbx = sum(1 for s in rbx_sessions.values() if time.time() - s.get("last_seen", 0) <= 20.0)
@@ -3277,13 +3143,13 @@ async def cb_adm_stats(callback: CallbackQuery):
         f"🎯 Цель расходов по подпискам (не более 50% выручки): <code>{subscription_cost_ceiling:.2f} ₽</code>\n"
         f"🚫 Заблокировано: <code>{ban_u}</code>\n"
         f"🎮 Подключено студий Roblox сейчас: <code>{active_rbx}</code>\n"
-        f"📊 Среднее использование лимита: <b>{average_usage:.1f}%</b>\n"
+        f"🔥 Потрачено токенов: <code>{total_tokens}</code>\n"
         f"⭐ Средняя оценка: <code>{avg_rev}/10</code> (Отзывов: <code>{total_rev}</code>)\n"
         f"👁 Прослушка чата: <b>{'🟢 ВКЛ' if bot_config.get('spy_mode') else '🔴 ВЫКЛ'}</b>\n\n"
-        f"🆓 Лимит Free: установлен\n"
-        f"💎 Лимиты Pro / Max: установлены (Max — в 2 раза больше Pro)\n"
+        f"🆓 Бесплатный лимит: <code>{bot_config['free_limit']}</code>\n"
+        f"💎 Pro лимит: <code>{bot_config['sub_limit']}</code> | Max: <code>{bot_config['sub_limit'] * 2}</code>\n"
         f"🎨 Модель генерации фото: <code>{bot_config['photo_model']}</code>\n"
-        f"💸 Ставки API (вход/выход за 1k единиц обработки): <code>{AI_INPUT_RUB_PER_1K:.3f}/{AI_OUTPUT_RUB_PER_1K:.3f} ₽</code>\n"
+        f"💸 Цены учёта API (вход/выход за 1k токенов): <code>{AI_INPUT_RUB_PER_1K:.3f}/{AI_OUTPUT_RUB_PER_1K:.3f} ₽</code>\n"
         f"💸 Себестоимость изображения: анализ <code>{VISION_IMAGE_COST_RUB:.2f} ₽</code>, генерация <code>{IMAGE_GENERATION_COST_RUB:.2f} ₽</code>\n"
         f"🌐 URL Roblox MCP: <code>{bot_config.get('mcp_public_url')}</code>",
         reply_markup=kb,
@@ -3296,13 +3162,13 @@ async def cb_adm_limits(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✏️ Изменить лимит Free", callback_data="adm_edit_free_lim")],
-        [InlineKeyboardButton(text="✏️ Изменить лимит Pro / Max", callback_data="adm_edit_sub_lim")],
-        [InlineKeyboardButton(text="🔄 Сбросить использование всем", callback_data="adm_reset_all_tokens")],
+        [InlineKeyboardButton(text=f"✏️ Изменить FREE лимит ({bot_config['free_limit']})", callback_data="adm_edit_free_lim")],
+        [InlineKeyboardButton(text=f"✏️ Изменить SUB лимит ({bot_config['sub_limit']})", callback_data="adm_edit_sub_lim")],
+        [InlineKeyboardButton(text="🔄 Сбросить токены ВСЕМ юзерам", callback_data="adm_reset_all_tokens")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_back_main")]
     ])
     await callback.message.edit_text(
-        "🎚 <b>Управление лимитами использования</b>\nВыберите параметр для изменения:",
+        "🎚 <b>Управление лимитами токенов</b>\nВыберите параметр для изменения:",
         reply_markup=kb,
         parse_mode="HTML"
     )
@@ -3316,7 +3182,7 @@ async def cb_adm_limits_action(callback: CallbackQuery):
         for u in users_db.values():
             u["tokens"] = 0
         save_data()
-        await callback.answer("✅ Использование лимита сброшено у всех пользователей!", show_alert=True)
+        await callback.answer("✅ Токены всех пользователей сброшены!", show_alert=True)
         return await cb_adm_limits(callback)
 
     admin_state[ADMIN_ID] = {"action": callback.data}
@@ -3429,7 +3295,7 @@ def render_user_manage_card(tid: int) -> tuple[str, InlineKeyboardMarkup]:
         f"👤 <b>Карточка пользователя</b> <code>{tid}</code>\n\n"
         f"Статус: {ban_str}\n"
         f"Подписка: {sub_str}\n"
-        f"Использование лимита: <b>{usage_percent(u):.1f}%</b>\n"
+        f"Токены: <code>{u['tokens']}</code>\n"
         f"Расход API всего за месяц: <code>{float(u.get('api_cost_month_rub', u.get('plan_cost_rub', 0.0))):.2f} ₽</code>\n"
         f"Расход в рамках подписки: <code>{float(u.get('plan_cost_rub', 0.0)):.2f} ₽</code> / {monthly_cost_cap(u):.2f} ₽\n"
         f"Текущая модель: <code>{u['current_model']}</code>"
@@ -3442,7 +3308,7 @@ def render_user_manage_card(tid: int) -> tuple[str, InlineKeyboardMarkup]:
         [InlineKeyboardButton(text="❌ Забрать подписку", callback_data=f"adm_u_unsub_{tid}")],
         [
             InlineKeyboardButton(text="🚫 Бан / Разбан", callback_data=f"adm_u_ban_{tid}"),
-            InlineKeyboardButton(text="🔄 Сбросить использование", callback_data=f"adm_u_rst_{tid}")
+            InlineKeyboardButton(text="🔄 Сброс токенов", callback_data=f"adm_u_rst_{tid}")
         ],
         [InlineKeyboardButton(text="✉️ Написать пользователю", callback_data=f"adm_reply_{tid}")],
         [InlineKeyboardButton(text="🔙 В админ-панель", callback_data="adm_back_main")]
@@ -3495,7 +3361,7 @@ async def cb_adm_user_card_actions(callback: CallbackQuery):
         await callback.answer("Статус бана изменен!")
     elif act == "rst":
         u["tokens"] = 0
-        await callback.answer("Использование лимита пользователя обнулено!")
+        await callback.answer("Токены пользователя обнулены!")
 
     save_data()
     text, kb = render_user_manage_card(tid)
@@ -4196,7 +4062,7 @@ async def handle_group_message(message: Message, user: dict):
     plan = normalize_plan(user)
     user_token_limit = bot_config["free_limit"] if plan == "free" else bot_config["sub_limit"] * (2 if plan == "max" else 1)
     if uid != ADMIN_ID and int(user.get("tokens", 0)) >= user_token_limit:
-        return await message.reply("⚠️ Лимит использования исчерпан: 100%. Дождитесь сброса лимита или смените тариф.")
+        return await message.reply(f"⚠️ Лимит токенов исчерпан: {user.get('tokens', 0)}/{user_token_limit}.")
 
     group_prompt = (
         "Ты ИИ-ассистент группового чата Telegram. Отвечай дружелюбно, не перегружай чат. "
@@ -4457,8 +4323,8 @@ async def handle_all_messages(message: Message):
             [InlineKeyboardButton(text="💎 Оформить Pro / Max", callback_data="buy_sub_prompt")]
         ])
         return await message.answer(
-            f"⚠️ <b>Лимит использования исчерпан: 100%.</b>\n"
-            f"Оформите Pro или Max, чтобы увеличить доступный лимит.",
+            f"⚠️ <b>Вы исчерпали лимит токенов ({u['tokens']} / {limit})!</b>\n"
+            f"Оформите Pro или Max для увеличения лимита токенов (Max даёт вдвое больше Pro).",
             reply_markup=kb,
             parse_mode="HTML"
         )
@@ -4520,33 +4386,22 @@ async def handle_all_messages(message: Message):
         allowed, quota_error = check_and_consume_image_quota(u, "analysis")
         if not allowed and uid != ADMIN_ID:
             return await message.answer(f"⚠️ {html.escape(quota_error)}", parse_mode="HTML")
+        estimated_in = estimate_request_tokens(user_text) + estimate_request_tokens(sys_prompt) + 1200
+        affordable, budget_error = can_afford_request(u, estimated_in, 1800, extra_cost_rub=VISION_IMAGE_COST_RUB)
+        if not affordable and uid != ADMIN_ID:
+            u["image_analysis_count"] = max(0, int(u.get("image_analysis_count", 1)) - 1)
+            return await message.answer(f"⚠️ {html.escape(budget_error)}", parse_mode="HTML")
+        vision_reserved_cost = reserve_request_cost(u, estimated_in, 1800, extra_cost_rub=VISION_IMAGE_COST_RUB)
         save_data()
-        wait_msg = await message.answer(
-            "🖼 <i>Подготавливаю изображение. Проверю доступные Vision-модели по очереди.</i>",
-            parse_mode="HTML"
-        )
-
-        async def update_vision_status(model_name: str, index: int, total: int) -> None:
-            try:
-                await wait_msg.edit_text(
-                    f"🖼 <i>Проверяю Vision-модель {index}/{total}: "
-                    f"{html.escape(model_name)}...</i>",
-                    parse_mode="HTML",
-                )
-            except Exception:
-                pass
-
+        wait_msg = await message.answer("🖼 <i>Подготавливаю изображение и анализирую его...</i>", parse_mode="HTML")
         try:
-            vision_result = await create_vision_completion(
+            ans = await create_vision_completion(
                 preferred_model=model_id,
                 sys_prompt=sys_prompt,
                 history=u["history"],
                 user_text=user_text,
-                b64_image=b64_img,
-                user=u,
-                progress_callback=update_vision_status,
+                b64_image=b64_img
             )
-            ans = vision_result["answer"]
             try:
                 await wait_msg.delete()
             except Exception:
@@ -4557,8 +4412,9 @@ async def handle_all_messages(message: Message):
             u["history"] = u["history"][-14:]
             task_for_followup = pending_followup.get("task", user_text or "[Изображение]") if pending_followup else (user_text or "[Изображение]")
             update_pending_followup(u, task_for_followup, ans)
-            # Все попытки моделей уже учтены внутри create_vision_completion:
-            # суммированы prompt/completion tokens и реальная оценка расходов.
+            input_est = estimated_in
+            output_est = estimate_request_tokens(ans)
+            record_ai_usage(u, input_est, output_est, VISION_IMAGE_COST_RUB, reserved_cost_rub=vision_reserved_cost)
             save_data()
             remember_spy_answer(message, ans)
             return await send_smart_ai_response(message, ans, programming=u.get("programming_mode") == "general")

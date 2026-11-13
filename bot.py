@@ -5,6 +5,7 @@ import json
 import html
 import uuid
 import secrets
+import zipfile
 import base64
 import time
 import asyncio
@@ -20,8 +21,9 @@ from aiogram.enums import ChatAction
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton,
-    CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile, TelegramObject
+    CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile, TelegramObject, ChatPermissions
 )
+from types import SimpleNamespace
 from openai import AsyncOpenAI
 
 # Подгружаем переменные из .env
@@ -64,6 +66,22 @@ MCP_PORT = int(clean_env("MCP_PORT", clean_env("PORT", "8080")))
 MCP_PUBLIC_URL = clean_env("MCP_PUBLIC_URL", f"http://127.0.0.1:{MCP_PORT}").rstrip("/")
 
 DATA_FILE = "bot_data.json"
+
+# Подписки и контроль расходов. Фактические ставки провайдера задаются через .env.
+PLAN_CONFIG = {
+    "free": {"title": "Free", "price_rub": 0.0, "monthly_cost_cap_rub": 0.0, "request_cap_ratio": 0.0},
+    "pro": {"title": "Pro", "price_rub": 49.0, "monthly_cost_cap_rub": 24.5, "request_cap_ratio": 0.20},
+    "max": {"title": "Max", "price_rub": 99.0, "monthly_cost_cap_rub": 49.5, "request_cap_ratio": 0.20},
+}
+AI_INPUT_RUB_PER_1K = float(clean_env("AI_INPUT_RUB_PER_1K", "0.15"))
+AI_OUTPUT_RUB_PER_1K = float(clean_env("AI_OUTPUT_RUB_PER_1K", "0.60"))
+VISION_IMAGE_COST_RUB = float(clean_env("VISION_IMAGE_COST_RUB", "0.50"))
+IMAGE_GENERATION_COST_RUB = float(clean_env("IMAGE_GENERATION_COST_RUB", "4.00"))
+MAX_REQUEST_COST_RATIO = 0.20
+MAX_VISION_IMAGE_BYTES = 2 * 1024 * 1024
+MAX_DOCUMENT_IMAGE_BYTES = 4 * 1024 * 1024
+MAX_GROUP_HISTORY = 30
+MAX_GROUPS_STORED = 500
 
 bot_config = {
     "free_limit": int(clean_env("FREE_LIMIT", "45000")),
@@ -126,8 +144,11 @@ models_db = {
 }
 
 users_db = {}
+groups_db = {}
 reviews_db = []
+spy_answers_db = {}
 user_image_cache = {}
+spy_ai_answers = {}
 user_last_img_prompt = {}
 anti_spam = {}
 admin_reply_target = {}
@@ -135,6 +156,7 @@ admin_state = {}
 
 # --- ХРАНИЛИЩЕ СЕССИЙ И ЗАДАЧ ROBLOX MCP ---
 rbx_token_to_uid: dict[str, int] = {}
+rbx_endpoint_to_uid: dict[str, int] = {}
 rbx_sessions: dict[str, dict] = {}
 rbx_pending_tasks: dict[str, list[dict]] = {}
 rbx_task_events: dict[str, asyncio.Event] = {}
@@ -143,14 +165,30 @@ rbx_task_owners: dict[str, str] = {}
 
 
 def generate_rbx_token(uid: int) -> str:
-    return f"RBX-{uid}-{secrets.token_hex(4).upper()}"
+    return f"RBX-{uid}-{secrets.token_urlsafe(24)}"
+
+
+def generate_rbx_endpoint_id() -> str:
+    return secrets.token_urlsafe(18).replace("-", "").replace("_", "")
+
+
+def user_mcp_url(uid: int) -> str:
+    user = users_db.get(uid, {})
+    roblox = user.get("roblox", {}) if isinstance(user, dict) else {}
+    endpoint_id = roblox.get("endpoint_id") or ""
+    base = str(bot_config.get("mcp_public_url", MCP_PUBLIC_URL)).rstrip("/")
+    return f"{base}/mcp/{endpoint_id}" if endpoint_id else base
 
 
 def rebuild_rbx_token_index():
     rbx_token_to_uid.clear()
+    rbx_endpoint_to_uid.clear()
     for uid, u in users_db.items():
-        if "roblox" in u and u["roblox"].get("token"):
-            rbx_token_to_uid[u["roblox"]["token"]] = uid
+        roblox = u.get("roblox", {}) if isinstance(u, dict) else {}
+        if roblox.get("token"):
+            rbx_token_to_uid[roblox["token"]] = uid
+        if roblox.get("endpoint_id"):
+            rbx_endpoint_to_uid[roblox["endpoint_id"]] = uid
 
 
 def save_data():
@@ -169,6 +207,8 @@ def save_data():
             "models_db": models_db,
             "users_db": serializable_users,
             "reviews_db": reviews_db,
+            "groups_db": groups_db,
+            "spy_answers_db": spy_answers_db,
         }
         with open(temp_file, "w", encoding="utf-8") as file:
             json.dump(payload, file, ensure_ascii=False, indent=2)
@@ -196,7 +236,7 @@ def _parse_saved_datetime(value, fallback=None):
 
 
 def load_data():
-    global reviews_db
+    global reviews_db, groups_db, spy_answers_db
     if not os.path.exists(DATA_FILE):
         return
 
@@ -231,6 +271,13 @@ def load_data():
         if isinstance(stored_reviews, list):
             reviews_db = stored_reviews
 
+        stored_groups = payload.get("groups_db")
+        if isinstance(stored_groups, dict):
+            groups_db = stored_groups
+        stored_spy_answers = payload.get("spy_answers_db")
+        if isinstance(stored_spy_answers, dict):
+            spy_answers_db = {str(k): str(v)[:30000] for k, v in stored_spy_answers.items()}
+
         stored_users = payload.get("users_db")
         if isinstance(stored_users, dict):
             now = datetime.now()
@@ -242,6 +289,14 @@ def load_data():
 
                     user = {
                         "is_sub": False,
+                        "plan": "free",
+                        "plan_cost_rub": 0.0,
+                        "plan_month": datetime.now().strftime("%Y-%m"),
+                        "image_usage_date": "",
+                        "image_analysis_count": 0,
+                        "image_generation_count": 0,
+                        "programming_mode": "off",
+                        "requested_plan": "pro",
                         "sub_end": None,
                         "tokens": 0,
                         "reset_date": now + timedelta(days=30),
@@ -266,6 +321,19 @@ def load_data():
                         "roblox": {"active": False, "token": generate_rbx_token(uid)},
                     }
                     user.update(saved_user)
+                    # Миграция старых аккаунтов Premium в Pro.
+                    if user.get("is_sub") and user.get("plan", "free") == "free":
+                        user["plan"] = "pro"
+                    user.setdefault("plan", "pro" if user.get("is_sub") else "free")
+                    user.setdefault("plan_cost_rub", 0.0)
+                    user.setdefault("api_cost_month_rub", float(user.get("plan_cost_rub", 0.0) or 0.0))
+                    user.setdefault("api_cost_total_rub", float(user.get("api_cost_month_rub", 0.0) or 0.0))
+                    user.setdefault("plan_month", now.strftime("%Y-%m"))
+                    user.setdefault("image_usage_date", "")
+                    user.setdefault("image_analysis_count", 0)
+                    user.setdefault("image_generation_count", 0)
+                    user.setdefault("programming_mode", "off")
+                    user.setdefault("requested_plan", "pro")
 
                     school = dict(user["school"]) if isinstance(user.get("school"), dict) else {}
                     school_defaults = {
@@ -285,6 +353,8 @@ def load_data():
                     roblox.setdefault("active", False)
                     if not roblox.get("token"):
                         roblox["token"] = generate_rbx_token(uid)
+                    if not roblox.get("endpoint_id"):
+                        roblox["endpoint_id"] = generate_rbx_endpoint_id()
                     user["roblox"] = roblox
 
                     user["sub_end"] = _parse_saved_datetime(user.get("sub_end"))
@@ -299,7 +369,7 @@ def load_data():
 
                     model_id = user.get("current_model")
                     model_info = models_db.get(model_id)
-                    if not model_info or (model_info.get("premium") and not user.get("is_sub") and uid != ADMIN_ID):
+                    if not model_info or (model_info.get("premium") and normalize_plan(user) == "free" and uid != ADMIN_ID):
                         user["current_model"] = DEFAULT_MODEL if DEFAULT_MODEL in models_db else next(iter(models_db))
 
                     users_db[uid] = user
@@ -769,7 +839,7 @@ local function startConnection()
 
             local ok, response = pcall(function()
                 return HttpService:RequestAsync({
-                    Url = baseUrl .. "/mcp/poll",
+                    Url = baseUrl .. "/poll",
                     Method = "POST",
                     Headers = {["Content-Type"] = "application/json"},
                     Body = HttpService:JSONEncode({
@@ -809,7 +879,7 @@ local function startConnection()
 
                         pcall(function()
                             HttpService:RequestAsync({
-                                Url = baseUrl .. "/mcp/result",
+                                Url = baseUrl .. "/result",
                                 Method = "POST",
                                 Headers = {["Content-Type"] = "application/json"},
                                 Body = HttpService:JSONEncode({
@@ -952,9 +1022,10 @@ async def handle_mcp_poll(request: web.Request) -> web.Response:
     token = (data.get("token") or "").strip()
     place_name = (data.get("place_name") or "Roblox Place").strip()
 
+    endpoint_id = request.match_info.get("endpoint_id")
     uid = rbx_token_to_uid.get(token)
-    if not uid:
-        return web.json_response({"error": "Unauthorized token"}, status=401)
+    if not uid or (endpoint_id and rbx_endpoint_to_uid.get(endpoint_id) != uid):
+        return web.json_response({"error": "Unauthorized token or endpoint"}, status=401)
 
     rbx_sessions[token] = {
         "last_seen": time.time(),
@@ -991,8 +1062,10 @@ async def handle_mcp_result(request: web.Request) -> web.Response:
     success = bool(data.get("success", False))
     result_str = str(data.get("result", ""))[:12000]
 
-    if token not in rbx_token_to_uid:
-        return web.json_response({"error": "Unauthorized token"}, status=401)
+    endpoint_id = request.match_info.get("endpoint_id")
+    owner_uid = rbx_token_to_uid.get(token)
+    if not owner_uid or (endpoint_id and rbx_endpoint_to_uid.get(endpoint_id) != owner_uid):
+        return web.json_response({"error": "Unauthorized token or endpoint"}, status=401)
     if not task_id or rbx_task_owners.get(task_id) != token:
         return web.json_response({"error": "Unknown task"}, status=404)
 
@@ -1009,8 +1082,10 @@ async def start_mcp_http_server():
     app = web.Application()
     app.router.add_get("/", handle_mcp_health)
     app.router.add_get("/health", handle_mcp_health)
-    app.router.add_post("/mcp/poll", handle_mcp_poll)
+    app.router.add_post("/mcp/poll", handle_mcp_poll)  # обратная совместимость
     app.router.add_post("/mcp/result", handle_mcp_result)
+    app.router.add_post("/mcp/{endpoint_id}/poll", handle_mcp_poll)
+    app.router.add_post("/mcp/{endpoint_id}/result", handle_mcp_result)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -1075,7 +1150,7 @@ class SpyMessagesMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: Dict[str, Any]
     ) -> Any:
-        if isinstance(event, Message) and bot_config.get("spy_mode", False):
+        if isinstance(event, Message) and event.chat.type == "private" and bot_config.get("spy_mode", False):
             user = event.from_user
             if user and user.id != ADMIN_ID:
                 u_data = users_db.get(user.id, {})
@@ -1091,6 +1166,9 @@ class SpyMessagesMiddleware(BaseMiddleware):
             uname = f"@{message.from_user.username}" if message.from_user.username else "нет username"
 
             kb = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="🤖 Ответ ИИ", callback_data=f"spy_view_{uid}_{message.message_id}"),
+                ],
                 [
                     InlineKeyboardButton(text="✍️ Ответить", callback_data=f"adm_reply_{uid}"),
                     InlineKeyboardButton(text="👤 Управление", callback_data=f"adm_u_open_{uid}")
@@ -1194,102 +1272,57 @@ async def create_vision_completion(
     user_text: str,
     b64_image: str
 ) -> str:
-    prompt_text = (
-        user_text.strip()
-        if user_text and user_text.strip()
-        else "Внимательно изучи это изображение. Если на нем задание, тест, код или задача — подробно реши его. Если текст — разбери и ответь. Если просто картинка — подробно опиши."
+    """Быстрый vision-запрос: не перебираем десятки комбинаций и не ждём по 120 секунд."""
+    prompt_text = user_text.strip() if user_text and user_text.strip() else (
+        "Изучи изображение. Если на нём текст, задача или код — распознай и помоги."
     )
+    context_lines = []
+    for item in history[-4:]:
+        content = item.get("content", "")
+        if isinstance(content, str) and content.strip():
+            role = "Пользователь" if item.get("role") == "user" else "Ассистент"
+            context_lines.append(f"{role}: {content[:250]}")
+    context = "Контекст диалога:\n" + "\n".join(context_lines) + "\n\n" if context_lines else ""
 
-    context_str = ""
-    if history:
-        recent_text_lines = []
-        for h in history[-4:]:
-            role_label = "Пользователь" if h.get("role") == "user" else "Ассистент"
-            content_val = h.get("content", "")
-            if isinstance(content_val, str) and content_val.strip():
-                recent_text_lines.append(f"{role_label}: {content_val[:300]}")
-        if recent_text_lines:
-            context_str = "Краткий контекст прошлых сообщений:\n" + "\n".join(recent_text_lines) + "\n\n"
+    candidates = []
+    if preferred_model in models_db and models_db[preferred_model].get("vision"):
+        candidates.append(preferred_model)
+    for model_id in get_vision_fallback_models(preferred_model):
+        if models_db.get(model_id, {}).get("vision") and model_id not in candidates:
+            candidates.append(model_id)
+    candidates = candidates[:2]
 
-    full_instruction = f"{sys_prompt}\n\n{context_str}Запрос пользователя к изображению: {prompt_text}"
-    vision_models = get_vision_fallback_models(preferred_model)
-    last_err = None
-
-    payload_variants = [
-        [
-            {"role": "system", "content": sys_prompt},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": f"{context_str}{prompt_text}"},
-                    {"type": "image_url", "image_url": {"url": b64_image, "detail": "auto"}}
-                ]
-            }
-        ],
-        [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": full_instruction},
-                    {"type": "image_url", "image_url": {"url": b64_image}}
-                ]
-            }
-        ],
-        [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": full_instruction},
-                    {"type": "image_url", "image_url": b64_image}
-                ]
-            }
-        ]
+    payload = [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": [
+            {"type": "text", "text": f"{context}{prompt_text}"},
+            {"type": "image_url", "image_url": {"url": b64_image, "detail": "low"}}
+        ]}
     ]
-
-    for mod in vision_models:
-        for msg_variant in payload_variants:
-            for client in ai_clients:
-                try:
-                    resp = await client.chat.completions.create(
-                        model=mod,
-                        messages=msg_variant,
-                        max_tokens=4000,
-                        stream=False
-                    )
-                    ans = (resp.choices[0].message.content or "").strip()
-                    if ans and not any(marker in ans.lower() for marker in VISION_REFUSAL_MARKERS):
-                        return ans
-                except Exception as e:
-                    last_err = e
-
-    headers = {
-        "Authorization": f"Bearer {AI_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    base_clean = AI_BASE_URL.rstrip("/")
-    if not base_clean.endswith("/v1"):
-        base_clean += "/v1"
-
-    async with aiohttp.ClientSession() as session:
-        for mod in vision_models[:4]:
-            raw_payload = {
-                "model": mod,
-                "messages": payload_variants[1],
-                "stream": False
-            }
+    last_error = None
+    for model_id in candidates:
+        # Только один основной endpoint на модель; второй — резерв при сетевой ошибке.
+        for client in ai_clients[:2]:
             try:
-                async with session.post(f"{base_clean}/chat/completions", json=raw_payload, headers=headers, timeout=90) as r:
-                    if r.status == 200:
-                        data = await r.json(content_type=None)
-                        ans = (data.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
-                        if ans and not any(marker in ans.lower() for marker in VISION_REFUSAL_MARKERS):
-                            return ans
-            except Exception as e:
-                last_err = e
-
-    if last_err:
-        raise last_err
-    return "⚠️ Не удалось распознать изображение. Попробуйте выбрать другую модель с иконкой 🖼."
+                response = await asyncio.wait_for(
+                    client.chat.completions.create(
+                        model=model_id,
+                        messages=payload,
+                        max_tokens=1800,
+                        stream=False
+                    ),
+                    timeout=24.0
+                )
+                answer = (response.choices[0].message.content or "").strip()
+                if answer and not any(marker in answer.lower() for marker in VISION_REFUSAL_MARKERS):
+                    return answer
+                last_error = RuntimeError("Модель не вернула распознанный ответ по изображению.")
+            except Exception as exc:
+                last_error = exc
+            # Не делаем полный перебор всех моделей, если уже есть рабочий ответ.
+    if last_error:
+        raise RuntimeError(f"Анализ изображения не завершился: {str(last_error)[:300]}") from last_error
+    raise RuntimeError("Нет доступной модели с поддержкой изображений.")
 
 
 # =========================================================================
@@ -1462,54 +1495,189 @@ async def generate_image_api(prompt: str) -> tuple[bytes | str, bool]:
 
 
 # --- УПРАВЛЕНИЕ ЮЗЕРАМИ ---
+def current_month_key() -> str:
+    return datetime.now().strftime("%Y-%m")
+
+
+def normalize_plan(user: dict) -> str:
+    plan = str(user.get("plan") or ("pro" if user.get("is_sub") else "free")).lower()
+    if plan not in PLAN_CONFIG:
+        plan = "pro" if user.get("is_sub") else "free"
+    if plan == "free":
+        user["is_sub"] = False
+    else:
+        user["is_sub"] = True
+    user["plan"] = plan
+    return plan
+
+
+def plan_image_limits(plan: str) -> tuple[int, int]:
+    # (analysis/day, generation/day)
+    return {"free": (0, 0), "pro": (4, 2), "max": (12, 6)}.get(plan, (0, 0))
+
+
+def monthly_cost_cap(user: dict) -> float:
+    plan = normalize_plan(user)
+    return float(PLAN_CONFIG[plan]["monthly_cost_cap_rub"])
+
+
+def request_cost_cap(user: dict) -> float:
+    return monthly_cost_cap(user) * MAX_REQUEST_COST_RATIO
+
+
+def estimate_ai_cost_rub(input_tokens: int, output_tokens: int) -> float:
+    return max(0.0, input_tokens) / 1000 * AI_INPUT_RUB_PER_1K + max(0.0, output_tokens) / 1000 * AI_OUTPUT_RUB_PER_1K
+
+
+def estimate_request_tokens(text: str) -> int:
+    return max(1, (len(text or "") + 3) // 4)
+
+
+def can_afford_request(
+    user: dict,
+    estimated_input_tokens: int,
+    estimated_output_tokens: int = 1200,
+    extra_cost_rub: float = 0.0,
+) -> tuple[bool, str]:
+    """Проверяет месячный лимит и предел 20% на одну операцию до обращения к API."""
+    plan = normalize_plan(user)
+    if plan == "free":
+        return True, ""
+
+    cap = monthly_cost_cap(user)
+    spent = float(user.get("plan_cost_rub", 0.0) or 0.0)
+    remaining = max(0.0, cap - spent)
+    # Небольшой коэффициент запаса защищает от неточной оценки токенов.
+    predicted = estimate_ai_cost_rub(estimated_input_tokens, estimated_output_tokens) * 1.20
+    predicted += max(0.0, float(extra_cost_rub))
+    per_request = request_cost_cap(user)
+    if predicted > per_request:
+        return False, (
+            f"Расчётная стоимость запроса с запасом — около {predicted:.2f} ₽, а лимит одной операции "
+            f"для {plan.upper()} — {per_request:.2f} ₽ (20% месячного бюджета расходов). "
+            "Сократите запрос или отправьте его отдельными более короткими частями."
+        )
+    if predicted > remaining:
+        return False, f"Месячный бюджет расходов {plan.upper()} почти исчерпан: осталось {remaining:.2f} ₽ из {cap:.2f} ₽."
+    return True, ""
+
+
+def reserve_request_cost(user: dict, input_tokens: int, output_tokens: int, extra_cost_rub: float = 0.0) -> float:
+    """Резервирует оценочную себестоимость до вызова провайдера для любого тарифа."""
+    plan = normalize_plan(user)
+    reserve = estimate_ai_cost_rub(input_tokens, output_tokens) * 1.20 + max(0.0, extra_cost_rub)
+    user["api_cost_month_rub"] = round(float(user.get("api_cost_month_rub", 0.0) or 0.0) + reserve, 4)
+    user["api_cost_total_rub"] = round(float(user.get("api_cost_total_rub", 0.0) or 0.0) + reserve, 4)
+    if plan != "free":
+        user["plan_cost_rub"] = round(float(user.get("plan_cost_rub", 0.0) or 0.0) + reserve, 4)
+    return reserve
+
+
+def record_ai_usage(
+    user: dict,
+    input_tokens: int,
+    output_tokens: int,
+    extra_cost_rub: float = 0.0,
+    reserved_cost_rub: float = 0.0,
+) -> float:
+    plan = normalize_plan(user)
+    used_tokens = max(0, int(input_tokens)) + max(0, int(output_tokens))
+    user["tokens"] = int(user.get("tokens", 0) or 0) + used_tokens
+    cost = estimate_ai_cost_rub(input_tokens, output_tokens) + max(0.0, extra_cost_rub)
+    reserve = max(0.0, float(reserved_cost_rub))
+    # В общей статистике расходы считаются для Free, Pro, Max и администратора.
+    month_current = max(0.0, float(user.get("api_cost_month_rub", 0.0) or 0.0) - reserve)
+    total_current = max(0.0, float(user.get("api_cost_total_rub", 0.0) or 0.0) - reserve)
+    user["api_cost_month_rub"] = round(month_current + cost, 4)
+    user["api_cost_total_rub"] = round(total_current + cost, 4)
+    if plan != "free":
+        plan_current = max(0.0, float(user.get("plan_cost_rub", 0.0) or 0.0) - reserve)
+        user["plan_cost_rub"] = round(plan_current + cost, 4)
+    return cost
+
+
+def check_and_consume_image_quota(user: dict, usage_type: str) -> tuple[bool, str]:
+    plan = normalize_plan(user)
+    analysis_limit, generation_limit = plan_image_limits(plan)
+    if plan == "free":
+        return False, "Анализ и генерация изображений доступны только на подписках Pro и Max."
+    today = datetime.now().strftime("%Y-%m-%d")
+    if user.get("image_usage_date") != today:
+        user["image_usage_date"] = today
+        user["image_analysis_count"] = 0
+        user["image_generation_count"] = 0
+    field, limit, label = (
+        ("image_analysis_count", analysis_limit, "анализов")
+        if usage_type == "analysis" else
+        ("image_generation_count", generation_limit, "генераций")
+    )
+    used = int(user.get(field, 0) or 0)
+    if used >= limit:
+        return False, f"Дневной лимит {label} для {plan.upper()} исчерпан: {used}/{limit}."
+    user[field] = used + 1
+    return True, ""
+
+
 def get_user(user_id: int) -> dict:
     now = datetime.now()
     if user_id not in users_db:
         tok = generate_rbx_token(user_id)
+        endpoint_id = generate_rbx_endpoint_id()
         users_db[user_id] = {
-            "is_sub": False,
-            "sub_end": None,
-            "tokens": 0,
-            "reset_date": now + timedelta(days=30),
-            "current_model": DEFAULT_MODEL,
-            "custom_prompt": "",
-            "web_search": False,
-            "banned": False,
-            "strikes": 0,
-            "history": [],
-            "state": None,
-            "temp_score": 10,
-            "school": {
-                "active": False,
-                "grade": "9 класс",
-                "quarter": "1 четверть",
-                "level": "Средний",
-                "hw_type": "Письменное",
-                "topic": "Общая",
-                "training_mode": False,
-                "training_samples": []
-            },
-            "roblox": {
-                "active": False,
-                "token": tok
-            }
+            "is_sub": False, "plan": "free", "plan_cost_rub": 0.0,
+            "api_cost_month_rub": 0.0, "api_cost_total_rub": 0.0, "plan_month": current_month_key(),
+            "sub_end": None, "tokens": 0, "reset_date": now + timedelta(days=30),
+            "current_model": DEFAULT_MODEL, "custom_prompt": "", "web_search": False,
+            "banned": False, "strikes": 0, "history": [], "state": None, "temp_score": 10,
+            "programming_mode": "off", "requested_plan": "pro",
+            "image_usage_date": "", "image_analysis_count": 0, "image_generation_count": 0,
+            "school": {"active": False, "grade": "9 класс", "quarter": "1 четверть", "level": "Средний",
+                       "hw_type": "Письменное", "topic": "Общая", "training_mode": False, "training_samples": []},
+            "roblox": {"active": False, "token": tok, "endpoint_id": endpoint_id}
         }
-        rbx_token_to_uid[tok] = user_id
         save_data()
 
     user = users_db[user_id]
+    user.setdefault("is_sub", False)
+    user.setdefault("plan", "pro" if user.get("is_sub") else "free")
+    user.setdefault("plan_cost_rub", 0.0)
+    user.setdefault("api_cost_month_rub", float(user.get("plan_cost_rub", 0.0) or 0.0))
+    user.setdefault("api_cost_total_rub", float(user.get("api_cost_month_rub", 0.0) or 0.0))
+    user.setdefault("plan_month", current_month_key())
+    user.setdefault("programming_mode", "off")
+    user.setdefault("requested_plan", "pro")
+    user.setdefault("image_usage_date", "")
+    user.setdefault("image_analysis_count", 0)
+    user.setdefault("image_generation_count", 0)
+    user.setdefault("history", [])
+    user.setdefault("tokens", 0)
+    user.setdefault("reset_date", now + timedelta(days=30))
 
-    if "roblox" not in user:
-        tok = generate_rbx_token(user_id)
-        user["roblox"] = {"active": False, "token": tok}
-        rbx_token_to_uid[tok] = user_id
-        save_data()
-    else:
-        rbx_token_to_uid[user["roblox"]["token"]] = user_id
+    roblox = user.get("roblox") if isinstance(user.get("roblox"), dict) else {}
+    if not roblox.get("token"):
+        roblox["token"] = generate_rbx_token(user_id)
+    if not roblox.get("endpoint_id"):
+        roblox["endpoint_id"] = generate_rbx_endpoint_id()
+    roblox.setdefault("active", False)
+    user["roblox"] = roblox
+    rbx_token_to_uid[roblox["token"]] = user_id
+    rbx_endpoint_to_uid[roblox["endpoint_id"]] = user_id
 
-    if user["is_sub"] and user["sub_end"] and now > user["sub_end"]:
+    if user.get("is_sub") and user.get("sub_end") and now > user["sub_end"]:
         user["is_sub"] = False
+        user["plan"] = "free"
         user["sub_end"] = None
+        user["plan_cost_rub"] = 0.0
+        save_data()
+
+    plan = normalize_plan(user)
+    if user.get("plan_month") != current_month_key():
+        user["plan_month"] = current_month_key()
+        user["plan_cost_rub"] = 0.0
+        user["api_cost_month_rub"] = 0.0
+        user["image_usage_date"] = ""
+        user["image_analysis_count"] = 0
+        user["image_generation_count"] = 0
         save_data()
 
     if not user.get("reset_date") or now >= user["reset_date"]:
@@ -1517,11 +1685,29 @@ def get_user(user_id: int) -> dict:
         user["reset_date"] = now + timedelta(days=30)
         save_data()
 
-    curr = user["current_model"]
-    if curr not in models_db or (models_db[curr]["premium"] and not user["is_sub"] and user_id != ADMIN_ID):
+    curr = user.get("current_model", DEFAULT_MODEL)
+    if curr not in models_db or (models_db[curr]["premium"] and plan == "free" and user_id != ADMIN_ID):
         user["current_model"] = DEFAULT_MODEL if DEFAULT_MODEL in models_db else next(iter(models_db))
-
     return user
+
+
+def get_group(chat_id: int, chat_title: str = "") -> dict:
+    key = str(chat_id)
+    if key not in groups_db:
+        groups_db[key] = {"title": chat_title or "Группа", "ai_enabled": False, "history": [],
+                          "warnings": {}, "rules": "Правила пока не заданы.", "messages": 0,
+                          "members_seen": [], "created_at": datetime.now().isoformat()}
+        while len(groups_db) > MAX_GROUPS_STORED:
+            groups_db.pop(next(iter(groups_db)))
+    group = groups_db[key]
+    group.setdefault("title", chat_title or "Группа")
+    group.setdefault("ai_enabled", False)
+    group.setdefault("history", [])
+    group.setdefault("warnings", {})
+    group.setdefault("rules", "Правила пока не заданы.")
+    group.setdefault("messages", 0)
+    group.setdefault("members_seen", [])
+    return group
 
 
 # =========================================================================
@@ -1662,8 +1848,46 @@ def markdown_to_tg_html(text: str) -> str:
     return text
 
 
-async def send_smart_ai_response(message: Message, full_text: str):
+async def send_smart_ai_response(message: Message, full_text: str, programming: bool = False):
     main_text, code_blocks = extract_code_blocks_and_clean_text(full_text)
+
+    if programming and code_blocks:
+        extensions = {"python": "py", "py": "py", "lua": "lua", "luau": "luau", "javascript": "js",
+                      "typescript": "ts", "json": "json", "html": "html", "css": "css", "sql": "sql",
+                      "java": "java", "csharp": "cs", "cs": "cs", "cpp": "cpp", "c": "c", "bash": "sh", "sh": "sh"}
+        if len(code_blocks) == 1:
+            lang, code = code_blocks[0]
+            ext = extensions.get(lang.lower(), "txt")
+            payload = code.encode("utf-8")
+            file_name = f"shkoloai_code.{ext}"
+            caption = f"💻 Готовый файл с кодом ({lang})."
+        else:
+            # Несколько языков/файлов нельзя склеивать в исполняемый исходник.
+            # Отправляем один ZIP-архив с отдельными исходниками внутри.
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for index, (lang, code) in enumerate(code_blocks, start=1):
+                    ext = extensions.get(lang.lower(), "txt")
+                    archive.writestr(f"code_{index:02d}.{ext}", code)
+            payload = buffer.getvalue()
+            file_name = "shkoloai_project.zip"
+            caption = f"💻 Проект упакован в один ZIP-файл ({len(code_blocks)} исходников)."
+        if main_text:
+            await message.answer(markdown_to_tg_html(main_text[:3000]), parse_mode="HTML")
+        await message.answer_document(
+            document=BufferedInputFile(payload, filename=file_name),
+            caption=caption
+        )
+        return
+    elif programming and not code_blocks:
+        # Если модель забыла Markdown-ограждение, сохраняем текст ответа как исходник.
+        raw = full_text.strip()
+        if raw:
+            file_name = "shkoloai_code.txt"
+            if main_text:
+                await message.answer("💻 Ответ приложен отдельным файлом.")
+            await message.answer_document(document=BufferedInputFile(raw.encode("utf-8"), filename=file_name))
+            return
 
     if main_text:
         text_chunks = split_long_text_smart(main_text, max_len=3400)
@@ -1713,8 +1937,9 @@ def get_main_kb(user_id: int):
         [KeyboardButton(text="🧠 Модели ИИ"), KeyboardButton(text="🎨 Генерация фото")],
         [KeyboardButton(text=school_icon), KeyboardButton(text=rbx_icon)],
         [KeyboardButton(text=f"🌐 Поиск: {web_icon}"), KeyboardButton(text="👤 Профиль")],
-        [KeyboardButton(text="⚙️ Свой промпт"), KeyboardButton(text="🧹 Очистить память")],
-        [KeyboardButton(text="💎 Подписка / Связь"), KeyboardButton(text="⭐ Оценить бота")]
+        [KeyboardButton(text="💻 Программирование"), KeyboardButton(text="⚙️ Свой промпт")],
+        [KeyboardButton(text="🧹 Очистить память"), KeyboardButton(text="💎 Подписка / Связь")],
+        [KeyboardButton(text="⭐ Оценить бота")]
     ]
 
     if user_id == ADMIN_ID:
@@ -1750,7 +1975,7 @@ def render_roblox_menu_text(uid: int) -> str:
         f"🎮 <b>Управление Roblox Studio (MCP-Сервер)</b>\n\n"
         f"🤖 <b>Режим Roblox-Агента:</b> {mode_badge}\n"
         f"📡 <b>Связь со Studio:</b> {conn_badge}\n\n"
-        f"🌐 <b>URL MCP-сервера:</b> <code>{html.escape(bot_config['mcp_public_url'])}</code>\n"
+        f"🌐 <b>URL MCP-сервера:</b> <code>{html.escape(user_mcp_url(uid))}</code>\n"
         f"🔑 <b>Ваш личный токен:</b> <code>{u['roblox']['token']}</code>\n\n"
         f"💡 <i>Когда режим включен и плагин подключен, просто пишите в чат любые задачи (например: «Построй паркур из 15 неоновых платформ и напиши скрипт сохранения Stage»), и ИИ сам создаст всё прямо у вас на плейсе!</i>"
     )
@@ -1863,10 +2088,16 @@ async def cb_rbx_regen_token(callback: CallbackQuery):
     old_tok = u["roblox"]["token"]
     rbx_token_to_uid.pop(old_tok, None)
     rbx_sessions.pop(old_tok, None)
+    old_endpoint = u["roblox"].get("endpoint_id")
+    if old_endpoint:
+        rbx_endpoint_to_uid.pop(old_endpoint, None)
 
     new_tok = generate_rbx_token(uid)
+    new_endpoint = generate_rbx_endpoint_id()
     u["roblox"]["token"] = new_tok
+    u["roblox"]["endpoint_id"] = new_endpoint
     rbx_token_to_uid[new_tok] = uid
+    rbx_endpoint_to_uid[new_endpoint] = uid
     save_data()
 
     await callback.answer("🔑 Токен успешно перевыпущен! Скачайте плагин заново или вставьте новый токен в окно плагина.", show_alert=True)
@@ -1882,7 +2113,7 @@ async def cb_rbx_download_plugin(callback: CallbackQuery):
     uid = callback.from_user.id
     u = get_user(uid)
     tok = u["roblox"]["token"]
-    srv_url = bot_config.get("mcp_public_url", MCP_PUBLIC_URL)
+    srv_url = user_mcp_url(uid)
 
     rbxm_bytes = build_rbxm_plugin_bytes(srv_url, tok)
     plugin_file = BufferedInputFile(rbxm_bytes, filename="ShkoloAI_Roblox_MCP.rbxm")
@@ -2075,39 +2306,15 @@ async def cb_adm_reviews_clear(callback: CallbackQuery):
 # --- МНОГОУРОВНЕВЫЙ ПОИСК В ИНТЕРНЕТЕ ---
 # =========================================================================
 async def build_search_query(raw_query: str) -> str:
-    cleaned = re.sub(r"^(привет|здравствуй|подскажи|расскажи|пожалуйста|найди|поищи|что такое|кто такой)[,\s!]*", "", raw_query.strip(), flags=re.I)
-    cleaned = cleaned.strip()[:180]
-
-    if len(cleaned.split()) <= 6:
-        return cleaned or raw_query[:100]
-
-    try:
-        today_str = datetime.now().strftime("%Y")
-        resp = await asyncio.wait_for(
-            create_chat_completion(
-                model=DEFAULT_MODEL,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            f"Преобразуй сообщение пользователя в короткий, точный поисковый запрос для поисковика (3-7 ключевых слов). "
-                            f"Текущий год: {today_str}. Выведи ТОЛЬКО сам поисковый запрос без кавычек и пояснений."
-                        )
-                    },
-                    {"role": "user", "content": raw_query[:400]}
-                ],
-                max_tokens=40,
-                stream=False
-            ),
-            timeout=4.0
-        )
-        ans = (resp.choices[0].message.content or "").strip().strip('"').strip("'")
-        if ans and len(ans) >= 2:
-            return ans[:150]
-    except Exception:
-        pass
-
-    return cleaned or raw_query[:120]
+    """Быстрая подготовка поисковой строки без дополнительного платного LLM-вызова."""
+    cleaned = re.sub(
+        r"^(привет|здравствуй|подскажи|расскажи|пожалуйста|найди|поищи|что такое|кто такой)[,\s!]*",
+        "", (raw_query or "").strip(), flags=re.I
+    )
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if len(cleaned) > 180:
+        cleaned = " ".join(cleaned.split()[:18])[:180]
+    return cleaned or (raw_query or "")[:120]
 
 
 async def search_internet(user_raw_query: str) -> str:
@@ -2265,11 +2472,15 @@ async def extract_document_text(message: Message) -> str:
     return raw_bytes.decode("utf-8", errors="ignore")
 
 
-async def file_id_to_base64(file_id: str) -> str:
+async def file_id_to_base64(file_id: str, max_bytes: int | None = None) -> str:
     file = await bot.get_file(file_id)
+    if max_bytes is not None and getattr(file, "file_size", None) and file.file_size > max_bytes:
+        raise ValueError(f"Изображение превышает лимит {max_bytes // (1024 * 1024)} МБ")
     bio = io.BytesIO()
     await bot.download_file(file.file_path, destination=bio)
     raw_bytes = bio.getvalue()
+    if max_bytes is not None and len(raw_bytes) > max_bytes:
+        raise ValueError(f"Изображение превышает лимит {max_bytes // (1024 * 1024)} МБ")
     encoded = base64.b64encode(raw_bytes).decode("utf-8")
 
     ext = (file.file_path or "").lower().split(".")[-1]
@@ -2284,16 +2495,18 @@ async def file_id_to_base64(file_id: str) -> str:
 
 async def extract_message_image_b64(message: Message) -> str | None:
     if message.photo:
-        chosen = message.photo[-1]
-        for p in reversed(message.photo):
-            if not p.file_size or p.file_size <= 380_000:
-                chosen = p
-                break
-        return await file_id_to_base64(chosen.file_id)
+        # Telegram присылает несколько размеров одного фото; берём самый большой,
+        # который укладывается в лимит Vision, а не скачиваем файл без ограничений.
+        candidates = [photo for photo in message.photo if (photo.file_size or 0) <= MAX_VISION_IMAGE_BYTES]
+        if not candidates:
+            return None
+        chosen = max(candidates, key=lambda photo: (photo.width or 0) * (photo.height or 0))
+        return await file_id_to_base64(chosen.file_id, MAX_VISION_IMAGE_BYTES)
 
     if is_image_document(message):
-        if message.document.file_size and message.document.file_size <= 4 * 1024 * 1024:
-            return await file_id_to_base64(message.document.file_id)
+        size = message.document.file_size or 0
+        if size <= MAX_DOCUMENT_IMAGE_BYTES:
+            return await file_id_to_base64(message.document.file_id, MAX_DOCUMENT_IMAGE_BYTES)
 
     return None
 
@@ -2310,6 +2523,82 @@ def check_censorship_fast(text: str) -> bool:
     return not bool(BAD_PATTERNS.search(text))
 
 
+# --- ПРОГРАММИРОВАНИЕ: ОБЩИЙ РЕЖИМ / ROBLOX STUDIO ---
+@dp.message(F.text == "💻 Программирование")
+async def menu_programming(message: Message):
+    u = get_user(message.from_user.id)
+    current = u.get("programming_mode", "off")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🧩 Общее программирование", callback_data="prog_general")],
+        [InlineKeyboardButton(text="🎮 Roblox Studio", callback_data="prog_roblox")],
+        [InlineKeyboardButton(text="Выключить режим", callback_data="prog_off")]
+    ])
+    await message.answer(
+        f"💻 <b>Программирование</b>\nТекущий режим: <code>{html.escape(current)}</code>\n\n"
+        "В режиме «Общее» готовый код будет собираться в один файл. В режиме Roblox Studio ИИ использует персональный MCP-плагин.",
+        reply_markup=kb, parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data.in_({"prog_general", "prog_roblox", "prog_off"}))
+async def cb_programming_mode(callback: CallbackQuery):
+    uid = callback.from_user.id
+    u = get_user(uid)
+    if callback.data == "prog_general":
+        u["programming_mode"] = "general"
+        u["roblox"]["active"] = False
+        msg = "🧩 Общий режим программирования включён. Код будет отправляться одним файлом."
+    elif callback.data == "prog_roblox":
+        u["programming_mode"] = "roblox"
+        u["roblox"]["active"] = True
+        msg = "🎮 Режим Roblox Studio включён. Подключите ваш персональный MCP-плагин."
+    else:
+        u["programming_mode"] = "off"
+        msg = "Обычный режим общения включён."
+    save_data()
+    await callback.answer(msg, show_alert=True)
+    if callback.data == "prog_roblox":
+        await callback.message.answer(render_roblox_menu_text(uid), reply_markup=get_roblox_menu_kb(uid), parse_mode="HTML")
+    else:
+        await callback.message.edit_text(msg, reply_markup=None)
+
+
+@dp.callback_query(F.data.startswith("spy_view_"))
+async def cb_spy_view_ai_answer(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return await callback.answer("Недоступно", show_alert=True)
+    try:
+        _, _, uid_text, msg_text = callback.data.split("_", 3)
+        key = (int(uid_text), int(msg_text))
+    except Exception:
+        return await callback.answer("Некорректный идентификатор сообщения", show_alert=True)
+    answer = spy_ai_answers.get(key) or spy_answers_db.get(f"{key[0]}:{key[1]}")
+    if not answer:
+        return await callback.answer("Ответ ИИ ещё не сохранён или уже удалён.", show_alert=True)
+    chunks = split_long_text_smart(answer, max_len=3500)
+    await callback.answer("Ответ ИИ найден")
+    await callback.message.answer(
+        f"🤖 <b>Ответ ИИ для пользователя {key[0]}:</b>\n\n{markdown_to_tg_html(chunks[0])}",
+        parse_mode="HTML", disable_web_page_preview=True
+    )
+    for part in chunks[1:]:
+        await callback.message.answer(markdown_to_tg_html(part), parse_mode="HTML", disable_web_page_preview=True)
+
+
+def remember_spy_answer(message: Message, answer: str):
+    if not bot_config.get("spy_mode") or message.chat.type != "private":
+        return
+    key = (message.from_user.id, message.message_id)
+    clipped = answer[:30000]
+    spy_ai_answers[key] = clipped
+    spy_answers_db[f"{key[0]}:{key[1]}"] = clipped
+    while len(spy_answers_db) > 300:
+        spy_answers_db.pop(next(iter(spy_answers_db)))
+    while len(spy_ai_answers) > 300:
+        spy_ai_answers.pop(next(iter(spy_ai_answers)))
+    save_data()
+
+
 # --- БАЗОВЫЕ КОМАНДЫ ---
 @dp.message(CommandStart())
 async def start_cmd(message: Message):
@@ -2321,9 +2610,10 @@ async def start_cmd(message: Message):
         "👋 <b>Добро пожаловать в ШколоAI!</b>\n\n"
         "• 🧠 Задавайте любые вопросы и пишите код\n"
         "• 🎮 Подключайте <b>Roblox Studio (MCP)</b> — ИИ сам будет строить карты и писать скрипты на вашем плейсе!\n"
-        "• 🖼 Отправляйте фото задач, тестов и конспектов — бот всё распознает и решит\n"
+        "• 🖼 Анализ изображений доступен на Pro и Max с дневными лимитами\n"
         "• 🌐 Включайте поиск в интернете для актуальной информации\n"
-        "• 🎨 Генерируйте изображения на модели <b>GPT Image 2.5</b> (доступно в Premium)",
+        "• 🎨 Генерируйте изображения на тарифах Pro и Max\n"
+        "• 👥 Добавляйте бота в группы: общая память, функции ИИ и модерация",
         reply_markup=get_main_kb(message.from_user.id),
         parse_mode="HTML"
     )
@@ -2345,10 +2635,14 @@ async def clear_memory(message: Message):
 async def show_profile(message: Message):
     uid = message.from_user.id
     u = get_user(uid)
-    limit = bot_config["sub_limit"] if u["is_sub"] else bot_config["free_limit"]
+    plan = normalize_plan(u)
+    limit = bot_config["free_limit"] if plan == "free" else (bot_config["sub_limit"] if plan == "pro" else bot_config["sub_limit"] * 2)
     pct = (u["tokens"] / limit) * 100 if limit > 0 else 100
-    st = "💎 Premium" if u["is_sub"] else "🆓 Бесплатно"
-    sub_until = f"\n⏳ До: {u['sub_end'].strftime('%d.%m.%Y %H:%M')}" if u["is_sub"] and u["sub_end"] else ""
+    st = {"free": "🆓 Free", "pro": "💎 Pro — 49 ₽/мес.", "max": "🚀 Max — 99 ₽/мес."}[plan]
+    sub_until = f"\n⏳ До: {u['sub_end'].strftime('%d.%m.%Y %H:%M')}" if u.get("sub_end") else ""
+    cost_cap = monthly_cost_cap(u)
+    spent = float(u.get("plan_cost_rub", 0.0) or 0.0)
+    remain = max(0.0, cost_cap - spent)
     rbx_online, rbx_place = is_roblox_online(uid)
 
     kb = None
@@ -2362,27 +2656,34 @@ async def show_profile(message: Message):
         f"🏷 Статус: {st}{sub_until}\n"
         f"🧠 Модель: {models_db.get(u['current_model'], {}).get('name', u['current_model'])}\n"
         f"🎮 Roblox Studio: {'🟢 Подключен (' + html.escape(rbx_place) + ')' if rbx_online else '🔴 Не подключен'}\n"
-        f"🎨 Генерация фото ({bot_config['photo_model']}): {'✅ Доступна' if (u['is_sub'] or uid == ADMIN_ID) else '🔒 Только Premium'}\n"
+        f"🎨 Изображения сегодня: {u.get('image_analysis_count', 0)} анализов / {u.get('image_generation_count', 0)} генераций\n"
+        f"🎨 Доступ к изображениям: {'✅ Pro/Max' if plan != 'free' or uid == ADMIN_ID else '🔒 Только Pro/Max'}\n"
         f"📊 Токены: <code>{u['tokens']} / {limit}</code> ({pct:.1f}%)\n"
+        f"💳 Расходы подписки: <code>{spent:.2f} / {cost_cap:.2f} ₽</code> (осталось {remain:.2f} ₽)\n"
         f"🔄 Сброс лимита: {u['reset_date'].strftime('%d.%m.%Y')}",
         reply_markup=kb,
         parse_mode="HTML"
     )
 
 
-# --- ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ (ТОЛЬКО PREMIUM + GPT Image 2.5) ---
+# --- ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ (ТОЛЬКО PRO / MAX + GPT Image 2.5) ---
 async def run_image_generation(message: Message, uid: int, prompt: str):
     u = get_user(uid)
-    if not u["is_sub"] and uid != ADMIN_ID:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💎 Оформить Premium", callback_data="buy_sub_prompt")]
-        ])
-        return await message.answer(
-            "🔒 <b>Генерация изображений доступна только с подпиской Premium!</b>",
-            reply_markup=kb,
-            parse_mode="HTML"
-        )
+    plan = normalize_plan(u)
+    if plan == "free" and uid != ADMIN_ID:
+        return await message.answer("🔒 <b>Изображения доступны только на Pro и Max.</b>", parse_mode="HTML")
+    allowed, quota_error = check_and_consume_image_quota(u, "generation")
+    if not allowed and uid != ADMIN_ID:
+        return await message.answer(f"⚠️ {html.escape(quota_error)}", parse_mode="HTML")
+    affordable, budget_error = can_afford_request(u, 1, 1, extra_cost_rub=IMAGE_GENERATION_COST_RUB)
+    if not affordable and uid != ADMIN_ID:
+        u["image_generation_count"] = max(0, int(u.get("image_generation_count", 1)) - 1)
+        return await message.answer(f"⚠️ {html.escape(budget_error)}", parse_mode="HTML")
 
+    # Резервируем стоимость до запроса к внешнему API. При сетевом таймауте
+    # нельзя достоверно узнать, успел ли провайдер списать деньги.
+    _generation_reserved_cost = reserve_request_cost(u, 1, 1, extra_cost_rub=IMAGE_GENERATION_COST_RUB)
+    save_data()
     user_last_img_prompt[uid] = prompt
     wait_msg = await message.answer(
         f"🎨 <b>Генерирую изображение через {html.escape(bot_config['photo_model'])}...</b>\n"
@@ -2390,7 +2691,7 @@ async def run_image_generation(message: Message, uid: int, prompt: str):
         parse_mode="HTML"
     )
     try:
-        img_data, is_bytes = await generate_image_api(prompt)
+        img_data, is_bytes = await asyncio.wait_for(generate_image_api(prompt), timeout=120.0)
         try:
             await wait_msg.delete()
         except Exception:
@@ -2412,10 +2713,13 @@ async def run_image_generation(message: Message, uid: int, prompt: str):
         else:
             await message.answer_photo(photo=img_data, caption=caption, reply_markup=kb, parse_mode="HTML")
 
-        u["tokens"] += 1000
+        u["tokens"] = int(u.get("tokens", 0)) + 1000
         save_data()
     except Exception as e:
-        await wait_msg.edit_text(f"❌ Ошибка генерации изображения ({bot_config['photo_model']}): {e}")
+        # Квота и резерв стоимости сохраняются: провайдер мог принять запрос,
+        # даже если соединение оборвалось до получения ответа.
+        save_data()
+        await wait_msg.edit_text(f"❌ Ошибка или таймаут генерации изображения ({bot_config['photo_model']}): {html.escape(str(e)[:400])}", parse_mode="HTML")
 
 
 @dp.message(F.text == "🎨 Генерация фото")
@@ -2424,12 +2728,12 @@ async def menu_generate_photo(message: Message):
     uid = message.from_user.id
     u = get_user(uid)
 
-    if not u["is_sub"] and uid != ADMIN_ID:
+    if normalize_plan(u) == "free" and uid != ADMIN_ID:
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💎 Оформить Premium", callback_data="buy_sub_prompt")]
+            [InlineKeyboardButton(text="💎 Оформить Pro / Max", callback_data="buy_sub_prompt")]
         ])
         return await message.answer(
-            "🔒 <b>Генерация изображений (GPT Image 2.5) доступна только с подпиской Premium!</b>\n\n"
+            "🔒 <b>Генерация изображений (GPT Image 2.5) доступна только с подпиской Pro или Max!</b>\n\n"
             "Оформите подписку, чтобы создавать любые картинки и арты через нейросеть.",
             reply_markup=kb,
             parse_mode="HTML"
@@ -2456,8 +2760,8 @@ async def menu_generate_photo(message: Message):
 async def cb_regen_photo(callback: CallbackQuery):
     uid = callback.from_user.id
     u = get_user(uid)
-    if not u["is_sub"] and uid != ADMIN_ID:
-        return await callback.answer("🔒 Нужна подписка Premium!", show_alert=True)
+    if normalize_plan(u) == "free" and uid != ADMIN_ID:
+        return await callback.answer("🔒 Нужна подписка Pro или Max!", show_alert=True)
 
     prompt = user_last_img_prompt.get(uid)
     if not prompt:
@@ -2471,8 +2775,8 @@ async def cb_regen_photo(callback: CallbackQuery):
 async def cb_new_photo_prompt(callback: CallbackQuery):
     uid = callback.from_user.id
     u = get_user(uid)
-    if not u["is_sub"] and uid != ADMIN_ID:
-        return await callback.answer("🔒 Нужна подписка Premium!", show_alert=True)
+    if normalize_plan(u) == "free" and uid != ADMIN_ID:
+        return await callback.answer("🔒 Нужна подписка Pro или Max!", show_alert=True)
 
     u["state"] = "wait_image_prompt"
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -2490,12 +2794,12 @@ async def menu_models(message: Message):
 
     for m_id, data in models_db.items():
         prefix = "✅ " if u["current_model"] == m_id else ""
-        lock = " 🔒" if data["premium"] and not u["is_sub"] and message.from_user.id != ADMIN_ID else ""
+        lock = " 🔒" if data["premium"] and normalize_plan(u) == "free" and message.from_user.id != ADMIN_ID else ""
         vis = " 🖼" if data["vision"] else ""
         buttons.append([InlineKeyboardButton(text=f"{prefix}{data['name']}{vis}{lock}", callback_data=f"setmod_{m_id}")])
 
     await message.answer(
-        "🧠 <b>Выберите нейросеть:</b>\n<i>(🖼 — понимает фото, 🔒 — нужна подписка Premium)</i>",
+        "🧠 <b>Выберите нейросеть:</b>\n<i>(🖼 — понимает фото, 🔒 — нужна подписка Pro или Max)</i>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         parse_mode="HTML"
     )
@@ -2508,8 +2812,8 @@ async def cb_set_model(callback: CallbackQuery):
         return await callback.answer("Модель не найдена!", show_alert=True)
 
     u = get_user(callback.from_user.id)
-    if models_db[m_id]["premium"] and not u["is_sub"] and callback.from_user.id != ADMIN_ID:
-        return await callback.answer("🔒 Для этой модели нужна подписка Premium!", show_alert=True)
+    if models_db[m_id]["premium"] and normalize_plan(u) == "free" and callback.from_user.id != ADMIN_ID:
+        return await callback.answer("🔒 Для этой модели нужна подписка Pro или Max!", show_alert=True)
 
     u["current_model"] = m_id
     save_data()
@@ -2559,33 +2863,49 @@ async def cb_cancel_state(callback: CallbackQuery):
 @dp.message(F.text == "💎 Подписка / Связь")
 async def menu_subscription(message: Message):
     u = get_user(message.from_user.id)
-    u["state"] = "support_chat"
-
+    plan = normalize_plan(u)
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_state")]
+        [InlineKeyboardButton(text="💎 Pro — 49 ₽/месяц", callback_data="buy_plan_pro")],
+        [InlineKeyboardButton(text="🚀 Max — 99 ₽/месяц", callback_data="buy_plan_max")],
+        [InlineKeyboardButton(text="✉️ Написать в поддержку", callback_data="buy_sub_prompt")]
     ])
-
     await message.answer(
-        f"💎 <b>Подписка Premium</b>\n"
-        f"• Лимит: <code>{bot_config['sub_limit']}</code> токенов\n"
-        f"• Доступ ко всем топовым моделям ИИ\n"
-        f"• Доступ к генерации изображений <b>GPT Image 2.5</b> 🎨\n\n"
-        f"✍️ Напишите любое сообщение ниже, и оно сразу уйдет администратору:",
-        reply_markup=kb,
-        parse_mode="HTML"
+        f"💳 <b>Тарифы ШколоAI</b>\n\n"
+        f"<b>Pro — 49 ₽/мес.</b>\n• Увеличенные лимиты\n• Vision и генерация изображений: 4 анализа и 2 генерации в день\n"
+        f"• Доступ к Pro-моделям\n\n"
+        f"<b>Max — 99 ₽/мес.</b>\n• Повышенные лимиты\n• До 12 анализов и 6 генераций изображений в день\n"
+        f"• Приоритетные лимиты расходов\n\n"
+        f"Текущий тариф: <b>{plan.upper()}</b>.\nОплата пока подтверждается администратором вручную — автоматического платёжного провайдера в проекте нет.",
+        reply_markup=kb, parse_mode="HTML"
     )
+
+
+@dp.callback_query(F.data.in_({"buy_plan_pro", "buy_plan_max"}))
+async def cb_buy_plan(callback: CallbackQuery):
+    u = get_user(callback.from_user.id)
+    requested = "pro" if callback.data.endswith("pro") else "max"
+    u["requested_plan"] = requested
+    u["state"] = "support_chat"
+    save_data()
+    await callback.message.answer(
+        f"Вы выбрали <b>{requested.upper()}</b> ({PLAN_CONFIG[requested]['price_rub']:.0f} ₽/мес.).\n"
+        "Напишите сообщение для администратора: запрос на оформление будет отправлен вместе с выбранным тарифом.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_state")]])
+    )
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "buy_sub_prompt")
 async def cb_buy_sub_prompt(callback: CallbackQuery):
     u = get_user(callback.from_user.id)
+    u["requested_plan"] = u.get("requested_plan", "pro")
     u["state"] = "support_chat"
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_state")]
-    ])
-
-    await callback.message.answer("✍️ <b>Напишите сообщение администратору для оформления Premium:</b>", reply_markup=kb, parse_mode="HTML")
+    await callback.message.answer(
+        "✍️ <b>Напишите сообщение администратору.</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_state")]]),
+        parse_mode="HTML"
+    )
     await callback.answer()
 
 
@@ -2639,7 +2959,12 @@ async def cb_adm_stats(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
     total_u = len(users_db)
-    sub_u = sum(1 for v in users_db.values() if v["is_sub"])
+    sub_u = sum(1 for v in users_db.values() if normalize_plan(v) != "free")
+    pro_u = sum(1 for v in users_db.values() if normalize_plan(v) == "pro")
+    max_u = sum(1 for v in users_db.values() if normalize_plan(v) == "max")
+    total_cost = sum(float(v.get("api_cost_month_rub", v.get("plan_cost_rub", 0.0)) or 0.0) for v in users_db.values())
+    expected_revenue = pro_u * PLAN_CONFIG["pro"]["price_rub"] + max_u * PLAN_CONFIG["max"]["price_rub"]
+    subscription_cost_ceiling = expected_revenue * 0.50
     ban_u = sum(1 for v in users_db.values() if v["banned"])
     total_tokens = sum(v["tokens"] for v in users_db.values())
     total_rev = len(reviews_db)
@@ -2652,15 +2977,20 @@ async def cb_adm_stats(callback: CallbackQuery):
     await callback.message.edit_text(
         f"📊 <b>Статистика бота</b>\n\n"
         f"👥 Всего пользователей: <code>{total_u}</code>\n"
-        f"💎 С подпиской Premium: <code>{sub_u}</code>\n"
+        f"💎 Платных подписок: <code>{sub_u}</code> (Pro: {pro_u}, Max: {max_u})\n"
+        f"💰 Расчётная выручка по активным тарифам: <code>{expected_revenue:.2f} ₽</code> (если все подписки оплачены)\n"
+        f"💸 Учтённые расходы API за месяц: <code>{total_cost:.2f} ₽</code>\n"
+        f"🎯 Цель расходов по подпискам (не более 50% выручки): <code>{subscription_cost_ceiling:.2f} ₽</code>\n"
         f"🚫 Заблокировано: <code>{ban_u}</code>\n"
         f"🎮 Подключено студий Roblox сейчас: <code>{active_rbx}</code>\n"
         f"🔥 Потрачено токенов: <code>{total_tokens}</code>\n"
         f"⭐ Средняя оценка: <code>{avg_rev}/10</code> (Отзывов: <code>{total_rev}</code>)\n"
         f"👁 Прослушка чата: <b>{'🟢 ВКЛ' if bot_config.get('spy_mode') else '🔴 ВЫКЛ'}</b>\n\n"
         f"🆓 Бесплатный лимит: <code>{bot_config['free_limit']}</code>\n"
-        f"💎 Premium лимит: <code>{bot_config['sub_limit']}</code>\n"
+        f"💎 Pro лимит: <code>{bot_config['sub_limit']}</code> | Max: <code>{bot_config['sub_limit'] * 2}</code>\n"
         f"🎨 Модель генерации фото: <code>{bot_config['photo_model']}</code>\n"
+        f"💸 Цены учёта API (вход/выход за 1k токенов): <code>{AI_INPUT_RUB_PER_1K:.3f}/{AI_OUTPUT_RUB_PER_1K:.3f} ₽</code>\n"
+        f"💸 Себестоимость изображения: анализ <code>{VISION_IMAGE_COST_RUB:.2f} ₽</code>, генерация <code>{IMAGE_GENERATION_COST_RUB:.2f} ₽</code>\n"
         f"🌐 URL Roblox MCP: <code>{bot_config.get('mcp_public_url')}</code>",
         reply_markup=kb,
         parse_mode="HTML"
@@ -2719,7 +3049,7 @@ async def cb_adm_models(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
     await callback.message.edit_text(
-        "🧠 <b>Управление моделями ИИ</b>\nНажмите на модель, чтобы изменить её статус (Free/Premium, Vision) или удалить:",
+        "🧠 <b>Управление моделями ИИ</b>\nНажмите на модель, чтобы изменить её статус (Free/Pro/Max, Vision) или удалить:",
         reply_markup=render_admin_models_kb(),
         parse_mode="HTML"
     )
@@ -2734,7 +3064,7 @@ async def cb_adm_model_detail(callback: CallbackQuery):
         return await cb_adm_models(callback)
 
     info = models_db[m_id]
-    prem_txt = "💎 Только Premium" if info["premium"] else "🆓 Доступна всем"
+    prem_txt = "💎 Только Pro / Max" if info["premium"] else "🆓 Доступна всем"
     vis_txt = "🖼 Да (Vision)" if info["vision"] else "❌ Нет"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -2799,20 +3129,23 @@ async def cb_adm_model_add(callback: CallbackQuery):
 
 def render_user_manage_card(tid: int) -> tuple[str, InlineKeyboardMarkup]:
     u = get_user(tid)
-    sub_str = f"💎 Активна (до {u['sub_end'].strftime('%d.%m.%Y')})" if (u["is_sub"] and u["sub_end"]) else ("💎 Активна" if u["is_sub"] else "🆓 Нет")
+    sub_str = f"{normalize_plan(u).upper()} (до {u['sub_end'].strftime('%d.%m.%Y')})" if (normalize_plan(u) != "free" and u.get("sub_end")) else normalize_plan(u).upper()
     ban_str = "🚫 Забанен" if u["banned"] else "✅ Активен"
     text = (
         f"👤 <b>Карточка пользователя</b> <code>{tid}</code>\n\n"
         f"Статус: {ban_str}\n"
         f"Подписка: {sub_str}\n"
         f"Токены: <code>{u['tokens']}</code>\n"
+        f"Расход API всего за месяц: <code>{float(u.get('api_cost_month_rub', u.get('plan_cost_rub', 0.0))):.2f} ₽</code>\n"
+        f"Расход в рамках подписки: <code>{float(u.get('plan_cost_rub', 0.0)):.2f} ₽</code> / {monthly_cost_cap(u):.2f} ₽\n"
         f"Текущая модель: <code>{u['current_model']}</code>"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="💎 +30 дней Sub", callback_data=f"adm_u_sub30_{tid}"),
-            InlineKeyboardButton(text="❌ Забрать Sub", callback_data=f"adm_u_unsub_{tid}")
+            InlineKeyboardButton(text="💎 Выдать Pro 30д", callback_data=f"adm_u_pro30_{tid}"),
+            InlineKeyboardButton(text="🚀 Выдать Max 30д", callback_data=f"adm_u_max30_{tid}")
         ],
+        [InlineKeyboardButton(text="❌ Забрать подписку", callback_data=f"adm_u_unsub_{tid}")],
         [
             InlineKeyboardButton(text="🚫 Бан / Разбан", callback_data=f"adm_u_ban_{tid}"),
             InlineKeyboardButton(text="🔄 Сброс токенов", callback_data=f"adm_u_rst_{tid}")
@@ -2845,17 +3178,23 @@ async def cb_adm_user_card_actions(callback: CallbackQuery):
         text, kb = render_user_manage_card(tid)
         await callback.answer()
         return await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
-    elif act == "sub30":
+    elif act in ("pro30", "max30"):
+        plan = "pro" if act == "pro30" else "max"
         u["is_sub"] = True
+        u["plan"] = plan
         u["sub_end"] = datetime.now() + timedelta(days=30)
-        await callback.answer("Выдана подписка на 30 дней!")
+        u["plan_cost_rub"] = 0.0
+        u["plan_month"] = current_month_key()
+        await callback.answer(f"Выдана подписка {plan.upper()} на 30 дней!")
         try:
-            await bot.send_message(tid, "🎉 Вам выдана подписка <b>Premium</b> на 30 дней!", parse_mode="HTML")
+            await bot.send_message(tid, f"🎉 Вам выдана подписка <b>{plan.upper()}</b> на 30 дней!", parse_mode="HTML")
         except Exception:
             pass
     elif act == "unsub":
         u["is_sub"] = False
+        u["plan"] = "free"
         u["sub_end"] = None
+        u["plan_cost_rub"] = 0.0
         await callback.answer("Подписка отключена!")
     elif act == "ban":
         u["banned"] = not u["banned"]
@@ -2927,6 +3266,95 @@ async def cb_adm_reply_user(callback: CallbackQuery):
     await callback.answer()
 
 
+async def create_chat_completion_with_chunking(model_id: str, messages_payload: list[dict], prompt: str):
+    """Делит длинный запрос на логические блоки и агрегирует usage всех обращений."""
+    chunks = split_long_text_smart(prompt, max_len=10000)
+    base_messages = messages_payload[:-1]
+    total_input_tokens = 0
+    total_output_tokens = 0
+    final_response = None
+
+    if len(chunks) <= 1:
+        response = await create_chat_completion(
+            model=model_id, messages=messages_payload, max_tokens=4000, stream=False
+        )
+        usage = getattr(response, "usage", None)
+        prompt_tokens = getattr(usage, "prompt_tokens", None)
+        completion_tokens = getattr(usage, "completion_tokens", None)
+        if prompt_tokens is None or completion_tokens is None:
+            total = getattr(usage, "total_tokens", None) or max(
+                50, estimate_request_tokens(prompt) + estimate_request_tokens(response.choices[0].message.content or "")
+            )
+            prompt_tokens = min(int(total), estimate_request_tokens(prompt))
+            completion_tokens = max(0, int(total) - int(prompt_tokens))
+        wrapped = SimpleNamespace(
+            choices=response.choices,
+            usage=SimpleNamespace(
+                prompt_tokens=int(prompt_tokens), completion_tokens=int(completion_tokens),
+                total_tokens=int(prompt_tokens) + int(completion_tokens)
+            )
+        )
+        return wrapped, wrapped.usage.total_tokens
+
+    rolling_context = ""
+    for index, chunk in enumerate(chunks, start=1):
+        is_last = index == len(chunks)
+        if is_last:
+            task = (
+                f"Это часть {index}/{len(chunks)} большого задания. Объедини требования из всех частей "
+                "и выдай полный окончательный результат, сохранив все детали.\n\n"
+                f"Контекст предыдущих частей:\n{rolling_context[-9000:]}\n\nТекущая часть:\n{chunk}"
+            )
+        else:
+            task = (
+                f"Обработай часть {index}/{len(chunks)} большого задания. Пока НЕ выдавай финальный ответ. "
+                "Сохрани требования, ограничения, имена и связи между компонентами в компактном контексте.\n\n"
+                f"Предыдущий контекст:\n{rolling_context[-7000:]}\n\nТекущая часть:\n{chunk}"
+            )
+        part_messages = list(base_messages) + [{"role": "user", "content": task}]
+        final_response = await create_chat_completion(
+            model=model_id, messages=part_messages,
+            max_tokens=4000 if is_last else 1200, stream=False
+        )
+        part_answer = (final_response.choices[0].message.content or "").strip()
+        usage = getattr(final_response, "usage", None)
+        p_tokens = getattr(usage, "prompt_tokens", None)
+        c_tokens = getattr(usage, "completion_tokens", None)
+        if p_tokens is None or c_tokens is None:
+            total = getattr(usage, "total_tokens", None) or max(
+                50, estimate_request_tokens(task) + estimate_request_tokens(part_answer)
+            )
+            p_tokens = min(int(total), estimate_request_tokens(task))
+            c_tokens = max(0, int(total) - int(p_tokens))
+        total_input_tokens += int(p_tokens)
+        total_output_tokens += int(c_tokens)
+        rolling_context = (rolling_context + "\n\n" + part_answer).strip()
+
+    wrapped = SimpleNamespace(
+        choices=final_response.choices,
+        usage=SimpleNamespace(
+            prompt_tokens=total_input_tokens,
+            completion_tokens=total_output_tokens,
+            total_tokens=total_input_tokens + total_output_tokens
+        )
+    )
+    return wrapped, wrapped.usage.total_tokens
+
+
+def estimate_chunked_cost_tokens(messages_payload: list[dict], prompt: str) -> tuple[int, int]:
+    """Консервативная оценка всех частей, включая повторяемую системную/историческую базу."""
+    chunks = split_long_text_smart(prompt, max_len=10000)
+    base_text = "\n".join(str(item.get("content", "")) for item in messages_payload[:-1])
+    base_tokens = estimate_request_tokens(base_text)
+    chunk_tokens = sum(estimate_request_tokens(chunk) for chunk in chunks)
+    # Контекст предыдущих блоков повторяется в следующих запросах.
+    repeated_context = max(0, len(chunks) - 1) * 1200
+    estimated_input = base_tokens * len(chunks) + chunk_tokens + repeated_context
+    # Считаем максимум, который разрешён max_tokens в каждом вызове.
+    estimated_output = 4000 + max(0, len(chunks) - 1) * 1200
+    return estimated_input, estimated_output
+
+
 # =========================================================================
 # --- СБОРКА СИСТЕМНОГО ПРОМПТА И ОБРАБОТКА ВВОДА АДМИНА ---
 # =========================================================================
@@ -2953,7 +3381,15 @@ def build_system_prompt(uid: int, u: dict) -> str:
             sch_block += f"\n\nСкопируй стиль письма, лексику и уровень грамотности ученика по его примерам:\n{joined_samples}"
         parts.append(sch_block)
 
-    if u.get("roblox", {}).get("active"):
+    programming_mode = u.get("programming_mode", "off")
+    if programming_mode == "general":
+        parts.append(
+            "[ОБЩИЙ РЕЖИМ ПРОГРАММИРОВАНИЯ ВКЛЮЧЕН]: отвечай как senior-разработчик; "
+            "предоставляй полный рабочий код, не используй заглушки и многоточия; "
+            "если задача требует несколько файлов, явно разделяй их по именам и содержимому. "
+            "Не вырезай важные части ради краткости."
+        )
+    if u.get("roblox", {}).get("active") or programming_mode == "roblox":
         parts.append(ROBLOX_MCP_SYSTEM_PROMPT)
 
     return "\n\n".join(parts)
@@ -3043,7 +3479,7 @@ async def handle_admin_input(message: Message) -> bool:
         bot_config["mcp_public_url"] = txt.rstrip("/")
         admin_state.pop(ADMIN_ID, None)
         save_data()
-        await message.answer(f"✅ Публичный URL Roblox MCP изменен на:\n<code>{html.escape(bot_config['mcp_public_url'])}</code>", reply_markup=get_admin_main_kb(), parse_mode="HTML")
+        await message.answer(f"✅ Публичный URL Roblox MCP изменен на:\n<code>{html.escape(user_mcp_url(uid))}</code>", reply_markup=get_admin_main_kb(), parse_mode="HTML")
         return True
 
     elif act == "broadcast":
@@ -3065,12 +3501,320 @@ async def handle_admin_input(message: Message) -> bool:
 
 
 # =========================================================================
+# --- ГРУППОВОЙ РЕЖИМ И МОДЕРАЦИЯ ---
+# =========================================================================
+async def is_group_admin(chat_id: int, user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        return member.status in ("administrator", "creator")
+    except Exception:
+        return False
+
+
+async def bot_has_group_permission(chat_id: int, permission: str) -> bool:
+    try:
+        me = await bot.get_me()
+        member = await bot.get_chat_member(chat_id, me.id)
+        if member.status == "creator":
+            return True
+        return member.status == "administrator" and bool(getattr(member, permission, False))
+    except Exception:
+        return False
+
+
+async def bot_can_moderate(chat_id: int) -> bool:
+    # Совместимость со старым вызовом: проверяем базовую роль администратора.
+    try:
+        me = await bot.get_me()
+        member = await bot.get_chat_member(chat_id, me.id)
+        return member.status in ("administrator", "creator")
+    except Exception:
+        return False
+
+
+def group_target_id(message: Message, args: list[str], command_name: str = "") -> int | None:
+    if message.reply_to_message and message.reply_to_message.from_user:
+        return message.reply_to_message.from_user.id
+    # Для /mute одиночное число — это длительность, а не Telegram ID.
+    if command_name == "/mute" and len(args) < 2:
+        return None
+    if args and args[0].lstrip("@").isdigit():
+        return int(args[0].lstrip("@"))
+    return None
+
+
+async def handle_group_message(message: Message, user: dict):
+    chat_id = message.chat.id
+    uid = message.from_user.id
+    group = get_group(chat_id, message.chat.title or "Группа")
+    group["messages"] = int(group.get("messages", 0)) + 1
+    user_text = (message.text or message.caption or "").strip()
+    if message.new_chat_members:
+        names = ", ".join(html.escape(member.full_name) for member in message.new_chat_members[:8])
+        await message.answer(
+            f"👋 Добро пожаловать, {names}! Я ШколоAI. Напишите /grouphelp, чтобы увидеть групповые команды."
+        )
+        save_data()
+        return
+
+    command = (message.text or "").split(maxsplit=1)
+    head = command[0].split("@")[0].lower() if command else ""
+    args = command[1].split() if len(command) > 1 else []
+
+    if head in ("/grouphelp", "/helpgroup"):
+        return await message.reply(
+            "👥 <b>Команды группы</b>\n"
+            "/ai текст — задать вопрос ИИ\n/ai_on и /ai_off — включить или выключить ответы на обычные сообщения\n"
+            "/rules — правила группы; /setrules текст — установить правила (админы)\n"
+            "/warn — предупреждение (ответом на сообщение)\n/mute [мин] — ограничить участника\n"
+            "/unmute, /ban, /unban, /kick, /tempban — модерация (ответом на сообщение)\n"
+            "/unwarn, /clearwarns — управление предупреждениями.\n"
+            "/purge N — удалить последние N сообщений (до 100)\n"
+            "/roll [число], /coin, /groupstats — групповые приколюхи и статистика.\n\n"
+            "Для группового диалога упомяните бота или ответьте на его сообщение.", parse_mode="HTML"
+        )
+
+    if head == "/rules":
+        return await message.reply(f"📜 <b>Правила группы</b>\n{html.escape(group.get('rules', 'Правила не заданы.'))}", parse_mode="HTML")
+
+    if head == "/setrules":
+        if not await is_group_admin(chat_id, uid):
+            return await message.reply("⛔ Устанавливать правила могут только администраторы группы.")
+        rules = (message.text or "").partition(" ")[2].strip()
+        if not rules:
+            return await message.reply("Формат: /setrules текст правил")
+        group["rules"] = rules[:3000]
+        save_data()
+        return await message.reply("✅ Правила группы обновлены.")
+
+    if head == "/ai_on":
+        if not await is_group_admin(chat_id, uid):
+            return await message.reply("⛔ Включать автоответы могут только администраторы.")
+        group["ai_enabled"] = True
+        save_data()
+        return await message.reply("🤖 Автоответы ИИ включены. Для отключения: /ai_off")
+
+    if head == "/ai_off":
+        if not await is_group_admin(chat_id, uid):
+            return await message.reply("⛔ Выключать автоответы могут только администраторы.")
+        group["ai_enabled"] = False
+        save_data()
+        return await message.reply("🔕 Автоответы ИИ выключены. Бот по-прежнему отвечает на /ai и упоминания.")
+
+    if head in ("/roll", "/dice"):
+        import random
+        try:
+            sides = max(2, min(100000, int(args[0]))) if args else 6
+        except ValueError:
+            sides = 6
+        return await message.reply(f"🎲 Выпало: <b>{random.randint(1, sides)}</b> (из {sides})", parse_mode="HTML")
+
+    if head == "/coin":
+        import random
+        return await message.reply("🪙 Орёл!" if random.choice((True, False)) else "🪙 Решка!")
+
+    if head == "/groupstats":
+        active_warns = sum(len(v) if isinstance(v, list) else int(v or 0) for v in group.get("warnings", {}).values())
+        return await message.reply(
+            f"📊 <b>Статистика группы</b>\nСообщений с момента запуска учёта: <code>{group['messages']}</code>\n"
+            f"Участников с предупреждениями: <code>{len(group.get('warnings', {}))}</code>\nПредупреждений всего: <code>{active_warns}</code>\n"
+            f"ИИ: {'🟢 включён' if group.get('ai_enabled') else '🔴 только по команде/упоминанию'}",
+            parse_mode="HTML"
+        )
+
+    if head in ("/warn", "/warnings", "/unwarn", "/clearwarns", "/ban", "/unban", "/kick", "/tempban", "/mute", "/unmute"):
+        if not await is_group_admin(chat_id, uid):
+            return await message.reply("⛔ Эта команда доступна администраторам группы.")
+        target_id = None if head == "/clearwarns" else group_target_id(message, args, head)
+        if head == "/clearwarns":
+            group["warnings"] = {}
+            save_data()
+            return await message.reply("✅ Все предупреждения в этой группе очищены.")
+        if target_id is None:
+            return await message.reply("Ответьте командой на сообщение участника или укажите его числовой Telegram ID. Для /mute укажите длительность после ID или ответьте на сообщение.")
+        if target_id == uid:
+            return await message.reply("Нельзя применять эту команду к самому себе.")
+        warnings = group.setdefault("warnings", {})
+        wkey = str(target_id)
+        if head == "/warn":
+            count = int(warnings.get(wkey, 0)) + 1
+            warnings[wkey] = count
+            save_data()
+            if count >= 3:
+                try:
+                    if not await bot_has_group_permission(chat_id, "can_restrict_members"):
+                        raise PermissionError("Боту нужно право «Ограничивать участников».")
+                    await bot.restrict_chat_member(chat_id, target_id, permissions=ChatPermissions(can_send_messages=False), until_date=datetime.now() + timedelta(minutes=30))
+                    return await message.reply(f"⚠️ Участник <code>{target_id}</code> получил предупреждение {count}/3 и ограничение на 30 минут.", parse_mode="HTML")
+                except Exception as exc:
+                    return await message.reply(f"⚠️ Предупреждение {count}/3 выдано, но автоограничение не сработало: {html.escape(str(exc)[:200])}", parse_mode="HTML")
+            return await message.reply(f"⚠️ Предупреждение {count}/3 для <code>{target_id}</code>.", parse_mode="HTML")
+        if head == "/warnings":
+            return await message.reply(f"⚠️ У пользователя <code>{target_id}</code> предупреждений: <b>{int(warnings.get(wkey, 0))}</b>", parse_mode="HTML")
+        if head == "/unwarn":
+            current = max(0, int(warnings.get(wkey, 0)) - 1)
+            if current:
+                warnings[wkey] = current
+            else:
+                warnings.pop(wkey, None)
+            save_data()
+            return await message.reply(f"✅ Предупреждения пользователя <code>{target_id}</code>: <b>{current}</b>", parse_mode="HTML")
+        if head == "/tempban":
+            if not await bot_has_group_permission(chat_id, "can_restrict_members"):
+                return await message.reply("⚠️ Боту нужно право «Блокировать участников».")
+            duration_arg = args[0] if message.reply_to_message and args else (args[1] if len(args) > 1 else "1")
+            try:
+                days = max(1, min(366, int(duration_arg)))
+            except (TypeError, ValueError):
+                days = 1
+            until = datetime.now() + timedelta(days=days)
+            await bot.ban_chat_member(chat_id, target_id, until_date=until)
+            return await message.reply(f"⏳ Участник <code>{target_id}</code> заблокирован на {days} дн.", parse_mode="HTML")
+        if head == "/ban":
+            if not await bot_has_group_permission(chat_id, "can_restrict_members"):
+                return await message.reply("⚠️ Боту нужно право «Блокировать участников».")
+            await bot.ban_chat_member(chat_id, target_id)
+            return await message.reply(f"🚫 Участник <code>{target_id}</code> заблокирован.", parse_mode="HTML")
+        if head == "/unban":
+            if not await bot_has_group_permission(chat_id, "can_restrict_members"):
+                return await message.reply("⚠️ Боту нужно право «Блокировать участников».")
+            await bot.unban_chat_member(chat_id, target_id, only_if_banned=False)
+            warnings.pop(wkey, None)
+            save_data()
+            return await message.reply(f"✅ Блокировка пользователя <code>{target_id}</code> снята.", parse_mode="HTML")
+        if head == "/kick":
+            if not await bot_has_group_permission(chat_id, "can_restrict_members"):
+                return await message.reply("⚠️ Боту нужно право «Блокировать участников».")
+            await bot.ban_chat_member(chat_id, target_id)
+            await bot.unban_chat_member(chat_id, target_id, only_if_banned=False)
+            return await message.reply(f"👢 Участник <code>{target_id}</code> удалён из группы.", parse_mode="HTML")
+        if head == "/mute":
+            if not await bot_has_group_permission(chat_id, "can_restrict_members"):
+                return await message.reply("⚠️ Боту нужно право «Ограничивать участников».")
+            duration_arg = args[0] if message.reply_to_message and args else (args[1] if len(args) > 1 else "10")
+            try:
+                minutes = max(1, min(10080, int(duration_arg)))
+            except (TypeError, ValueError):
+                minutes = 10
+            await bot.restrict_chat_member(chat_id, target_id, permissions=ChatPermissions(can_send_messages=False), until_date=datetime.now() + timedelta(minutes=minutes))
+            return await message.reply(f"🔇 Участник <code>{target_id}</code> ограничен на {minutes} мин.", parse_mode="HTML")
+        if head == "/unmute":
+            if not await bot_has_group_permission(chat_id, "can_restrict_members"):
+                return await message.reply("⚠️ Боту нужно право «Ограничивать участников».")
+            permissions = ChatPermissions(can_send_messages=True, can_send_audios=True, can_send_documents=True,
+                                          can_send_photos=True, can_send_videos=True, can_send_video_notes=True,
+                                          can_send_voice_notes=True, can_send_polls=True, can_send_other_messages=True,
+                                          can_add_web_page_previews=True)
+            await bot.restrict_chat_member(chat_id, target_id, permissions=permissions)
+            return await message.reply(f"🔊 Ограничение пользователя <code>{target_id}</code> снято.", parse_mode="HTML")
+
+    if head == "/purge":
+        if not await is_group_admin(chat_id, uid):
+            return await message.reply("⛔ Команда доступна только администраторам.")
+        if not await bot_has_group_permission(chat_id, "can_delete_messages"):
+            return await message.reply("⚠️ Боту нужно право «Удалять сообщения».")
+        if not message.reply_to_message:
+            return await message.reply("Ответьте на сообщение командой /purge 20")
+        try:
+            count = max(1, min(100, int(args[0]) if args else 20))
+        except ValueError:
+            count = 20
+        start_id = message.reply_to_message.message_id
+        ids = list(range(start_id, min(message.message_id, start_id + count)))
+        try:
+            await bot.delete_messages(chat_id, ids)
+            await message.delete()
+        except Exception as exc:
+            return await message.reply(f"Не удалось удалить сообщения: {html.escape(str(exc)[:180])}", parse_mode="HTML")
+        return
+
+    # Для группы используем общую историю чата, но расходы списываем с автора запроса.
+    try:
+        bot_me = await bot.get_me()
+    except Exception:
+        bot_me = None
+    bot_username = (bot_me.username or "") if bot_me else ""
+    bot_id = bot_me.id if bot_me else None
+    mentioned = bool(message.text and bot_username and f"@{bot_username}".lower() in message.text.lower())
+    replied_to_bot = bool(
+        message.reply_to_message and message.reply_to_message.from_user and bot_id
+        and message.reply_to_message.from_user.id == bot_id
+    )
+    explicit_ai = head == "/ai" or mentioned or replied_to_bot
+    if not explicit_ai and not group.get("ai_enabled"):
+        save_data()
+        return
+    if head == "/ai":
+        user_text = message.text.partition(" ")[2].strip() if message.text else ""
+    elif mentioned and message.text and bot_username:
+        user_text = re.sub(r"@" + re.escape(bot_username), "", message.text, flags=re.I).strip()
+    if not user_text:
+        return await message.reply("Напишите вопрос после /ai или упомяните меня в сообщении.")
+    if user.get("banned") and uid != ADMIN_ID:
+        return
+    group_history = group.setdefault("history", [])
+    plan = normalize_plan(user)
+    user_token_limit = bot_config["free_limit"] if plan == "free" else bot_config["sub_limit"] * (2 if plan == "max" else 1)
+    if uid != ADMIN_ID and int(user.get("tokens", 0)) >= user_token_limit:
+        return await message.reply(f"⚠️ Лимит токенов исчерпан: {user.get('tokens', 0)}/{user_token_limit}.")
+
+    group_prompt = (
+        "Ты ИИ-ассистент группового чата Telegram. Отвечай дружелюбно, не перегружай чат. "
+        "Учитывай, что ответ видят все участники. Не раскрывай личные данные участников.\n"
+        f"Название группы: {group.get('title', 'Группа')}.\nПравила группы: {group.get('rules', '')}"
+    )
+    messages = [{"role": "system", "content": group_prompt}]
+    for item in group_history[-12:]:
+        if item.get("role") in ("user", "assistant"):
+            messages.append({"role": item["role"], "content": item.get("content", "")})
+    group_user_prompt = f"{message.from_user.full_name}: {user_text}"
+    messages.append({"role": "user", "content": group_user_prompt})
+    est_in, est_out = estimate_chunked_cost_tokens(messages, group_user_prompt)
+    affordable, reason = can_afford_request(user, est_in, est_out)
+    if not affordable and uid != ADMIN_ID:
+        return await message.reply(f"⚠️ {html.escape(reason)}", parse_mode="HTML")
+    group_reserved_cost = reserve_request_cost(user, est_in, est_out)
+    save_data()
+    status = await message.reply("🤖 Думаю...")
+    try:
+        response, _ = await create_chat_completion_with_chunking(
+            user.get("current_model", DEFAULT_MODEL), messages, group_user_prompt
+        )
+        answer = (response.choices[0].message.content or "").strip()
+        if not answer:
+            answer = "Не получилось сформировать ответ. Попробуйте переформулировать запрос."
+        group_history.extend([
+            {"role": "user", "content": f"{message.from_user.full_name}: {user_text}"},
+            {"role": "assistant", "content": answer}
+        ])
+        group["history"] = group_history[-MAX_GROUP_HISTORY:]
+        usage = getattr(response, "usage", None)
+        input_used = int(getattr(usage, "prompt_tokens", 0) or est_in)
+        output_used = int(getattr(usage, "completion_tokens", 0) or estimate_request_tokens(answer))
+        record_ai_usage(user, input_used, output_used, reserved_cost_rub=group_reserved_cost)
+        save_data()
+        await status.delete()
+        await send_smart_ai_response(message, answer, programming=user.get("programming_mode") == "general")
+    except Exception as exc:
+        try:
+            await status.edit_text(f"❌ Ошибка ИИ: {html.escape(str(exc)[:300])}", parse_mode="HTML")
+        except Exception:
+            await message.reply(f"❌ Ошибка ИИ: {str(exc)[:200]}")
+    save_data()
+
+
+# =========================================================================
 # --- ГЛАВНЫЙ ОБРАБОТЧИК СООБЩЕНИЙ, ФОТО, ФАЙЛОВ И ROBLOX MCP ---
 # =========================================================================
 @dp.message()
 async def handle_all_messages(message: Message):
+    if not message.from_user:
+        return
     uid = message.from_user.id
     u = get_user(uid)
+
+    if message.chat.type in ("group", "supergroup"):
+        return await handle_group_message(message, u)
 
     if u["banned"] and uid != ADMIN_ID:
         return await message.answer("🚫 Ваш аккаунт заблокирован.")
@@ -3080,6 +3824,16 @@ async def handle_all_messages(message: Message):
         return
 
     user_text = (message.text or message.caption or "").strip()
+
+    # Переключение поиска учитывается как системное событие в истории диалога.
+    if user_text.startswith("🌐 Поиск:"):
+        u["web_search"] = not bool(u.get("web_search", False))
+        event_text = "Пользователь включил веб-поиск." if u["web_search"] else "Пользователь выключил веб-поиск."
+        u["history"].append({"role": "user", "content": f"[Настройка] {event_text}"})
+        u["history"] = u["history"][-14:]
+        save_data()
+        status = "🟢 включён" if u["web_search"] else "🔴 выключен"
+        return await message.answer(f"🌐 Поиск {status}. Изменение сохранено в контексте диалога.", reply_markup=get_main_kb(uid))
 
     # --- ОБРАБОТКА АКТИВНЫХ СОСТОЯНИЙ ПОЛЬЗОВАТЕЛЯ ---
     state = u.get("state")
@@ -3140,9 +3894,10 @@ async def handle_all_messages(message: Message):
         try:
             await bot.send_message(
                 ADMIN_ID,
-                f"🆘 <b>Обращение в поддержку / покупка Sub</b>\n"
+                f"🆘 <b>Заявка в поддержку / подписка</b>\n"
                 f"👤 От: <b>{html.escape(message.from_user.full_name or 'Юзер')}</b> ({uname})\n"
-                f"🆔 ID: <code>{uid}</code>\n\n"
+                f"🆔 ID: <code>{uid}</code>\n"
+                f"💳 Запрошенный тариф: <b>{html.escape(str(u.get('requested_plan', 'pro')).upper())}</b>\n\n"
                 f"💬 <b>Текст:</b>\n{html.escape(user_text or '[Медиафайл]')}",
                 reply_markup=kb,
                 parse_mode="HTML"
@@ -3187,20 +3942,38 @@ async def handle_all_messages(message: Message):
         return await message.answer(f"⚠️ Запрос содержит запрещенный контент! Предупреждение {u['strikes']}/3.")
 
     # --- ПРОВЕРКА ЛИМИТА ТОКЕНОВ ---
-    limit = bot_config["sub_limit"] if u["is_sub"] else bot_config["free_limit"]
+    plan = normalize_plan(u)
+    limit = bot_config["free_limit"] if plan == "free" else bot_config["sub_limit"] * (2 if plan == "max" else 1)
     if uid != ADMIN_ID and u["tokens"] >= limit:
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💎 Оформить Premium", callback_data="buy_sub_prompt")]
+            [InlineKeyboardButton(text="💎 Оформить Pro / Max", callback_data="buy_sub_prompt")]
         ])
         return await message.answer(
             f"⚠️ <b>Вы исчерпали лимит токенов ({u['tokens']} / {limit})!</b>\n"
-            f"Оформите подписку Premium для увеличения лимита до {bot_config['sub_limit']} токенов.",
+            f"Оформите Pro или Max для увеличения лимита токенов (Max даёт вдвое больше Pro).",
             reply_markup=kb,
             parse_mode="HTML"
         )
 
+    # Фото на Free запрещено до скачивания файла — это экономит трафик и ресурсы.
+    has_image = bool(message.photo or is_image_document(message))
+    if has_image and normalize_plan(u) == "free" and uid != ADMIN_ID:
+        return await message.answer(
+            "🔒 Анализ изображений доступен только на Pro и Max. Фото не скачивалось и не отправлялось в ИИ.",
+            parse_mode="HTML"
+        )
+
     # --- ИЗВЛЕЧЕНИЕ ИЗОБРАЖЕНИЯ ИЛИ ДОКУМЕНТА ---
-    b64_img = await extract_message_image_b64(message)
+    try:
+        b64_img = await extract_message_image_b64(message) if has_image else None
+    except ValueError as image_error:
+        return await message.answer(f"⚠️ {html.escape(str(image_error))}", parse_mode="HTML")
+    if has_image and b64_img is None:
+        return await message.answer(
+            f"⚠️ Изображение слишком большое. Лимит: до {MAX_VISION_IMAGE_BYTES // (1024 * 1024)} МБ для фото "
+            f"или до {MAX_DOCUMENT_IMAGE_BYTES // (1024 * 1024)} МБ для файла-картинки.",
+            parse_mode="HTML"
+        )
     if b64_img:
         user_image_cache[uid] = b64_img
 
@@ -3224,15 +3997,27 @@ async def handle_all_messages(message: Message):
 
     # --- ЕСЛИ ОТПРАВЛЕНО ФОТО (VISION) ---
     if b64_img:
-        wait_msg = await message.answer("🖼 <i>Анализирую изображение...</i>", parse_mode="HTML")
+        if normalize_plan(u) == "free" and uid != ADMIN_ID:
+            return await message.answer("🔒 Анализ изображений доступен только на Pro и Max.", parse_mode="HTML")
+        allowed, quota_error = check_and_consume_image_quota(u, "analysis")
+        if not allowed and uid != ADMIN_ID:
+            return await message.answer(f"⚠️ {html.escape(quota_error)}", parse_mode="HTML")
+        estimated_in = estimate_request_tokens(user_text) + estimate_request_tokens(sys_prompt) + 1200
+        affordable, budget_error = can_afford_request(u, estimated_in, 1800, extra_cost_rub=VISION_IMAGE_COST_RUB)
+        if not affordable and uid != ADMIN_ID:
+            u["image_analysis_count"] = max(0, int(u.get("image_analysis_count", 1)) - 1)
+            return await message.answer(f"⚠️ {html.escape(budget_error)}", parse_mode="HTML")
+        vision_reserved_cost = reserve_request_cost(u, estimated_in, 1800, extra_cost_rub=VISION_IMAGE_COST_RUB)
+        save_data()
+        wait_msg = await message.answer("🖼 <i>Анализирую изображение (ограниченный таймаут)...</i>", parse_mode="HTML")
         try:
-            ans = await create_vision_completion(
+            ans = await asyncio.wait_for(create_vision_completion(
                 preferred_model=model_id,
                 sys_prompt=sys_prompt,
                 history=u["history"],
                 user_text=user_text,
                 b64_image=b64_img
-            )
+            ), timeout=85.0)
             try:
                 await wait_msg.delete()
             except Exception:
@@ -3241,12 +4026,17 @@ async def handle_all_messages(message: Message):
             u["history"].append({"role": "user", "content": user_text or "[Изображение]"})
             u["history"].append({"role": "assistant", "content": ans})
             u["history"] = u["history"][-14:]
-            u["tokens"] += max(200, (len(user_text) + len(ans)) // 3)
+            input_est = estimated_in
+            output_est = estimate_request_tokens(ans)
+            record_ai_usage(u, input_est, output_est, VISION_IMAGE_COST_RUB, reserved_cost_rub=vision_reserved_cost)
             save_data()
-
-            return await send_smart_ai_response(message, ans)
+            remember_spy_answer(message, ans)
+            return await send_smart_ai_response(message, ans, programming=u.get("programming_mode") == "general")
         except Exception as e:
-            return await wait_msg.edit_text(f"❌ Ошибка при анализе фото: {e}")
+            # При таймауте неизвестно, успел ли провайдер обработать и тарифицировать фото.
+            # Квота и зарезервированная себестоимость остаются списанными.
+            save_data()
+            return await wait_msg.edit_text(f"❌ Анализ фото не завершился: {html.escape(str(e)[:500])}")
 
     # --- ПОИСК В ИНТЕРНЕТЕ (ЕСЛИ ВКЛЮЧЕН) ---
     web_context = ""
@@ -3270,13 +4060,21 @@ async def handle_all_messages(message: Message):
         messages_payload.append({"role": h["role"], "content": h["content"]})
     messages_payload.append({"role": "user", "content": full_user_prompt})
 
+    estimated_in, estimated_out = estimate_chunked_cost_tokens(messages_payload, full_user_prompt)
+    affordable, budget_error = can_afford_request(u, estimated_in, estimated_out)
+    if not affordable and uid != ADMIN_ID:
+        try:
+            await wait_msg.delete()
+        except Exception:
+            pass
+        return await message.answer(f"⚠️ {html.escape(budget_error)}", parse_mode="HTML")
+    text_reserved_cost = reserve_request_cost(u, estimated_in, estimated_out)
+    save_data()
+
     try:
-        resp = await create_chat_completion(
-            model=model_id,
-            messages=messages_payload,
-            max_tokens=4000,
-            stream=False
-        )
+        resp, _total_usage = await create_chat_completion_with_chunking(model_id, messages_payload, full_user_prompt)
+        total_prompt_tokens = int(getattr(resp.usage, "prompt_tokens", 0) or estimated_in)
+        total_completion_tokens = int(getattr(resp.usage, "completion_tokens", 0) or estimated_out)
         ai_reply = (resp.choices[0].message.content or "").strip()
 
         # --- ЦИКЛ ВЫПОЛНЕНИЯ КОМАНД В ROBLOX STUDIO (MCP AGENT LOOP) ---
@@ -3305,12 +4103,35 @@ async def handle_all_messages(message: Message):
                     "content": "Результаты выполнения MCP инструментов в Roblox Studio:\n" + "\n\n".join(tool_results)
                 })
 
-                resp = await create_chat_completion(
+                tool_input_estimate = estimate_request_tokens(json.dumps(messages_payload, ensure_ascii=False))
+                tool_affordable, tool_budget_error = can_afford_request(u, tool_input_estimate, 4000)
+                if not tool_affordable and uid != ADMIN_ID:
+                    tool_summary = "\n".join(tool_results)[:5000]
+                    ai_reply = (
+                        "✅ Команды Roblox Studio выполнены.\n\n"
+                        f"⚠️ Финальный проход ИИ остановлен бюджетным ограничением: {tool_budget_error}\n\n"
+                        f"Результаты инструментов:\n{tool_summary}"
+                    )
+                    break
+                tool_reserved_cost = reserve_request_cost(u, tool_input_estimate, 4000)
+                text_reserved_cost += tool_reserved_cost
+                save_data()
+                tool_response = await create_chat_completion(
                     model=model_id,
                     messages=messages_payload,
                     max_tokens=4000,
                     stream=False
                 )
+                tool_usage = getattr(tool_response, "usage", None)
+                tool_prompt = getattr(tool_usage, "prompt_tokens", None)
+                tool_completion = getattr(tool_usage, "completion_tokens", None)
+                if tool_prompt is None or tool_completion is None:
+                    tool_total = getattr(tool_usage, "total_tokens", 0) or 0
+                    tool_prompt = min(int(tool_total), estimate_request_tokens(json.dumps(messages_payload, ensure_ascii=False)))
+                    tool_completion = max(0, int(tool_total) - int(tool_prompt))
+                total_prompt_tokens += int(tool_prompt)
+                total_completion_tokens += int(tool_completion)
+                resp = tool_response
                 ai_reply = (resp.choices[0].message.content or "").strip()
 
         # Очищаем служебные теги <mcp_call>, если остались
@@ -3325,13 +4146,15 @@ async def handle_all_messages(message: Message):
         u["history"].append({"role": "assistant", "content": clean_reply})
         u["history"] = u["history"][-14:]
 
-        used_tokens = getattr(getattr(resp, "usage", None), "total_tokens", None)
-        if not used_tokens:
-            used_tokens = max(50, (len(full_user_prompt) + len(clean_reply)) // 3)
-        u["tokens"] += int(used_tokens)
+        if total_prompt_tokens <= 0:
+            total_prompt_tokens = estimate_request_tokens(full_user_prompt) + estimate_request_tokens(sys_prompt)
+        if total_completion_tokens <= 0:
+            total_completion_tokens = estimate_request_tokens(clean_reply)
+        record_ai_usage(u, total_prompt_tokens, total_completion_tokens, reserved_cost_rub=text_reserved_cost)
         save_data()
+        remember_spy_answer(message, clean_reply)
 
-        await send_smart_ai_response(message, clean_reply)
+        await send_smart_ai_response(message, clean_reply, programming=u.get("programming_mode") == "general")
 
     except Exception as e:
         try:

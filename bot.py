@@ -3,6 +3,8 @@ import io
 import re
 import json
 import html
+import uuid
+import secrets
 import base64
 import time
 import asyncio
@@ -11,6 +13,7 @@ from datetime import datetime, timedelta
 from typing import Callable, Dict, Any, Awaitable
 
 import aiohttp
+from aiohttp import web
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.filters import Command, CommandStart
@@ -49,6 +52,10 @@ PHOTO_GENERATIONAL_KEY = clean_env("PHOTO_GENERATIONAL_KEY", AI_API_KEY)
 PHOTO_BASE_URL = clean_env("PHOTO_BASE_URL", "https://api.podpiski-neiroseti.shop")
 PHOTO_MODEL = clean_env("PHOTO_MODEL", "gpt-image-2.5")
 
+# --- НАСТРОЙКИ ROBLOX STUDIO MCP СЕРВЕРА ---
+MCP_PORT = int(clean_env("MCP_PORT", clean_env("PORT", "8080")))
+MCP_PUBLIC_URL = clean_env("MCP_PUBLIC_URL", f"http://127.0.0.1:{MCP_PORT}").rstrip("/")
+
 DATA_FILE = "bot_data.json"
 
 # Динамические настройки (сохраняются в БД)
@@ -56,7 +63,8 @@ bot_config = {
     "free_limit": int(clean_env("FREE_LIMIT", "45000")),
     "sub_limit": int(clean_env("SUB_LIMIT", "1000000")),
     "photo_model": PHOTO_MODEL,
-    "spy_mode": False  # Переключатель прослушки сообщений для владельца
+    "spy_mode": False,  # Переключатель прослушки сообщений для владельца
+    "mcp_public_url": MCP_PUBLIC_URL
 }
 
 BASE_SYSTEM_PROMPT = os.getenv(
@@ -121,6 +129,24 @@ anti_spam = {}
 admin_reply_target = {}
 admin_state = {}
 
+# --- ХРАНИЛИЩЕ СЕССИЙ И ЗАДАЧ ROBLOX MCP ---
+rbx_token_to_uid: dict[str, int] = {}
+rbx_sessions: dict[str, dict] = {}               # token -> {"last_seen": float, "place_name": str}
+rbx_pending_tasks: dict[str, list[dict]] = {}    # token -> [{"id": str, "tool": str, "args": dict}]
+rbx_task_events: dict[str, asyncio.Event] = {}   # token -> Event (для мгновенного Long-Polling)
+rbx_task_futures: dict[str, asyncio.Future] = {} # task_id -> Future
+
+
+def generate_rbx_token(uid: int) -> str:
+    return f"RBX-{uid}-{secrets.token_hex(4).upper()}"
+
+
+def rebuild_rbx_token_index():
+    rbx_token_to_uid.clear()
+    for uid, u in users_db.items():
+        if "roblox" in u and u["roblox"].get("token"):
+            rbx_token_to_uid[u["roblox"]["token"]] = uid
+
 
 # --- СОХРАНЕНИЕ И ЗАГРУЗКА БАЗЫ ДАННЫХ (JSON) ---
 def save_data():
@@ -158,6 +184,8 @@ def load_data():
                 bot_config["photo_model"] = PHOTO_MODEL
             if "spy_mode" not in bot_config:
                 bot_config["spy_mode"] = False
+            if "mcp_public_url" not in bot_config:
+                bot_config["mcp_public_url"] = MCP_PUBLIC_URL
         if "models_db" in payload and payload["models_db"]:
             models_db.update(payload["models_db"])
         if "reviews_db" in payload and isinstance(payload["reviews_db"], list):
@@ -167,9 +195,718 @@ def load_data():
                 uid = int(uid_str)
                 u["sub_end"] = datetime.fromisoformat(u["sub_end"]) if u.get("sub_end") else None
                 u["reset_date"] = datetime.fromisoformat(u["reset_date"]) if u.get("reset_date") else (datetime.now() + timedelta(days=30))
+                if "roblox" not in u:
+                    u["roblox"] = {
+                        "active": False,
+                        "token": generate_rbx_token(uid)
+                    }
                 users_db[uid] = u
+        rebuild_rbx_token_index()
     except Exception as e:
         print(f"[DB Warning] Ошибка чтения данных: {e}")
+
+
+# =========================================================================
+# --- КОД ПЛАГИНА ROBLOX STUDIO (ШАБЛОН LUAU) ---
+# =========================================================================
+ROBLOX_PLUGIN_LUA_TEMPLATE = r'''--[[
+    🤖 ШколоAI — Roblox Studio MCP Plugin
+    Позволяет ИИ из Telegram-бота управлять вашим плейсом, создавать объекты и писать скрипты.
+    Поддерживает отмену действий через Ctrl + Z (ChangeHistoryService).
+]]
+
+local HttpService = game:GetService("HttpService")
+local ChangeHistoryService = game:GetService("ChangeHistoryService")
+local Selection = game:GetService("Selection")
+local RunService = game:GetService("RunService")
+
+-- Преднастроенные данные вашего аккаунта из Telegram-бота:
+local DEFAULT_SERVER_URL = "__SERVER_URL__"
+local DEFAULT_TOKEN = "__USER_TOKEN__"
+
+local toolbar = plugin:CreateToolbar("🤖 ШколоAI MCP")
+local toggleBtn = toolbar:CreateButton(
+    "ШколоAI MCP",
+    "Открыть панель подключения к Telegram-боту ШколоAI",
+    "rbxassetid://6031075938"
+)
+
+local widgetInfo = DockWidgetPluginGuiInfo.new(
+    Enum.InitialDockState.Float,
+    false,
+    false,
+    340,
+    420,
+    280,
+    320
+)
+
+local widget = plugin:CreateDockWidgetPluginGui("ShkoloAI_MCP_Widget_v1", widgetInfo)
+widget.Title = "🤖 ШколоAI — Roblox MCP"
+
+-- UI Оформление
+local bg = Instance.new("Frame")
+bg.Size = UDim2.new(1, 0, 1, 0)
+bg.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+bg.BorderSizePixel = 0
+bg.Parent = widget
+
+local pad = Instance.new("UIPadding")
+pad.PaddingTop = UDim.new(0, 10)
+pad.PaddingBottom = UDim.new(0, 10)
+pad.PaddingLeft = UDim.new(0, 10)
+pad.PaddingRight = UDim.new(0, 10)
+pad.Parent = bg
+
+local function createLabel(text, posY, sizeY, color, bold)
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, 0, 0, sizeY)
+    lbl.Position = UDim2.new(0, 0, 0, posY)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = text
+    lbl.TextColor3 = color or Color3.fromRGB(230, 230, 230)
+    lbl.Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham
+    lbl.TextSize = 13
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = bg
+    return lbl
+end
+
+local function createInput(defaultText, placeholder, posY)
+    local box = Instance.new("TextBox")
+    box.Size = UDim2.new(1, 0, 0, 30)
+    box.Position = UDim2.new(0, 0, 0, posY)
+    box.BackgroundColor3 = Color3.fromRGB(45, 45, 52)
+    box.BorderSizePixel = 0
+    box.Text = defaultText
+    box.PlaceholderText = placeholder
+    box.TextColor3 = Color3.fromRGB(255, 255, 255)
+    box.PlaceholderColor3 = Color3.fromRGB(140, 140, 140)
+    box.Font = Enum.Font.Code
+    box.TextSize = 13
+    box.ClearTextOnFocus = false
+    box.Parent = bg
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 6)
+    corner.Parent = box
+    return box
+end
+
+createLabel("🌐 URL MCP-сервера бота:", 0, 18, nil, true)
+local urlBox = createInput(plugin:GetSetting("ShkoloAI_URL") or DEFAULT_SERVER_URL, "http://127.0.0.1:8080", 20)
+
+createLabel("🔑 Ваш MCP Токен из бота:", 58, 18, nil, true)
+local tokenBox = createInput(plugin:GetSetting("ShkoloAI_Token") or DEFAULT_TOKEN, "RBX-...", 78)
+
+local statusLabel = createLabel("🔴 Статус: Отключено", 116, 20, Color3.fromRGB(255, 100, 100), true)
+
+local connectBtn = Instance.new("TextButton")
+connectBtn.Size = UDim2.new(1, 0, 0, 36)
+connectBtn.Position = UDim2.new(0, 0, 0, 142)
+connectBtn.BackgroundColor3 = Color3.fromRGB(46, 160, 67)
+connectBtn.BorderSizePixel = 0
+connectBtn.Text = "🔌 ПОДКЛЮЧИТЬСЯ К БОТУ"
+connectBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+connectBtn.Font = Enum.Font.GothamBold
+connectBtn.TextSize = 14
+connectBtn.Parent = bg
+local btnCorner = Instance.new("UICorner")
+btnCorner.CornerRadius = UDim.new(0, 6)
+btnCorner.Parent = connectBtn
+
+createLabel("📜 Журнал действий ИИ:", 186, 18, Color3.fromRGB(180, 180, 190), true)
+
+local logScroll = Instance.new("ScrollingFrame")
+logScroll.Size = UDim2.new(1, 0, 1, -210)
+logScroll.Position = UDim2.new(0, 0, 0, 208)
+logScroll.BackgroundColor3 = Color3.fromRGB(20, 20, 24)
+logScroll.BorderSizePixel = 0
+logScroll.ScrollBarThickness = 6
+logScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+logScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+logScroll.Parent = bg
+
+local logLayout = Instance.new("UIListLayout")
+logLayout.SortOrder = Enum.SortOrder.LayoutOrder
+logLayout.Padding = UDim.new(0, 4)
+logLayout.Parent = logScroll
+
+local logOrder = 0
+local function addLog(txt, color)
+    logOrder += 1
+    local item = Instance.new("TextLabel")
+    item.LayoutOrder = logOrder
+    item.Size = UDim2.new(1, -10, 0, 0)
+    item.AutomaticSize = Enum.AutomaticSize.Y
+    item.BackgroundTransparency = 1
+    item.Text = os.date("[%H:%M:%S] ") .. tostring(txt)
+    item.TextColor3 = color or Color3.fromRGB(210, 210, 210)
+    item.Font = Enum.Font.Code
+    item.TextSize = 12
+    item.TextWrapped = true
+    item.TextXAlignment = Enum.TextXAlignment.Left
+    item.Parent = logScroll
+    task.defer(function()
+        logScroll.CanvasPosition = Vector2.new(0, 999999)
+    end)
+end
+
+toggleBtn.Click:Connect(function()
+    widget.Enabled = not widget.Enabled
+end)
+
+-- =========================================================================
+-- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ROBLOX MCP
+-- =========================================================================
+local function resolveInstance(pathStr)
+    if not pathStr or pathStr == "" or pathStr == "game" then
+        return game
+    end
+    local clean = pathStr:gsub("^game%.", "")
+    local parts = string.split(clean, ".")
+    local current = game
+
+    for i, part in ipairs(parts) do
+        if i == 1 then
+            if part == "Workspace" or part == "workspace" then
+                current = workspace
+            else
+                local ok, srv = pcall(function() return game:GetService(part) end)
+                if ok and srv then
+                    current = srv
+                else
+                    current = game:FindFirstChild(part)
+                end
+            end
+        else
+            if current then
+                current = current:FindFirstChild(part)
+            end
+        end
+        if not current then
+            return nil
+        end
+    end
+    return current
+end
+
+local function parsePropertyValue(val)
+    if type(val) == "table" then
+        local t = val._type
+        if t == "Vector3" then
+            return Vector3.new(tonumber(val.x) or 0, tonumber(val.y) or 0, tonumber(val.z) or 0)
+        elseif t == "Color3" then
+            return Color3.fromRGB(tonumber(val.r) or 255, tonumber(val.g) or 255, tonumber(val.b) or 255)
+        elseif t == "CFrame" then
+            return CFrame.new(tonumber(val.x) or 0, tonumber(val.y) or 0, tonumber(val.z) or 0)
+        elseif t == "UDim2" then
+            return UDim2.new(tonumber(val.sx) or 0, tonumber(val.ox) or 0, tonumber(val.sy) or 0, tonumber(val.oy) or 0)
+        end
+    elseif type(val) == "string" then
+        local vx, vy, vz = val:match("^Vector3%(([%-%d%.]+),%s*([%-%d%.]+),%s*([%-%d%.]+)%)$")
+        if vx then
+            return Vector3.new(tonumber(vx), tonumber(vy), tonumber(vz))
+        end
+        local cr, cg, cb = val:match("^Color3%(([%d%.]+),%s*([%d%.]+),%s*([%d%.]+)%)$")
+        if cr then
+            return Color3.fromRGB(tonumber(cr), tonumber(cg), tonumber(cb))
+        end
+        local hex = val:match("^#(%x%x%x%x%x%x)$")
+        if hex then
+            return Color3.fromHex(hex)
+        end
+        local bc = val:match("^BrickColor%((.+)%)$")
+        if bc then
+            return BrickColor.new(bc)
+        end
+        if val:sub(1, 5) == "Enum." then
+            local ep = string.split(val, ".")
+            if #ep == 3 and Enum[ep[2]] and Enum[ep[2]][ep[3]] then
+                return Enum[ep[2]][ep[3]]
+            end
+        end
+    end
+    return val
+end
+
+local function serializeTree(inst, depth, maxDepth)
+    local node = {
+        Name = inst.Name,
+        ClassName = inst.ClassName,
+        Path = inst:GetFullName()
+    }
+    if depth < maxDepth then
+        local children = inst:GetChildren()
+        if #children > 0 then
+            node.Children = {}
+            for idx, ch in ipairs(children) do
+                if idx <= 60 then
+                    table.insert(node.Children, serializeTree(ch, depth + 1, maxDepth))
+                else
+                    table.insert(node.Children, {Name = "...еще " .. (#children - 60) .. " объектов", ClassName = "Info"})
+                    break
+                end
+            end
+        end
+    else
+        node.ChildrenCount = #inst:GetChildren()
+    end
+    return node
+end
+
+-- =========================================================================
+-- ОБРАБОТЧИКИ ИНСТРУМЕНТОВ MCP
+-- =========================================================================
+local tools = {}
+
+tools.get_explorer_tree = function(args)
+    local pathStr = args.path or "game"
+    local maxDepth = math.clamp(tonumber(args.depth) or 2, 1, 5)
+    if pathStr == "game" then
+        local services = {"Workspace", "ReplicatedStorage", "ServerScriptService", "ServerStorage", "StarterGui", "StarterPack", "StarterPlayer", "Lighting"}
+        local result = {}
+        for _, sName in ipairs(services) do
+            local ok, srv = pcall(function() return game:GetService(sName) end)
+            if ok and srv then
+                table.insert(result, serializeTree(srv, 1, maxDepth))
+            end
+        end
+        return HttpService:JSONEncode(result)
+    else
+        local target = resolveInstance(pathStr)
+        if not target then
+            error("Объект не найден по пути: " .. tostring(pathStr))
+        end
+        return HttpService:JSONEncode(serializeTree(target, 0, maxDepth))
+    end
+end
+
+tools.read_script = function(args)
+    local target = resolveInstance(args.path)
+    if not target then
+        error("Скрипт не найден: " .. tostring(args.path))
+    end
+    if not target:IsA("LuaSourceContainer") then
+        error("Объект " .. target:GetFullName() .. " не является скриптом (" .. target.ClassName .. ")")
+    end
+    return target.Source
+end
+
+tools.write_script = function(args)
+    ChangeHistoryService:SetWaypoint("Before ShkoloAI write_script")
+    local parent = resolveInstance(args.parent_path or "ServerScriptService")
+    if not parent then
+        error("Родительский объект не найден: " .. tostring(args.parent_path))
+    end
+    local scriptName = args.name or "AIScript"
+    local className = args.class_name or "Script"
+    if className ~= "Script" and className ~= "LocalScript" and className ~= "ModuleScript" then
+        className = "Script"
+    end
+
+    local scr = parent:FindFirstChild(scriptName)
+    if scr and not scr:IsA("LuaSourceContainer") then
+        scr = nil
+    end
+    if not scr then
+        scr = Instance.new(className)
+        scr.Name = scriptName
+        scr.Parent = parent
+    end
+    scr.Source = args.source or ""
+    Selection:Set({scr})
+    ChangeHistoryService:SetWaypoint("After ShkoloAI write_script")
+    return "Скрипт успешно сохранен: " .. scr:GetFullName()
+end
+
+tools.create_instance = function(args)
+    ChangeHistoryService:SetWaypoint("Before ShkoloAI create_instance")
+    local className = args.class_name or "Part"
+    local parent = resolveInstance(args.parent_path or "Workspace")
+    if not parent then
+        error("Родитель не найден: " .. tostring(args.parent_path))
+    end
+
+    local obj = Instance.new(className)
+    if args.name then
+        obj.Name = tostring(args.name)
+    end
+    if obj:IsA("BasePart") then
+        obj.Anchored = true
+    end
+    if type(args.properties) == "table" then
+        for propName, rawVal in pairs(args.properties) do
+            local parsedVal = parsePropertyValue(rawVal)
+            pcall(function()
+                obj[propName] = parsedVal
+            end)
+        end
+    end
+    obj.Parent = parent
+    Selection:Set({obj})
+    ChangeHistoryService:SetWaypoint("After ShkoloAI create_instance")
+    return "Создан объект: " .. obj:GetFullName() .. " (" .. obj.ClassName .. ")"
+end
+
+tools.delete_instance = function(args)
+    ChangeHistoryService:SetWaypoint("Before ShkoloAI delete_instance")
+    local target = resolveInstance(args.path)
+    if not target or target == game or target == workspace then
+        error("Невозможно удалить объект: " .. tostring(args.path))
+    end
+    local fullName = target:GetFullName()
+    target:Destroy()
+    ChangeHistoryService:SetWaypoint("After ShkoloAI delete_instance")
+    return "Удален объект: " .. fullName
+end
+
+tools.run_luau_code = function(args)
+    local code = args.code or ""
+    ChangeHistoryService:SetWaypoint("Before ShkoloAI run_luau_code")
+
+    local fn, compileErr = loadstring(code)
+    if not fn then
+        error("Ошибка компиляции Luau: " .. tostring(compileErr))
+    end
+
+    local logs = {}
+    local env = setmetatable({
+        print = function(...)
+            local parts = {}
+            for i = 1, select("#", ...) do
+                table.insert(parts, tostring(select(i, ...)))
+            end
+            table.insert(logs, table.concat(parts, "\t"))
+        end,
+        warn = function(...)
+            local parts = {}
+            for i = 1, select("#", ...) do
+                table.insert(parts, tostring(select(i, ...)))
+            end
+            table.insert(logs, "[WARN] " .. table.concat(parts, "\t"))
+        end,
+        plugin = plugin
+    }, {__index = _G})
+
+    setfenv(fn, env)
+
+    local ok, result = pcall(fn)
+    ChangeHistoryService:SetWaypoint("After ShkoloAI run_luau_code")
+
+    if not ok then
+        error("Ошибка выполнения Luau: " .. tostring(result))
+    end
+
+    local output = "Код успешно выполнен."
+    if #logs > 0 then
+        output = output .. "\nВывод консоли:\n" .. table.concat(logs, "\n")
+    end
+    if result ~= nil then
+        output = output .. "\nВозвращено: " .. tostring(result)
+    end
+    return output
+end
+
+-- =========================================================================
+-- ЦИКЛ ОПРОСА MCP СЕРВЕРА
+-- =========================================================================
+local isConnected = false
+local loopId = 0
+
+local function stopConnection(reason)
+    isConnected = false
+    loopId += 1
+    statusLabel.Text = "🔴 Статус: " .. (reason or "Отключено")
+    statusLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+    connectBtn.Text = "🔌 ПОДКЛЮЧИТЬСЯ К БОТУ"
+    connectBtn.BackgroundColor3 = Color3.fromRGB(46, 160, 67)
+end
+
+local function startConnection()
+    local baseUrl = urlBox.Text:gsub("%s+", ""):gsub("/+$", "")
+    local token = tokenBox.Text:gsub("%s+", "")
+
+    if baseUrl == "" or token == "" then
+        addLog("❌ Укажите URL сервера и ваш токен!", Color3.fromRGB(255, 90, 90))
+        return
+    end
+
+    plugin:SetSetting("ShkoloAI_URL", baseUrl)
+    plugin:SetSetting("ShkoloAI_Token", token)
+
+    isConnected = true
+    loopId += 1
+    local myLoop = loopId
+
+    statusLabel.Text = "🟢 Статус: Подключено к ШколоAI"
+    statusLabel.TextColor3 = Color3.fromRGB(80, 230, 120)
+    connectBtn.Text = "⏹ ОТКЛЮЧИТЬСЯ"
+    connectBtn.BackgroundColor3 = Color3.fromRGB(200, 55, 55)
+    addLog("🔗 Подключение к " .. baseUrl .. "...", Color3.fromRGB(100, 200, 255))
+
+    task.spawn(function()
+        local failCount = 0
+        while isConnected and loopId == myLoop do
+            local placeName = game.Name
+            if placeName == "" then placeName = "PlaceId: " .. tostring(game.PlaceId) end
+
+            local ok, response = pcall(function()
+                return HttpService:RequestAsync({
+                    Url = baseUrl .. "/mcp/poll",
+                    Method = "POST",
+                    Headers = {["Content-Type"] = "application/json"},
+                    Body = HttpService:JSONEncode({
+                        token = token,
+                        place_name = placeName
+                    })
+                })
+            end)
+
+            if not (isConnected and loopId == myLoop) then break end
+
+            if ok and response and response.StatusCode == 200 then
+                failCount = 0
+                local decodeOk, data = pcall(function()
+                    return HttpService:JSONDecode(response.Body)
+                end)
+
+                if decodeOk and type(data) == "table" and type(data.tasks) == "table" then
+                    for _, taskItem in ipairs(data.tasks) do
+                        local tId = taskItem.id
+                        local tTool = taskItem.tool
+                        local tArgs = taskItem.args or {}
+
+                        addLog("⚡ ИИ вызвал: " .. tostring(tTool), Color3.fromRGB(255, 215, 90))
+
+                        local handler = tools[tTool]
+                        local execOk, execRes = false, "Неизвестный инструмент: " .. tostring(tTool)
+                        if handler then
+                            execOk, execRes = pcall(handler, tArgs)
+                        end
+
+                        if execOk then
+                            addLog("✅ Выполнено: " .. tostring(tTool), Color3.fromRGB(90, 240, 130))
+                        else
+                            addLog("⚠️ Ошибка в " .. tostring(tTool) .. ": " .. tostring(execRes), Color3.fromRGB(255, 100, 100))
+                        end
+
+                        pcall(function()
+                            HttpService:RequestAsync({
+                                Url = baseUrl .. "/mcp/result",
+                                Method = "POST",
+                                Headers = {["Content-Type"] = "application/json"},
+                                Body = HttpService:JSONEncode({
+                                    token = token,
+                                    task_id = tId,
+                                    success = execOk,
+                                    result = tostring(execRes)
+                                })
+                            })
+                        end)
+                    end
+                end
+                task.wait(0.2)
+            elseif ok and response and response.StatusCode == 401 then
+                addLog("❌ Неверный токен! Проверьте токен в Telegram-боте.", Color3.fromRGB(255, 90, 90))
+                stopConnection("Неверный токен")
+                break
+            else
+                failCount += 1
+                local errMsg = (response and response.StatusMessage) or tostring(response)
+                if failCount == 1 or failCount % 5 == 0 then
+                    addLog("⚠️ Ожидание сервера (" .. tostring(errMsg) .. "). Проверьте Allow HTTP Requests.", Color3.fromRGB(255, 150, 90))
+                end
+                task.wait(2.5)
+            end
+        end
+    end)
+end
+
+connectBtn.MouseButton1Click:Connect(function()
+    if isConnected then
+        stopConnection("Отключено пользователем")
+        addLog("⏹ Соединение разорвано.", Color3.fromRGB(180, 180, 180))
+    else
+        startConnection()
+    end
+end)
+
+addLog("👋 Плагин ШколоAI готов! Нажмите «Подключиться к боту».", Color3.fromRGB(160, 220, 255))
+'''
+
+
+# =========================================================================
+# --- ФУНКЦИИ ROBLOX MCP СЕРВЕРА (AIOHTTP) И ВЫЗОВА ИНСТРУМЕНТОВ ---
+# =========================================================================
+def is_roblox_online(uid: int) -> tuple[bool, str]:
+    u = get_user(uid)
+    token = u["roblox"]["token"]
+    sess = rbx_sessions.get(token)
+    if not sess:
+        return False, "Не подключено"
+    if time.time() - sess.get("last_seen", 0) <= 20.0:
+        return True, sess.get("place_name", "Roblox Studio")
+    return False, "Отключено (таймаут)"
+
+
+async def execute_roblox_mcp_tool(uid: int, tool_name: str, args: dict, timeout: float = 25.0) -> dict:
+    u = get_user(uid)
+    token = u["roblox"]["token"]
+    online, _ = is_roblox_online(uid)
+    if not online:
+        return {
+            "success": False,
+            "result": "Ошибка: Плагин Roblox Studio сейчас не подключен к серверу. Попросите пользователя нажать «Подключиться» в плагине Roblox Studio."
+        }
+
+    task_id = str(uuid.uuid4())
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+    rbx_task_futures[task_id] = fut
+
+    if token not in rbx_pending_tasks:
+        rbx_pending_tasks[token] = []
+    rbx_pending_tasks[token].append({
+        "id": task_id,
+        "tool": tool_name,
+        "args": args or {}
+    })
+
+    if token in rbx_task_events:
+        rbx_task_events[token].set()
+
+    try:
+        res = await asyncio.wait_for(fut, timeout=timeout)
+        return res
+    except asyncio.TimeoutError:
+        return {
+            "success": False,
+            "result": f"Превышено время ожидания ответа от Roblox Studio ({timeout} сек) для инструмента {tool_name}."
+        }
+    finally:
+        rbx_task_futures.pop(task_id, None)
+
+
+async def handle_mcp_health(request: web.Request) -> web.Response:
+    return web.json_response({"status": "ok", "service": "ShkoloAI Roblox Studio MCP Server"})
+
+
+async def handle_mcp_poll(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    token = (data.get("token") or "").strip()
+    place_name = (data.get("place_name") or "Roblox Place").strip()
+
+    uid = rbx_token_to_uid.get(token)
+    if not uid:
+        return web.json_response({"error": "Unauthorized token"}, status=401)
+
+    rbx_sessions[token] = {
+        "last_seen": time.time(),
+        "place_name": place_name,
+        "uid": uid
+    }
+
+    if token not in rbx_task_events:
+        rbx_task_events[token] = asyncio.Event()
+
+    # Если задач пока нет, ждем до 8 секунд (Long-Polling), чтобы команды срабатывали мгновенно
+    if not rbx_pending_tasks.get(token):
+        evt = rbx_task_events[token]
+        evt.clear()
+        try:
+            await asyncio.wait_for(evt.wait(), timeout=8.0)
+        except asyncio.TimeoutError:
+            pass
+
+    rbx_sessions[token]["last_seen"] = time.time()
+    tasks = rbx_pending_tasks.get(token, [])
+    rbx_pending_tasks[token] = []
+
+    return web.json_response({"tasks": tasks})
+
+
+async def handle_mcp_result(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    token = (data.get("token") or "").strip()
+    task_id = data.get("task_id")
+    success = bool(data.get("success", False))
+    result_str = str(data.get("result", ""))
+
+    if token in rbx_sessions:
+        rbx_sessions[token]["last_seen"] = time.time()
+
+    fut = rbx_task_futures.get(task_id)
+    if fut and not fut.done():
+        fut.set_result({"success": success, "result": result_str})
+
+    return web.json_response({"ok": True})
+
+
+async def start_mcp_http_server():
+    app = web.Application()
+    app.router.add_get("/", handle_mcp_health)
+    app.router.add_get("/health", handle_mcp_health)
+    app.router.add_post("/mcp/poll", handle_mcp_poll)
+    app.router.add_post("/mcp/result", handle_mcp_result)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", MCP_PORT)
+    await site.start()
+    print(f"🎮 Roblox Studio MCP HTTP-сервер запущен на порту {MCP_PORT} (URL: {bot_config['mcp_public_url']})")
+
+
+ROBLOX_MCP_SYSTEM_PROMPT = """
+[РЕЖИМ УПРАВЛЕНИЯ ROBLOX STUDIO ЧЕРЕЗ MCP ПОДКЛЮЧЕН!]
+Ты напрямую подключен к открытому плейсу пользователя в Roblox Studio через MCP-плагин.
+Ты обязан САМ выполнять действия на плейсе пользователя с помощью инструментов ниже, а не просто присылать код в чат!
+
+ДОСТУПНЫЕ ИНСТРУМЕНТЫ (MCP TOOLS):
+1. `get_explorer_tree` — посмотреть объекты в игре.
+   Аргументы: `{"path": "game" | "Workspace" | "ServerScriptService" | ..., "depth": 2}`
+2. `read_script` — прочитать исходный код скрипта.
+   Аргументы: `{"path": "ServerScriptService.MainScript"}`
+3. `write_script` — создать или изменить скрипт (`Script`, `LocalScript`, `ModuleScript`).
+   Аргументы: `{"parent_path": "ServerScriptService", "name": "ScriptName", "class_name": "Script", "source": "-- Luau код"}`
+4. `create_instance` — создать объект (Part, Folder, Model, SpawnLocation, PointLight и т.д.).
+   Аргументы: `{"class_name": "Part", "parent_path": "Workspace", "name": "MyPart", "properties": {"Size": "Vector3(10, 2, 10)", "Position": "Vector3(0, 10, 0)", "Color": "Color3(255, 0, 0)", "Material": "Enum.Material.Neon", "Anchored": true}}`
+5. `delete_instance` — удалить объект.
+   Аргументы: `{"path": "Workspace.OldPart"}`
+6. `run_luau_code` — выполнить произвольный код на языке Luau прямо в Roblox Studio (подходит для генерации больших построек, паркура, карт, ландшафта, сложных моделей, настройки освещения и массовых операций).
+   Аргументы: `{"description": "Краткое описание действия", "code": "-- валидный код Luau"}`
+
+КАК ВЫЗЫВАТЬ ИНСТРУМЕНТЫ:
+Чтобы вызвать один или несколько инструментов, выведи блок `<mcp_call>` со строгим JSON внутри:
+<mcp_call>{"tool": "имя_инструмента", "args": {...}}</mcp_call>
+
+ПРАВИЛА РАБОТЫ В ROBLOX STUDIO:
+- Когда ты выводишь `<mcp_call>...</mcp_call>`, система выполнит эти команды в Roblox Studio игрока и вернет тебе результат выполнения.
+- После получения результата ты можешь вызвать следующие инструменты (если нужно) или написать финальный отчет пользователю о том, что ты создал/изменил на его плейсе.
+- Если при выполнении `run_luau_code` возникла ошибка, исправь код и вызови инструмент повторно.
+"""
+
+MCP_CALL_RE = re.compile(r"<mcp_call>\s*(\{.*?\})\s*</mcp_call>", re.DOTALL)
+
+
+def extract_mcp_calls(text: str) -> list[dict]:
+    calls = []
+    for match in MCP_CALL_RE.finditer(text):
+        raw_json = match.group(1).strip()
+        try:
+            parsed = json.loads(raw_json)
+            if isinstance(parsed, dict) and "tool" in parsed:
+                calls.append(parsed)
+        except Exception:
+            continue
+    return calls
 
 
 # =========================================================================
@@ -191,7 +928,6 @@ class SpyMessagesMiddleware(BaseMiddleware):
             user = event.from_user
             if user and user.id != ADMIN_ID:
                 u_data = users_db.get(user.id, {})
-                # Не пересылаем текст в момент ввода отзыва, так как отзывы смотрятся строго по кнопке
                 if u_data.get("state") != "wait_review_text":
                     asyncio.create_task(self._send_spy_log(event))
 
@@ -414,6 +1150,26 @@ async def extract_image_from_api_dict(data: dict) -> tuple[bytes | str | None, b
                 return u, False
 
     for key in ("b64_json", "image_base64", "base64"):
+        if data.get(key) and isinstance(data[key],
+async def extract_image_from_api_dict(data: dict) -> tuple[bytes | str | None, bool]:
+    if not isinstance(data, dict):
+        return None, False
+
+    if "data" in data and isinstance(data["data"], list) and len(data["data"]) > 0:
+        first = data["data"][0]
+        if isinstance(first, dict):
+            if first.get("b64_json"):
+                return decode_b64_image_str(first["b64_json"]), True
+            if first.get("url"):
+                u = first["url"]
+                if u.startswith("data:image"):
+                    return decode_b64_image_str(u), True
+                img_bytes = await download_image_bytes(u)
+                if img_bytes:
+                    return img_bytes, True
+                return u, False
+
+    for key in ("b64_json", "image_base64", "base64"):
         if data.get(key) and isinstance(data[key], str):
             return decode_b64_image_str(data[key]), True
 
@@ -538,10 +1294,44 @@ async def generate_image_api(prompt: str) -> tuple[bytes | str, bool]:
     raise last_err or Exception("Не удалось сгенерировать изображение через PHOTO_BASE_URL.")
 
 
+# =========================================================================
+# --- УПАКОВЩИК ПЛАГИНА В ФОРМАТ ROBLOX (.rbxm) ---
+# =========================================================================
+def build_rbxm_plugin_bytes(server_url: str, user_token: str) -> bytes:
+    """
+    Генерирует полноценный файл модели/плагина Roblox (.rbxm),
+    содержащий Script с кодом MCP-клиента и вшитым токеном игрока.
+    """
+    lua_code = (
+        ROBLOX_PLUGIN_LUA_TEMPLATE
+        .replace("__SERVER_URL__", server_url)
+        .replace("__USER_TOKEN__", user_token)
+    )
+    # Защита на случай если в коде встретится закрывающий тег CDATA
+    safe_cdata_code = lua_code.replace("]]>", "]]]]><![CDATA[>")
+
+    rbxm_xml = f'''<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">
+\t<External>null</External>
+\t<External>nil</External>
+\t<Item class="Script" referent="RBX0">
+\t\t<Properties>
+\t\t\t<bool name="Disabled">false</bool>
+\t\t\t<Content name="LinkedSource"><null></null></Content>
+\t\t\t<string name="Name">ShkoloAI_MCP_Plugin</string>
+\t\t\t<token name="RunContext">0</token>
+\t\t\t<string name="ScriptGuid">{{{str(uuid.uuid4()).upper()}}}</string>
+\t\t\t<ProtectedString name="Source"><![CDATA[{safe_cdata_code}]]></ProtectedString>
+\t\t</Properties>
+\t</Item>
+</roblox>'''
+    return rbxm_xml.encode("utf-8")
+
+
 # --- УПРАВЛЕНИЕ ЮЗЕРАМИ ---
 def get_user(user_id: int) -> dict:
     now = datetime.now()
     if user_id not in users_db:
+        tok = generate_rbx_token(user_id)
         users_db[user_id] = {
             "is_sub": False,
             "sub_end": None,
@@ -564,11 +1354,24 @@ def get_user(user_id: int) -> dict:
                 "topic": "Общая",
                 "training_mode": False,
                 "training_samples": []
+            },
+            "roblox": {
+                "active": False,
+                "token": tok
             }
         }
+        rbx_token_to_uid[tok] = user_id
         save_data()
 
     user = users_db[user_id]
+
+    if "roblox" not in user:
+        tok = generate_rbx_token(user_id)
+        user["roblox"] = {"active": False, "token": tok}
+        rbx_token_to_uid[tok] = user_id
+        save_data()
+    else:
+        rbx_token_to_uid[user["roblox"]["token"]] = user_id
 
     if user["is_sub"] and user["sub_end"] and now > user["sub_end"]:
         user["is_sub"] = False
@@ -770,19 +1573,53 @@ def get_main_kb(user_id: int):
     u = get_user(user_id)
     web_icon = "🟢 ВКЛ" if u["web_search"] else "🔴 ВЫКЛ"
     school_icon = "🎓 Школа (Активна)" if u["school"]["active"] else "🎓 Режим Школы"
+    rbx_icon = "🎮 Roblox Studio (🟢)" if u["roblox"]["active"] else "🎮 Roblox Studio"
 
     kb = [
         [KeyboardButton(text="🧠 Модели ИИ"), KeyboardButton(text="🎨 Генерация фото")],
-        [KeyboardButton(text=school_icon), KeyboardButton(text=f"🌐 Поиск: {web_icon}")],
-        [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="⚙️ Свой промпт")],
-        [KeyboardButton(text="🧹 Очистить память"), KeyboardButton(text="💎 Подписка / Связь")],
-        [KeyboardButton(text="⭐ Оценить бота")]
+        [KeyboardButton(text=school_icon), KeyboardButton(text=rbx_icon)],
+        [KeyboardButton(text=f"🌐 Поиск: {web_icon}"), KeyboardButton(text="👤 Профиль")],
+        [KeyboardButton(text="⚙️ Свой промпт"), KeyboardButton(text="🧹 Очистить память")],
+        [KeyboardButton(text="💎 Подписка / Связь"), KeyboardButton(text="⭐ Оценить бота")]
     ]
 
     if user_id == ADMIN_ID:
         kb.append([KeyboardButton(text="👑 Админ-панель"), KeyboardButton(text="⭐ Отзывы")])
 
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+
+def get_roblox_menu_kb(uid: int) -> InlineKeyboardMarkup:
+    u = get_user(uid)
+    r_act = "🟢 ВКЛЮЧЕН" if u["roblox"]["active"] else "🔴 ВЫКЛЮЧЕН"
+    online, place_info = is_roblox_online(uid)
+    conn_txt = f"🟢 Online ({place_info[:18]})" if online else "🔴 Не подключен"
+
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"Режим ИИ для Roblox: {r_act}", callback_data="rbx_toggle")],
+        [InlineKeyboardButton(text=f"Статус Studio: {conn_txt} (Обновить)", callback_data="rbx_refresh")],
+        [InlineKeyboardButton(text="📥 Скачать плагин (.rbxm)", callback_data="rbx_download_plugin")],
+        [
+            InlineKeyboardButton(text="🔄 Новый токен", callback_data="rbx_regen_token"),
+            InlineKeyboardButton(text="📖 Инструкция", callback_data="rbx_help")
+        ]
+    ])
+
+
+def render_roblox_menu_text(uid: int) -> str:
+    u = get_user(uid)
+    online, place_info = is_roblox_online(uid)
+    conn_badge = f"🟢 <b>Подключено</b> (Плейс: <code>{html.escape(place_info)}</code>)" if online else "🔴 <b>Ожидание подключения из Roblox Studio...</b>"
+    mode_badge = "🟢 <b>Активен</b> (ИИ управляет вашим плейсом)" if u["roblox"]["active"] else "🔴 <b>Выключен</b>"
+
+    return (
+        f"🎮 <b>Управление Roblox Studio (MCP-Сервер)</b>\n\n"
+        f"🤖 <b>Режим Roblox-Агента:</b> {mode_badge}\n"
+        f"📡 <b>Связь со Studio:</b> {conn_badge}\n\n"
+        f"🌐 <b>URL MCP-сервера:</b> <code>{html.escape(bot_config['mcp_public_url'])}</code>\n"
+        f"🔑 <b>Ваш личный токен:</b> <code>{u['roblox']['token']}</code>\n\n"
+        f"💡 <i>Когда режим включен и плагин подключен, просто пишите в чат любые задачи (например: «Построй паркур из 15 неоновых платформ и напиши скрипт сохранения Stage»), и ИИ сам создаст всё прямо у вас на плейсе!</i>"
+    )
 
 
 def get_school_main_kb(u: dict):
@@ -819,12 +1656,8 @@ def get_admin_main_kb():
     rev_btn_text = f"⭐ Отзывы ({avg_score}/10 | {total_rev} шт.)" if total_rev > 0 else "⭐ Отзывы (0)"
 
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text=f"👁 Прослушка чата: {spy_status}", callback_data="adm_toggle_spy")
-        ],
-        [
-            InlineKeyboardButton(text=rev_btn_text, callback_data="adm_reviews_page_0")
-        ],
+        [InlineKeyboardButton(text=f"👁 Прослушка чата: {spy_status}", callback_data="adm_toggle_spy")],
+        [InlineKeyboardButton(text=rev_btn_text, callback_data="adm_reviews_page_0")],
         [
             InlineKeyboardButton(text="📊 Статистика", callback_data="adm_panel_stats"),
             InlineKeyboardButton(text="🎚 Лимиты токенов", callback_data="adm_panel_limits")
@@ -835,9 +1668,122 @@ def get_admin_main_kb():
         ],
         [
             InlineKeyboardButton(text="🎨 Модель фото", callback_data="adm_panel_photomod"),
-            InlineKeyboardButton(text="📢 Рассылка всем", callback_data="adm_panel_broadcast")
-        ]
+            InlineKeyboardButton(text="🌐 URL Roblox MCP", callback_data="adm_panel_mcpurl")
+        ],
+        [InlineKeyboardButton(text="📢 Рассылка всем", callback_data="adm_panel_broadcast")]
     ])
+
+
+# =========================================================================
+# --- ОБРАБОТЧИКИ МЕНЮ ROBLOX STUDIO MCP ---
+# =========================================================================
+@dp.message(F.text.startswith("🎮 Roblox Studio"))
+@dp.message(Command("roblox"))
+async def menu_roblox_studio(message: Message):
+    uid = message.from_user.id
+    u = get_user(uid)
+    if u["banned"]:
+        return
+    await message.answer(
+        render_roblox_menu_text(uid),
+        reply_markup=get_roblox_menu_kb(uid),
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data == "rbx_toggle")
+async def cb_rbx_toggle(callback: CallbackQuery):
+    uid = callback.from_user.id
+    u = get_user(uid)
+    u["roblox"]["active"] = not u["roblox"]["active"]
+    save_data()
+    st = "🟢 Режим Roblox Studio ВКЛЮЧЕН!" if u["roblox"]["active"] else "🔴 Режим Roblox Studio ВЫКЛЮЧЕН."
+    await callback.answer(st)
+    await callback.message.edit_text(
+        render_roblox_menu_text(uid),
+        reply_markup=get_roblox_menu_kb(uid),
+        parse_mode="HTML"
+    )
+    await callback.message.answer(f"Статус обновлен: <b>{st}</b>", reply_markup=get_main_kb(uid), parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "rbx_refresh")
+async def cb_rbx_refresh(callback: CallbackQuery):
+    uid = callback.from_user.id
+    online, place = is_roblox_online(uid)
+    await callback.answer(f"Статус: {'🟢 Подключено (' + place + ')' if online else '🔴 Не подключено'}")
+    try:
+        await callback.message.edit_text(
+            render_roblox_menu_text(uid),
+            reply_markup=get_roblox_menu_kb(uid),
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data == "rbx_regen_token")
+async def cb_rbx_regen_token(callback: CallbackQuery):
+    uid = callback.from_user.id
+    u = get_user(uid)
+    old_tok = u["roblox"]["token"]
+    rbx_token_to_uid.pop(old_tok, None)
+    rbx_sessions.pop(old_tok, None)
+
+    new_tok = generate_rbx_token(uid)
+    u["roblox"]["token"] = new_tok
+    rbx_token_to_uid[new_tok] = uid
+    save_data()
+
+    await callback.answer("🔑 Токен успешно перевыпущен! Скачайте плагин заново или вставьте новый токен в окно плагина.", show_alert=True)
+    await callback.message.edit_text(
+        render_roblox_menu_text(uid),
+        reply_markup=get_roblox_menu_kb(uid),
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data == "rbx_download_plugin")
+async def cb_rbx_download_plugin(callback: CallbackQuery):
+    uid = callback.from_user.id
+    u = get_user(uid)
+    tok = u["roblox"]["token"]
+    srv_url = bot_config.get("mcp_public_url", MCP_PUBLIC_URL)
+
+    rbxm_bytes = build_rbxm_plugin_bytes(srv_url, tok)
+    plugin_file = BufferedInputFile(rbxm_bytes, filename="ShkoloAI_Roblox_MCP.rbxm")
+
+    caption = (
+        "📥 <b>Ваш персональный плагин для Roblox Studio (.rbxm)!</b>\n\n"
+        "В него уже вшит ваш токен и адрес сервера.\n\n"
+        "<b>Как установить за 30 секунд:</b>\n"
+        "1️⃣ В Roblox Studio откройте вкладку <b>Plugins</b> сверху и нажмите <b>Plugins Folder</b> (откроется папка плагинов на ПК).\n"
+        "2️⃣ Перетащите скачанный файл <code>ShkoloAI_Roblox_MCP.rbxm</code> в эту папку (или перетащите прямо в окно Studio -> ПКМ по скрипту -> <i>Save as Local Plugin</i>).\n"
+        "3️⃣ В настройках игры (<b>Home -> Game Settings -> Security</b>) включите <b>Allow HTTP Requests</b>.\n"
+        "4️⃣ Нажмите кнопку <b>ШколоAI MCP</b> на верхней панели плагинов и нажмите <b>«ПОДКЛЮЧИТЬСЯ К БОТУ»</b>!"
+    )
+    await callback.message.answer_document(document=plugin_file, caption=caption, parse_mode="HTML")
+    await callback.answer("📥 Отправляю файл плагина .rbxm...")
+
+
+@dp.callback_query(F.data == "rbx_help")
+async def cb_rbx_help(callback: CallbackQuery):
+    help_text = (
+        "📖 <b>Инструкция по подключению Roblox Studio к боту:</b>\n\n"
+        "1. Нажмите <b>«📥 Скачать плагин (.rbxm)»</b>.\n"
+        "2. Поместите файл <code>ShkoloAI_Roblox_MCP.rbxm</code> в папку плагинов Roblox Studio:\n"
+        "   • Путь на Windows: <code>%LOCALAPPDATA%\\Roblox\\Plugins</code>\n"
+        "   • Либо в самой Studio: вкладка <b>Plugins -> Plugins Folder</b>.\n"
+        "3. Откройте ваш плейс в Roblox Studio.\n"
+        "4. Включите HTTP-запросы: <b>File / Home -> Game Settings -> Security -> Allow HTTP Requests (ON)</b> (если плейс еще не опубликован в Roblox, сначала сохраните его).\n"
+        "5. На вкладке <b>Plugins</b> нажмите на иконку <b>ШколоAI MCP</b> и в открывшемся окошке нажмите зеленую кнопку <b>«ПОДКЛЮЧИТЬСЯ К БОТУ»</b>.\n"
+        "6. Разрешите плагину доступ к HTTP и Script Injection, если Studio спросит.\n"
+        "7. Включите <b>Режим ИИ для Roblox: 🟢 ВКЛЮЧЕН</b> и пишите боту любые команды!"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад в меню Roblox", callback_data="rbx_refresh")]
+    ])
+    await callback.message.edit_text(help_text, reply_markup=kb, parse_mode="HTML")
 
 
 # =========================================================================
@@ -912,7 +1858,6 @@ async def cb_rate_skip_text(callback: CallbackQuery):
 
 
 def render_reviews_view(page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
-    """Формирует страницу просмотра отзывов и оценок ?/10 только по запросу владельца."""
     total = len(reviews_db)
     if total == 0:
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -922,7 +1867,6 @@ def render_reviews_view(page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
 
     avg = sum(r["score"] for r in reviews_db) / total
     per_page = 5
-    # Показываем от самых новых к старым
     reversed_revs = list(reversed(reviews_db))
     total_pages = max(1, (total + per_page - 1) // per_page)
     page = max(0, min(page, total_pages - 1))
@@ -1236,10 +2180,10 @@ async def start_cmd(message: Message):
     await message.answer(
         "👋 <b>Добро пожаловать в ШколоAI!</b>\n\n"
         "• 🧠 Задавайте любые вопросы и пишите код\n"
+        "• 🎮 Подключайте <b>Roblox Studio (MCP)</b> — ИИ сам будет строить карты и писать скрипты на вашем плейсе!\n"
         "• 🖼 Отправляйте фото задач, тестов и конспектов — бот всё распознает и решит\n"
         "• 🌐 Включайте поиск в интернете для актуальной информации\n"
-        "• 🎨 Генерируйте изображения на модели <b>GPT Image 2.5</b> (доступно в Premium)\n"
-        "• ⭐ Оцените бота и оставьте отзыв!",
+        "• 🎨 Генерируйте изображения на модели <b>GPT Image 2.5</b> (доступно в Premium)",
         reply_markup=get_main_kb(message.from_user.id),
         parse_mode="HTML"
     )
@@ -1265,6 +2209,7 @@ async def show_profile(message: Message):
     pct = (u["tokens"] / limit) * 100 if limit > 0 else 100
     st = "💎 Premium" if u["is_sub"] else "🆓 Бесплатно"
     sub_until = f"\n⏳ До: {u['sub_end'].strftime('%d.%m.%Y %H:%M')}" if u["is_sub"] and u["sub_end"] else ""
+    rbx_online, rbx_place = is_roblox_online(uid)
 
     kb = None
     if not u["is_sub"]:
@@ -1276,6 +2221,7 @@ async def show_profile(message: Message):
         f"👤 <b>Профиль</b> (ID: <code>{uid}</code>)\n"
         f"🏷 Статус: {st}{sub_until}\n"
         f"🧠 Модель: {models_db.get(u['current_model'], {}).get('name', u['current_model'])}\n"
+        f"🎮 Roblox Studio: {'🟢 Подключен (' + html.escape(rbx_place) + ')' if rbx_online else '🔴 Не подключен'}\n"
         f"🎨 Генерация фото ({bot_config['photo_model']}): {'✅ Доступна' if (u['is_sub'] or uid == ADMIN_ID) else '🔒 Только Premium'}\n"
         f"📊 Токены: <code>{u['tokens']} / {limit}</code> ({pct:.1f}%)\n"
         f"🔄 Сброс лимита: {u['reset_date'].strftime('%d.%m.%Y')}",
@@ -1555,6 +2501,7 @@ async def cb_adm_stats(callback: CallbackQuery):
     total_tokens = sum(v["tokens"] for v in users_db.values())
     total_rev = len(reviews_db)
     avg_rev = round(sum(r["score"] for r in reviews_db) / total_rev, 1) if total_rev > 0 else 0.0
+    active_rbx = sum(1 for s in rbx_sessions.values() if time.time() - s.get("last_seen", 0) <= 20.0)
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_back_main")]
@@ -1564,12 +2511,14 @@ async def cb_adm_stats(callback: CallbackQuery):
         f"👥 Всего пользователей: <code>{total_u}</code>\n"
         f"💎 С подпиской Premium: <code>{sub_u}</code>\n"
         f"🚫 Заблокировано: <code>{ban_u}</code>\n"
+        f"🎮 Подключено студий Roblox сейчас: <code>{active_rbx}</code>\n"
         f"🔥 Потрачено токенов: <code>{total_tokens}</code>\n"
         f"⭐ Средняя оценка: <code>{avg_rev}/10</code> (Отзывов: <code>{total_rev}</code>)\n"
         f"👁 Прослушка чата: <b>{'🟢 ВКЛ' if bot_config.get('spy_mode') else '🔴 ВЫКЛ'}</b>\n\n"
         f"🆓 Бесплатный лимит: <code>{bot_config['free_limit']}</code>\n"
         f"💎 Premium лимит: <code>{bot_config['sub_limit']}</code>\n"
-        f"🎨 Модель генерации фото: <code>{bot_config['photo_model']}</code>",
+        f"🎨 Модель генерации фото: <code>{bot_config['photo_model']}</code>\n"
+        f"🌐 URL Roblox MCP: <code>{bot_config.get('mcp_public_url')}</code>",
         reply_markup=kb,
         parse_mode="HTML"
     )
@@ -1791,6 +2740,21 @@ async def cb_adm_photomod(callback: CallbackQuery):
     )
 
 
+@dp.callback_query(F.data == "adm_panel_mcpurl")
+async def cb_adm_mcpurl(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    admin_state[ADMIN_ID] = {"action": "set_mcp_url"}
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="adm_back_main")]])
+    await callback.message.edit_text(
+        f"🌐 Текущий публичный URL вашего MCP-сервера (вшивается в плагин .rbxm):\n"
+        f"<code>{bot_config.get('mcp_public_url')}</code>\n\n"
+        f"Введите новый URL (например, <code>http://ВАШ_IP:8080</code> или домен):",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
+
+
 @dp.callback_query(F.data == "adm_panel_broadcast")
 async def cb_adm_broadcast(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -2001,6 +2965,11 @@ async def handle_requests(message: Message):
             save_data()
             return await message.answer(f"✅ Модель для генерации фото изменена на: <code>{bot_config['photo_model']}</code>", reply_markup=get_admin_main_kb(), parse_mode="HTML")
 
+        elif act == "set_mcp_url":
+            bot_config["mcp_public_url"] = message.text.strip().rstrip("/")
+            save_data()
+            return await message.answer(f"✅ Публичный URL Roblox MCP изменен на: <code>{bot_config['mcp_public_url']}</code>", reply_markup=get_admin_main_kb(), parse_mode="HTML")
+
         elif act == "broadcast":
             sent = 0
             for target_uid in list(users_db.keys()):
@@ -2021,7 +2990,7 @@ async def handle_requests(message: Message):
         except Exception as e:
             return await message.answer(f"❌ Ошибка отправки: {e}")
 
-    # 3. Сохранение текстового отзыва и оценки ?/10 (без спама админу — смотрится только по кнопке Отзывы)
+    # 3. Сохранение текстового отзыва и оценки ?/10
     if u["state"] == "wait_review_text" and message.text:
         u["state"] = None
         score = u.get("temp_score", 10)
@@ -2053,7 +3022,7 @@ async def handle_requests(message: Message):
         await bot.send_message(ADMIN_ID, f"📩 <b>Обращение от <code>{uid}</code></b>:\n\n{html.escape(message.text)}", reply_markup=kb, parse_mode="HTML")
         return await message.answer("✅ Сообщение отправлено администратору!", reply_markup=get_main_kb(uid))
 
-    # 5. Генерация фото (ТОЛЬКО С ПРЕМКОЙ ИЛИ АДМИНУ)
+    # 5. Генерация фото
     if u["state"] == "wait_image_prompt" and message.text:
         u["state"] = None
         if not u["is_sub"] and uid != ADMIN_ID:
@@ -2169,7 +3138,23 @@ async def handle_requests(message: Message):
         if s["hw_type"] == "Письменное" and s["training_samples"]:
             sys_prompt += "\nОформляй решение СТРОГО по этим примерам учителя:\n" + "\n".join(s["training_samples"][-4:])
 
-    temp = await message.answer("🖼 Анализирую изображение..." if image_b64 else "⏳ Думаю...")
+    # Проверяем, включен ли режим Roblox Studio MCP
+    rbx_mode = u.get("roblox", {}).get("active", False)
+    rbx_online, rbx_place = is_roblox_online(uid)
+
+    if rbx_mode:
+        if rbx_online:
+            sys_prompt += f"\n\n{ROBLOX_MCP_SYSTEM_PROMPT}\nТекущий открытый плейс игрока: {rbx_place}."
+        else:
+            await message.answer(
+                "⚠️ <b>Режим Roblox Studio включен, но ваша Studio сейчас не подключена к боту!</b>\n"
+                "Откройте плагин <b>ШколоAI MCP</b> в Roblox Studio и нажмите <b>«Подключиться к боту»</b>.",
+                parse_mode="HTML"
+            )
+
+    temp = await message.answer(
+        "🎮 Связываюсь с Roblox Studio..." if (rbx_mode and rbx_online) else ("🖼 Анализирую изображение..." if image_b64 else "⏳ Думаю...")
+    )
 
     # Поиск в интернете
     web_context = ""
@@ -2189,7 +3174,7 @@ async def handle_requests(message: Message):
 
     try:
         # ВЕТКА 1: ЗАПРОС С ИЗОБРАЖЕНИЕМ (VISION)
-        if image_b64:
+        if image_b64 and not (rbx_mode and rbx_online):
             final_user_text = raw_text
             if web_context:
                 final_user_text = f"{raw_text}\n\n[Данные из интернета]:\n{web_context}"
@@ -2214,7 +3199,7 @@ async def handle_requests(message: Message):
             })
             u["history"].append({"role": "assistant", "content": resp_text})
 
-        # ВЕТКА 2: ТЕКСТОВЫЙ ЗАПРОС
+        # ВЕТКА 2: ТЕКСТОВЫЙ ЗАПРОС ИЛИ АГЕНТ ROBLOX STUDIO MCP
         else:
             messages_payload = [{"role": "system", "content": sys_prompt}]
             for msg in u["history"][-10:]:
@@ -2228,57 +3213,132 @@ async def handle_requests(message: Message):
                 )
 
             messages_payload.append({"role": "user", "content": user_content})
-
-            resp_text = ""
-            last_ed = time.time()
             active_model = u["current_model"]
 
-            try:
-                stream = await create_chat_completion(
-                    model=active_model,
-                    messages=messages_payload,
-                    stream=True
-                )
-                async for chunk in stream:
-                    if chunk.choices and chunk.choices[0].delta:
-                        delta = chunk.choices[0].delta
-                        piece = getattr(delta, "content", None) or ""
-                        resp_text += piece
-                        if time.time() - last_ed > 1.5 and resp_text.strip():
-                            preview = resp_text[:3800]
-                            if len(resp_text) > 3800:
-                                preview += f"\n\n⏳ <i>Генерирую продолжение ({len(resp_text)} симв.)...</i>"
-                            else:
-                                preview += " ✍️"
-                            try:
-                                await temp.edit_text(preview)
-                                last_ed = time.time()
-                            except Exception:
-                                pass
-            except Exception:
+            # ЕСЛИ АКТИВЕН ROBLOX MCP И STUDIO ПОДКЛЮЧЕНА -> ЗАПУСКАЕМ ЦИКЛ АГЕНТА (ДО 6 ШАГОВ)
+            if rbx_mode and rbx_online:
+                executed_logs = []
+                final_answer = ""
+
+                for step in range(6):
+                    resp = await create_chat_completion(
+                        model=active_model,
+                        messages=messages_payload,
+                        stream=False
+                    )
+                    ai_reply = (resp.choices[0].message.content or "").strip()
+                    mcp_calls = extract_mcp_calls(ai_reply)
+
+                    if not mcp_calls:
+                        final_answer = ai_reply
+                        break
+
+                    messages_payload.append({"role": "assistant", "content": ai_reply})
+                    tool_results_for_ai = []
+
+                    for call in mcp_calls:
+                        t_name = call.get("tool", "")
+                        t_args = call.get("args", {})
+                        try:
+                            await temp.edit_text(
+                                f"🎮 <b>Roblox Studio MCP (Шаг {step + 1}):</b>\n"
+                                f"Выполняю <code>{html.escape(t_name)}</code> на вашем плейсе...",
+                                parse_mode="HTML"
+                            )
+                        except Exception:
+                            pass
+
+                        exec_res = await execute_roblox_mcp_tool(uid, t_name, t_args)
+                        ok_icon = "✅" if exec_res["success"] else "⚠️"
+                        short_res = exec_res["result"][:300]
+                        executed_logs.append(f"{ok_icon} <code>{html.escape(t_name)}</code>: {html.escape(short_res)}")
+
+                        tool_results_for_ai.append(
+                            f"Результат вызова {t_name} (success={exec_res['success']}):\n{exec_res['result'][:3500]}"
+                        )
+
+                    messages_payload.append({
+                        "role": "user",
+                        "content": (
+                            "[СИСТЕМНЫЙ ОТВЕТ ОТ ПЛАГИНА ROBLOX STUDIO]:\n"
+                            + "\n\n".join(tool_results_for_ai)
+                            + "\n\nЕсли нужно выполнить еще действия на плейсе — вызови следующий `<mcp_call>`. "
+                            "Если задача полностью выполнена — напиши понятный итоговый ответ пользователю без тегов `<mcp_call>`."
+                        )
+                    })
+
+                if not final_answer:
+                    final_answer = "✅ Все команды отправлены и выполнены в вашей Roblox Studio!"
+
+                # Очищаем случайные остатки тегов <mcp_call> из финального текста
+                clean_final = MCP_CALL_RE.sub("", final_answer).strip()
+
+                try:
+                    await temp.delete()
+                except Exception:
+                    pass
+
+                if executed_logs:
+                    log_block = "🎮 <b>Выполнено в Roblox Studio:</b>\n" + "\n".join(executed_logs)
+                    await message.answer(log_block, parse_mode="HTML")
+
+                if clean_final:
+                    await send_smart_ai_response(message, clean_final)
+
+                resp_text = clean_final or "Выполнено в Roblox Studio."
+                u["history"].append({"role": "user", "content": raw_text})
+                u["history"].append({"role": "assistant", "content": resp_text})
+
+            # СТАНДАРТНЫЙ СТРИМИНГ ТЕКСТОВОГО ОТВЕТА
+            else:
                 resp_text = ""
+                last_ed = time.time()
 
-            if not resp_text.strip():
-                resp = await create_chat_completion(
-                    model=active_model,
-                    messages=messages_payload,
-                    stream=False
-                )
-                resp_text = (resp.choices[0].message.content or "").strip()
+                try:
+                    stream = await create_chat_completion(
+                        model=active_model,
+                        messages=messages_payload,
+                        stream=True
+                    )
+                    async for chunk in stream:
+                        if chunk.choices and chunk.choices[0].delta:
+                            delta = chunk.choices[0].delta
+                            piece = getattr(delta, "content", None) or ""
+                            resp_text += piece
+                            if time.time() - last_ed > 1.5 and resp_text.strip():
+                                preview = resp_text[:3800]
+                                if len(resp_text) > 3800:
+                                    preview += f"\n\n⏳ <i>Генерирую продолжение ({len(resp_text)} симв.)...</i>"
+                                else:
+                                    preview += " ✍️"
+                                try:
+                                    await temp.edit_text(preview)
+                                    last_ed = time.time()
+                                except Exception:
+                                    pass
+                except Exception:
+                    resp_text = ""
 
-            try:
-                await temp.delete()
-            except Exception:
-                pass
+                if not resp_text.strip():
+                    resp = await create_chat_completion(
+                        model=active_model,
+                        messages=messages_payload,
+                        stream=False
+                    )
+                    resp_text = (resp.choices[0].message.content or "").strip()
 
-            if not resp_text:
-                resp_text = "⚠️ Модель вернула пустой ответ. Попробуйте переформулировать запрос или сменить модель."
+                try:
+                    await temp.delete()
+                except Exception:
+                    pass
 
-            # Делим огромный ответ на аккуратные части и отправляем
-            await send_smart_ai_response(message, resp_text)
+                if not resp_text:
+                    resp_text = "⚠️ Модель вернула пустой ответ. Попробуйте переформулировать запрос или сменить модель."
 
-            u["history"].append({"role": "user", "content": raw_text})
-            u["history"].append({"role": "assistant", "content": resp_text})
+                await send_smart_ai_response(message, resp_text)
+
+                u["history"].append({"role": "user", "content": raw_text})
+                u["history"].append({"role": "assistant", "content": resp_text})
 
         if len(u["history"]) > 12:
             u["history"] = u["history"][-12:]
@@ -2292,6 +3352,8 @@ async def handle_requests(message: Message):
 
 async def main():
     load_data()
+    # Запускаем встроенный HTTP MCP-сервер для Roblox Studio параллельно с Telegram-ботом
+    await start_mcp_http_server()
     print(f"✅ Бот запущен! Модель фото: {bot_config['photo_model']}")
     await dp.start_polling(bot)
 

@@ -2748,3 +2748,699 @@ async def cb_adm_broadcast(callback: CallbackQuery):
         return
     admin_state[ADMIN_ID] = {"action": "broadcast"}
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboard
+@dp.callback_query(F.data == "adm_panel_limits")
+async def cb_adm_limits(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"✏️ Изменить FREE лимит ({bot_config['free_limit']})", callback_data="adm_edit_free_lim")],
+        [InlineKeyboardButton(text=f"✏️ Изменить SUB лимит ({bot_config['sub_limit']})", callback_data="adm_edit_sub_lim")],
+        [InlineKeyboardButton(text="🔄 Сбросить токены ВСЕМ юзерам", callback_data="adm_reset_all_tokens")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_back_main")]
+    ])
+    await callback.message.edit_text(
+        "🎚 <b>Управление лимитами токенов</b>\nВыберите параметр для изменения:",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data.in_({"adm_edit_free_lim", "adm_edit_sub_lim", "adm_reset_all_tokens"}))
+async def cb_adm_limits_action(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    if callback.data == "adm_reset_all_tokens":
+        for u in users_db.values():
+            u["tokens"] = 0
+        save_data()
+        await callback.answer("✅ Токены всех пользователей сброшены!", show_alert=True)
+        return await cb_adm_limits(callback)
+
+    admin_state[ADMIN_ID] = {"action": callback.data}
+    label = "бесплатного (FREE)" if callback.data == "adm_edit_free_lim" else "подписочного (SUB)"
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="adm_back_main")]])
+    await callback.message.edit_text(f"🔢 Введите новое числовое значение для <b>{label}</b> лимита:", reply_markup=kb, parse_mode="HTML")
+
+
+def render_admin_models_kb():
+    buttons = []
+    for m_id, info in models_db.items():
+        prem = "💎" if info["premium"] else "🆓"
+        vis = "🖼" if info["vision"] else "📝"
+        buttons.append([
+            InlineKeyboardButton(text=f"{info['name']} ({prem}/{vis})", callback_data=f"adm_mod_open_{m_id}")
+        ])
+    buttons.append([InlineKeyboardButton(text="➕ Добавить новую модель", callback_data="adm_mod_add")])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="adm_back_main")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@dp.callback_query(F.data == "adm_panel_models")
+async def cb_adm_models(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    await callback.message.edit_text(
+        "🧠 <b>Управление моделями ИИ</b>\nНажмите на модель, чтобы изменить её статус (Free/Premium, Vision) или удалить:",
+        reply_markup=render_admin_models_kb(),
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data.startswith("adm_mod_open_"))
+async def cb_adm_model_detail(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    m_id = callback.data.replace("adm_mod_open_", "")
+    if m_id not in models_db:
+        return await cb_adm_models(callback)
+
+    info = models_db[m_id]
+    prem_txt = "💎 Только Premium" if info["premium"] else "🆓 Доступна всем"
+    vis_txt = "🖼 Да (Vision)" if info["vision"] else "❌ Нет"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"Доступ: {prem_txt} (Переключить)", callback_data=f"adm_mod_tprem_{m_id}")],
+        [InlineKeyboardButton(text=f"Фото: {vis_txt} (Переключить)", callback_data=f"adm_mod_tvis_{m_id}")],
+        [InlineKeyboardButton(text="🗑 Удалить модель", callback_data=f"adm_mod_del_{m_id}")],
+        [InlineKeyboardButton(text="🔙 К списку моделей", callback_data="adm_panel_models")]
+    ])
+    await callback.message.edit_text(
+        f"⚙️ <b>Настройка модели</b>\n"
+        f"ID: <code>{m_id}</code>\n"
+        f"Название: <b>{info['name']}</b>",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data.startswith("adm_mod_tprem_") | F.data.startswith("adm_mod_tvis_") | F.data.startswith("adm_mod_del_"))
+async def cb_adm_model_modify(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    data = callback.data
+    if data.startswith("adm_mod_tprem_"):
+        m_id = data.replace("adm_mod_tprem_", "")
+        if m_id in models_db:
+            models_db[m_id]["premium"] = not models_db[m_id]["premium"]
+            save_data()
+        return await cb_adm_model_detail(callback)
+
+    elif data.startswith("adm_mod_tvis_"):
+        m_id = data.replace("adm_mod_tvis_", "")
+        if m_id in models_db:
+            models_db[m_id]["vision"] = not models_db[m_id]["vision"]
+            save_data()
+        return await cb_adm_model_detail(callback)
+
+    elif data.startswith("adm_mod_del_"):
+        m_id = data.replace("adm_mod_del_", "")
+        if len(models_db) <= 1:
+            return await callback.answer("Нельзя удалить последнюю модель!", show_alert=True)
+        models_db.pop(m_id, None)
+        save_data()
+        await callback.answer("Модель удалена!")
+        return await cb_adm_models(callback)
+
+
+@dp.callback_query(F.data == "adm_mod_add")
+async def cb_adm_model_add(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    admin_state[ADMIN_ID] = {"action": "add_model"}
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="adm_panel_models")]])
+    await callback.message.edit_text(
+        "➕ <b>Добавление новой модели</b>\n\n"
+        "Отправьте данные в формате:\n"
+        "<code>id_модели | Название | premium(1 или 0) | vision(1 или 0)</code>\n\n"
+        "Пример:\n<code>gpt-5-turbo | GPT-5 Turbo | 1 | 1</code>",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
+
+
+def render_user_manage_card(tid: int) -> tuple[str, InlineKeyboardMarkup]:
+    u = get_user(tid)
+    sub_str = f"💎 Активна (до {u['sub_end'].strftime('%d.%m.%Y')})" if (u["is_sub"] and u["sub_end"]) else ("💎 Активна" if u["is_sub"] else "🆓 Нет")
+    ban_str = "🚫 Забанен" if u["banned"] else "✅ Активен"
+    text = (
+        f"👤 <b>Карточка пользователя</b> <code>{tid}</code>\n\n"
+        f"Статус: {ban_str}\n"
+        f"Подписка: {sub_str}\n"
+        f"Токены: <code>{u['tokens']}</code>\n"
+        f"Текущая модель: <code>{u['current_model']}</code>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="💎 +30 дней Sub", callback_data=f"adm_u_sub30_{tid}"),
+            InlineKeyboardButton(text="❌ Забрать Sub", callback_data=f"adm_u_unsub_{tid}")
+        ],
+        [
+            InlineKeyboardButton(text="🚫 Бан / Разбан", callback_data=f"adm_u_ban_{tid}"),
+            InlineKeyboardButton(text="🔄 Сброс токенов", callback_data=f"adm_u_rst_{tid}")
+        ],
+        [InlineKeyboardButton(text="✉️ Написать пользователю", callback_data=f"adm_reply_{tid}")],
+        [InlineKeyboardButton(text="🔙 В админ-панель", callback_data="adm_back_main")]
+    ])
+    return text, kb
+
+
+@dp.callback_query(F.data == "adm_panel_user")
+async def cb_adm_panel_user(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    admin_state[ADMIN_ID] = {"action": "find_user"}
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="adm_back_main")]])
+    await callback.message.edit_text("🔍 Введите <b>Telegram ID</b> пользователя для управления:", reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("adm_u_"))
+async def cb_adm_user_card_actions(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    parts = callback.data.split("_")
+    act = parts[2]
+    tid = int(parts[3])
+    u = get_user(tid)
+
+    if act == "open":
+        text, kb = render_user_manage_card(tid)
+        await callback.answer()
+        return await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    elif act == "sub30":
+        u["is_sub"] = True
+        u["sub_end"] = datetime.now() + timedelta(days=30)
+        await callback.answer("Выдана подписка на 30 дней!")
+        try:
+            await bot.send_message(tid, "🎉 Вам выдана подписка <b>Premium</b> на 30 дней!", parse_mode="HTML")
+        except Exception:
+            pass
+    elif act == "unsub":
+        u["is_sub"] = False
+        u["sub_end"] = None
+        await callback.answer("Подписка отключена!")
+    elif act == "ban":
+        u["banned"] = not u["banned"]
+        await callback.answer("Статус бана изменен!")
+    elif act == "rst":
+        u["tokens"] = 0
+        await callback.answer("Токены пользователя обнулены!")
+
+    save_data()
+    text, kb = render_user_manage_card(tid)
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "adm_panel_photomod")
+async def cb_adm_photomod(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    admin_state[ADMIN_ID] = {"action": "set_photo_model"}
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="adm_back_main")]])
+    await callback.message.edit_text(
+        f"🎨 Текущая модель для генерации изображений: <code>{bot_config['photo_model']}</code>\n\n"
+        f"Введите название модели (например: <code>gpt-image-2.5</code> или <code>GPT Image 2.5</code>):",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data == "adm_panel_mcpurl")
+async def cb_adm_mcpurl(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    admin_state[ADMIN_ID] = {"action": "set_mcp_url"}
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="adm_back_main")]])
+    await callback.message.edit_text(
+        f"🌐 Текущий публичный URL вашего MCP-сервера (вшивается в плагин .rbxm):\n"
+        f"<code>{bot_config.get('mcp_public_url')}</code>\n\n"
+        f"Введите новый URL (например, <code>http://ВАШ_IP:8080</code> или домен):",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data == "adm_panel_broadcast")
+async def cb_adm_broadcast(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    admin_state[ADMIN_ID] = {"action": "broadcast"}
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="adm_back_main")]])
+    await callback.message.edit_text(
+        "📢 <b>Рассылка всем пользователям</b>\n\n"
+        "Введите текст сообщения (поддерживается HTML), которое будет отправлено всем пользователям бота:",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data.startswith("adm_reply_"))
+async def cb_adm_reply_user(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    tid = int(callback.data.replace("adm_reply_", ""))
+    admin_reply_target[ADMIN_ID] = tid
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_state")]])
+    await callback.message.answer(
+        f"✍️ <b>Введите ответ для пользователя</b> <code>{tid}</code>:",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+# =========================================================================
+# --- СБОРКА СИСТЕМНОГО ПРОМПТА И ОБРАБОТКА ВВОДА АДМИНА ---
+# =========================================================================
+def build_system_prompt(uid: int, u: dict) -> str:
+    parts = [BASE_SYSTEM_PROMPT]
+
+    if u.get("custom_prompt"):
+        parts.append(f"\n[ПОЛЬЗОВАТЕЛЬСКИЙ ПРОМПТ]:\n{u['custom_prompt']}")
+
+    s = u.get("school", {})
+    if s.get("active"):
+        sch_block = (
+            f"\n[ВКЛЮЧЕН РЕЖИМ ШКОЛЫ]:\n"
+            f"- Ученик учится в: {s.get('grade', '9 класс')} ({s.get('quarter', '1 четверть')}).\n"
+            f"- Уровень подготовки: {s.get('level', 'Средний')}.\n"
+            f"- Тип домашнего задания: {s.get('hw_type', 'Письменное')}.\n"
+            f"- Текущая тема: {s.get('topic', 'Общая')}.\n"
+            f"ВАЖНО: Решай задачи строго методами, которые проходят в {s.get('grade', '9 класс')}. "
+            f"Не используй высшую математику или термины старших классов, если ученик в младшем/среднем звене."
+        )
+        samples = s.get("training_samples", [])
+        if s.get("hw_type") == "Письменное" and samples:
+            joined_samples = "\n---\n".join(samples[-3:])
+            sch_block += f"\n\nСкопируй стиль письма, лексику и уровень грамотности ученика по его примерам:\n{joined_samples}"
+        parts.append(sch_block)
+
+    if u.get("roblox", {}).get("active"):
+        parts.append(ROBLOX_MCP_SYSTEM_PROMPT)
+
+    return "\n\n".join(parts)
+
+
+async def handle_admin_input(message: Message) -> bool:
+    """Обрабатывает состояния админ-панели и ответы пользователям."""
+    if message.from_user.id != ADMIN_ID:
+        return False
+
+    if ADMIN_ID in admin_reply_target:
+        tid = admin_reply_target.pop(ADMIN_ID)
+        txt = message.text or message.caption or ""
+        try:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✍️ Ответить администратору", callback_data="buy_sub_prompt")]
+            ])
+            await bot.send_message(
+                tid,
+                f"📩 <b>Сообщение от администратора:</b>\n\n{html.escape(txt)}",
+                reply_markup=kb,
+                parse_mode="HTML"
+            )
+            await message.answer(f"✅ Ответ отправлен пользователю <code>{tid}</code>.", parse_mode="HTML")
+        except Exception as e:
+            await message.answer(f"❌ Не удалось отправить сообщение: {e}")
+        return True
+
+    st = admin_state.get(ADMIN_ID)
+    if not st or not message.text:
+        return False
+
+    act = st.get("action")
+    txt = message.text.strip()
+
+    if act in ("adm_edit_free_lim", "adm_edit_sub_lim"):
+        if not txt.isdigit():
+            await message.answer("❌ Введите целое число!")
+            return True
+        val = int(txt)
+        if act == "adm_edit_free_lim":
+            bot_config["free_limit"] = val
+        else:
+            bot_config["sub_limit"] = val
+        admin_state.pop(ADMIN_ID, None)
+        save_data()
+        await message.answer(f"✅ Лимит успешно обновлен на <code>{val}</code>!", reply_markup=get_admin_main_kb(), parse_mode="HTML")
+        return True
+
+    elif act == "add_model":
+        parts = [p.strip() for p in txt.split("|")]
+        if len(parts) < 2:
+            await message.answer("❌ Неверный формат! Используйте: <code>id | Название | 1 | 1</code>", parse_mode="HTML")
+            return True
+        m_id = parts[0]
+        m_name = parts[1]
+        is_prem = parts[2] == "1" if len(parts) > 2 else False
+        is_vis = parts[3] == "1" if len(parts) > 3 else False
+        models_db[m_id] = {"name": m_name, "premium": is_prem, "vision": is_vis}
+        admin_state.pop(ADMIN_ID, None)
+        save_data()
+        await message.answer(f"✅ Модель <b>{html.escape(m_name)}</b> (<code>{html.escape(m_id)}</code>) добавлена!", reply_markup=get_admin_main_kb(), parse_mode="HTML")
+        return True
+
+    elif act == "find_user":
+        if not txt.isdigit():
+            await message.answer("❌ Введите числовой Telegram ID!")
+            return True
+        tid = int(txt)
+        admin_state.pop(ADMIN_ID, None)
+        card_txt, card_kb = render_user_manage_card(tid)
+        await message.answer(card_txt, reply_markup=card_kb, parse_mode="HTML")
+        return True
+
+    elif act == "set_photo_model":
+        bot_config["photo_model"] = txt
+        admin_state.pop(ADMIN_ID, None)
+        save_data()
+        await message.answer(f"✅ Модель генерации фото изменена на: <code>{html.escape(txt)}</code>", reply_markup=get_admin_main_kb(), parse_mode="HTML")
+        return True
+
+    elif act == "set_mcp_url":
+        bot_config["mcp_public_url"] = txt.rstrip("/")
+        admin_state.pop(ADMIN_ID, None)
+        save_data()
+        await message.answer(f"✅ Публичный URL Roblox MCP изменен на:\n<code>{html.escape(bot_config['mcp_public_url'])}</code>", reply_markup=get_admin_main_kb(), parse_mode="HTML")
+        return True
+
+    elif act == "broadcast":
+        admin_state.pop(ADMIN_ID, None)
+        status_msg = await message.answer("📢 Запускаю рассылку...")
+        sent = 0
+        failed = 0
+        for uid in list(users_db.keys()):
+            try:
+                await bot.send_message(uid, txt, parse_mode="HTML")
+                sent += 1
+                await asyncio.sleep(0.04)
+            except Exception:
+                failed += 1
+        await status_msg.edit_text(f"✅ <b>Рассылка завершена!</b>\nУспешно: <code>{sent}</code> | Ошибок: <code>{failed}</code>", parse_mode="HTML")
+        return True
+
+    return False
+
+
+# =========================================================================
+# --- ГЛАВНЫЙ ОБРАБОТЧИК СООБЩЕНИЙ, ФОТО, ФАЙЛОВ И ROBLOX MCP ---
+# =========================================================================
+@dp.message()
+async def handle_all_messages(message: Message):
+    uid = message.from_user.id
+    u = get_user(uid)
+
+    if u["banned"] and uid != ADMIN_ID:
+        return await message.answer("🚫 Ваш аккаунт заблокирован.")
+
+    # Проверка ввода админа
+    if uid == ADMIN_ID and await handle_admin_input(message):
+        return
+
+    user_text = (message.text or message.caption or "").strip()
+
+    # --- ОБРАБОТКА АКТИВНЫХ СОСТОЯНИЙ ПОЛЬЗОВАТЕЛЯ ---
+    state = u.get("state")
+
+    if state == "wait_review_text":
+        u["state"] = None
+        score = u.get("temp_score", 10)
+        reviews_db.append({
+            "user_id": uid,
+            "name": message.from_user.full_name or "Пользователь",
+            "username": f"@{message.from_user.username}" if message.from_user.username else "без username",
+            "score": score,
+            "text": user_text[:800] if user_text else "Без комментария",
+            "date": datetime.now().strftime("%d.%m.%Y %H:%M")
+        })
+        save_data()
+        return await message.answer(
+            f"🎉 <b>Спасибо за ваш отзыв и оценку ({score}/10)!</b>",
+            reply_markup=get_main_kb(uid),
+            parse_mode="HTML"
+        )
+
+    elif state == "wait_prompt":
+        u["custom_prompt"] = user_text[:1500]
+        u["state"] = None
+        save_data()
+        return await message.answer(
+            "✅ <b>Ваш системный промпт сохранен!</b>",
+            reply_markup=get_main_kb(uid),
+            parse_mode="HTML"
+        )
+
+    elif state == "wait_school_topic":
+        u["school"]["topic"] = user_text[:100] or "Общая"
+        u["state"] = None
+        save_data()
+        return await message.answer(
+            f"📌 Тема урока обновлена: <b>{html.escape(u['school']['topic'])}</b>",
+            reply_markup=get_school_main_kb(u),
+            parse_mode="HTML"
+        )
+
+    elif state == "wait_image_prompt":
+        u["state"] = None
+        if not user_text:
+            return await message.answer("❌ Напишите текстовое описание картинки.")
+        return await run_image_generation(message, uid, user_text)
+
+    elif state == "support_chat":
+        u["state"] = None
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✍️ Ответить", callback_data=f"adm_reply_{uid}"),
+                InlineKeyboardButton(text="👤 Карточка юзера", callback_data=f"adm_u_open_{uid}")
+            ]
+        ])
+        uname = f"@{message.from_user.username}" if message.from_user.username else "нет username"
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"🆘 <b>Обращение в поддержку / покупка Sub</b>\n"
+                f"👤 От: <b>{html.escape(message.from_user.full_name or 'Юзер')}</b> ({uname})\n"
+                f"🆔 ID: <code>{uid}</code>\n\n"
+                f"💬 <b>Текст:</b>\n{html.escape(user_text or '[Медиафайл]')}",
+                reply_markup=kb,
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+        return await message.answer(
+            "✅ <b>Ваше сообщение отправлено администратору!</b> Ожидайте ответа в этом чате.",
+            reply_markup=get_main_kb(uid),
+            parse_mode="HTML"
+        )
+
+    # --- РЕЖИМ ОБУЧЕНИЯ ШКОЛЫ (КОПИРОВАНИЕ СТИЛЯ) ---
+    if u["school"]["active"] and u["school"]["hw_type"] == "Письменное" and u["school"]["training_mode"]:
+        sample_txt = user_text
+        if message.document and not is_image_document(message):
+            sample_txt = await extract_document_text(message)
+        if sample_txt and len(sample_txt.strip()) >= 20:
+            u["school"]["training_samples"].append(sample_txt.strip()[:1500])
+            save_data()
+            return await message.answer(
+                f"🧠 <b>Пример вашей работы сохранен!</b> (Всего примеров: <code>{len(u['school']['training_samples'])}</code>)\n"
+                f"Можете отправить еще один или выключить «Режим Обучения» в меню 🎓 Школа.",
+                reply_markup=get_school_main_kb(u),
+                parse_mode="HTML"
+            )
+
+    # --- АНТИСПАМ (0.8 СЕК ДЛЯ БЫСТРОГО ОТКЛИКА) ---
+    now_ts = time.time()
+    if uid != ADMIN_ID and now_ts - anti_spam.get(uid, 0) < 0.8:
+        return
+    anti_spam[uid] = now_ts
+
+    # --- ЦЕНЗУРА ---
+    if not check_censorship_fast(user_text):
+        u["strikes"] = u.get("strikes", 0) + 1
+        if u["strikes"] >= 3 and uid != ADMIN_ID:
+            u["banned"] = True
+            save_data()
+            return await message.answer("🚫 Вы заблокированы за систематическое нарушение правил.")
+        save_data()
+        return await message.answer(f"⚠️ Запрос содержит запрещенный контент! Предупреждение {u['strikes']}/3.")
+
+    # --- ПРОВЕРКА ЛИМИТА ТОКЕНОВ ---
+    limit = bot_config["sub_limit"] if u["is_sub"] else bot_config["free_limit"]
+    if uid != ADMIN_ID and u["tokens"] >= limit:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💎 Оформить Premium", callback_data="buy_sub_prompt")]
+        ])
+        return await message.answer(
+            f"⚠️ <b>Вы исчерпали лимит токенов ({u['tokens']} / {limit})!</b>\n"
+            f"Оформите подписку Premium для увеличения лимита до {bot_config['sub_limit']} токенов.",
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+
+    # --- ИЗВЛЕЧЕНИЕ ИЗОБРАЖЕНИЯ ИЛИ ДОКУМЕНТА ---
+    b64_img = await extract_message_image_b64(message)
+    if b64_img:
+        user_image_cache[uid] = b64_img
+
+    doc_content = ""
+    if message.document and not is_image_document(message):
+        doc_content = await extract_document_text(message)
+        fname = message.document.file_name or "file.txt"
+        user_text = f"{user_text}\n\n[Содержимое файла {fname}]:\n{doc_content[:12000]}".strip()
+
+    if not user_text and not b64_img:
+        return
+
+    sys_prompt = build_system_prompt(uid, u)
+    model_id = u["current_model"]
+
+    # Мгновенная реакция в чате (typing indicator + статус)
+    try:
+        await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+    except Exception:
+        pass
+
+    # --- ЕСЛИ ОТПРАВЛЕНО ФОТО (VISION) ---
+    if b64_img:
+        wait_msg = await message.answer("🖼 <i>Анализирую изображение...</i>", parse_mode="HTML")
+        try:
+            ans = await create_vision_completion(
+                preferred_model=model_id,
+                sys_prompt=sys_prompt,
+                history=u["history"],
+                user_text=user_text,
+                b64_image=b64_img
+            )
+            try:
+                await wait_msg.delete()
+            except Exception:
+                pass
+
+            u["history"].append({"role": "user", "content": user_text or "[Изображение]"})
+            u["history"].append({"role": "assistant", "content": ans})
+            u["history"] = u["history"][-14:]
+            u["tokens"] += max(200, (len(user_text) + len(ans)) // 3)
+            save_data()
+
+            return await send_smart_ai_response(message, ans)
+        except Exception as e:
+            return await wait_msg.edit_text(f"❌ Ошибка при анализе фото: {e}")
+
+    # --- ПОИСК В ИНТЕРНЕТЕ (ЕСЛИ ВКЛЮЧЕН) ---
+    web_context = ""
+    wait_msg = await message.answer(
+        "🌐 <i>Ищу актуальную информацию...</i>" if u["web_search"] else "💭 <i>Думаю...</i>",
+        parse_mode="HTML"
+    )
+
+    if u["web_search"] and user_text:
+        try:
+            web_context = await search_internet(user_text)
+        except Exception:
+            web_context = ""
+
+    full_user_prompt = user_text
+    if web_context:
+        full_user_prompt = f"{user_text}\n\n[АКТУАЛЬНЫЕ ДАННЫЕ ИЗ ИНТЕРНЕТА]:\n{web_context}"
+
+    messages_payload = [{"role": "system", "content": sys_prompt}]
+    for h in u["history"][-12:]:
+        messages_payload.append({"role": h["role"], "content": h["content"]})
+    messages_payload.append({"role": "user", "content": full_user_prompt})
+
+    try:
+        resp = await create_chat_completion(
+            model=model_id,
+            messages=messages_payload,
+            max_tokens=4000,
+            stream=False
+        )
+        ai_reply = (resp.choices[0].message.content or "").strip()
+
+        # --- ЦИКЛ ВЫПОЛНЕНИЯ КОМАНД В ROBLOX STUDIO (MCP AGENT LOOP) ---
+        if u["roblox"]["active"]:
+            step = 0
+            while step < 5:
+                mcp_calls = extract_mcp_calls(ai_reply)
+                if not mcp_calls:
+                    break
+                step += 1
+                tool_results = []
+                for call in mcp_calls:
+                    t_name = call.get("tool", "")
+                    t_args = call.get("args", {})
+                    try:
+                        await wait_msg.edit_text(f"🎮 <i>Выполняю в Roblox Studio: <code>{html.escape(t_name)}</code>...</i>", parse_mode="HTML")
+                    except Exception:
+                        pass
+                    exec_res = await execute_roblox_mcp_tool(uid, t_name, t_args)
+                    status_str = "SUCCESS" if exec_res.get("success") else "ERROR"
+                    tool_results.append(f"[{t_name} -> {status_str}]:\n{exec_res.get('result', '')[:2500]}")
+
+                messages_payload.append({"role": "assistant", "content": ai_reply})
+                messages_payload.append({
+                    "role": "user",
+                    "content": "Результаты выполнения MCP инструментов в Roblox Studio:\n" + "\n\n".join(tool_results)
+                })
+
+                resp = await create_chat_completion(
+                    model=model_id,
+                    messages=messages_payload,
+                    max_tokens=4000,
+                    stream=False
+                )
+                ai_reply = (resp.choices[0].message.content or "").strip()
+
+        # Очищаем служебные теги <mcp_call>, если остались
+        clean_reply = MCP_CALL_RE.sub("", ai_reply).strip() or "✅ Действия успешно выполнены в Roblox Studio!"
+
+        try:
+            await wait_msg.delete()
+        except Exception:
+            pass
+
+        u["history"].append({"role": "user", "content": user_text})
+        u["history"].append({"role": "assistant", "content": clean_reply})
+        u["history"] = u["history"][-14:]
+
+        used_tokens = getattr(getattr(resp, "usage", None), "total_tokens", None)
+        if not used_tokens:
+            used_tokens = max(50, (len(full_user_prompt) + len(clean_reply)) // 3)
+        u["tokens"] += int(used_tokens)
+        save_data()
+
+        await send_smart_ai_response(message, clean_reply)
+
+    except Exception as e:
+        try:
+            await wait_msg.edit_text(f"❌ Ошибка при обращении к ИИ: {e}")
+        except Exception:
+            await message.answer(f"❌ Ошибка при обращении к ИИ: {e}")
+
+
+# =========================================================================
+# --- ЗАПУСК БОТА И MCP СЕРВЕРА (ОПТИМИЗИРОВАНО ДЛЯ ХОСТИНГА) ---
+# =========================================================================
+async def main():
+    load_data()
+    mcp_runner = await start_mcp_http_server()
+
+    # Сбрасываем старый вебхук и накопившиеся апдейты для быстрого старта
+    await bot.delete_webhook(drop_pending_updates=True)
+    print(f"🚀 Бот ШколоAI успешно запущен! Администратор: {ADMIN_ID}")
+
+    try:
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        print("⏳ Сохранение данных и остановка сервисов...")
+        save_data(force_sync=True)
+        await mcp_runner.cleanup()
+        if http_session and not http_session.closed:
+            await http_session.close()
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("🛑 Бот остановлен.")

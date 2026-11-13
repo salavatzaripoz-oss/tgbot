@@ -3845,6 +3845,317 @@ async def handle_admin_input(message: Message) -> bool:
 # =========================================================================
 # --- ГЛАВНЫЙ ОБРАБОТЧИК СООБЩЕНИЙ, ФОТО, ФАЙЛОВ И ROBLOX MCP ---
 # =========================================================================
+# =========================================================================
+# --- РЕЖИМ ШКОЛЫ ---
+# =========================================================================
+@dp.message(F.text.startswith("🎓"))
+@dp.message(Command("school"))
+async def menu_school(message: Message):
+    u = get_user(message.from_user.id)
+    if u["banned"]:
+        return
+    await message.answer(
+        "🎓 <b>Настройки Режима Школы</b>\n\n"
+        "В этом режиме ИИ решает задачи строго по программе вашего класса и может подстраиваться под ваш почерк/стиль письма.",
+        reply_markup=get_school_main_kb(u),
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data.startswith("sch_"))
+async def cb_school_actions(callback: CallbackQuery):
+    uid = callback.from_user.id
+    u = get_user(uid)
+    s = u["school"]
+    data = callback.data
+
+    if data == "sch_toggle":
+        s["active"] = not s["active"]
+        save_data()
+        await callback.answer("Режим Школы включён!" if s["active"] else "Режим Школы выключен.")
+        await callback.message.edit_reply_markup(reply_markup=get_school_main_kb(u))
+        return await callback.message.answer("Клавиатура обновлена.", reply_markup=get_main_kb(uid))
+
+    if data == "sch_menu_grade":
+        grades = ["1-4 класс", "5 класс", "6 класс", "7 класс", "8 класс", "9 класс", "10 класс", "11 класс"]
+        rows = [[InlineKeyboardButton(text=g, callback_data=f"sch_set_grade_{g}")] for g in grades]
+        return await callback.message.edit_text("🏫 Выберите класс:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+    if data.startswith("sch_set_grade_"):
+        s["grade"] = data.replace("sch_set_grade_", "")
+        save_data()
+        return await callback.message.edit_text("🎓 <b>Настройки Режима Школы</b>", reply_markup=get_school_main_kb(u), parse_mode="HTML")
+
+    if data == "sch_menu_quarter":
+        quarters = ["1 четверть", "2 четверть", "3 четверть", "4 четверть"]
+        rows = [[InlineKeyboardButton(text=q, callback_data=f"sch_set_quarter_{q}")] for q in quarters]
+        return await callback.message.edit_text("📅 Выберите четверть:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+    if data.startswith("sch_set_quarter_"):
+        s["quarter"] = data.replace("sch_set_quarter_", "")
+        save_data()
+        return await callback.message.edit_text("🎓 <b>Настройки Режима Школы</b>", reply_markup=get_school_main_kb(u), parse_mode="HTML")
+
+    if data == "sch_menu_level":
+        levels = ["Базовый", "Средний", "Углублённый / Олимпиадный"]
+        rows = [[InlineKeyboardButton(text=lv, callback_data=f"sch_set_level_{lv}")] for lv in levels]
+        return await callback.message.edit_text("📊 Выберите уровень:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+    if data.startswith("sch_set_level_"):
+        s["level"] = data.replace("sch_set_level_", "")
+        save_data()
+        return await callback.message.edit_text("🎓 <b>Настройки Режима Школы</b>", reply_markup=get_school_main_kb(u), parse_mode="HTML")
+
+    if data == "sch_menu_hw":
+        types = ["Письменное", "Устное / Пересказ", "Тест / Контрольная"]
+        rows = [[InlineKeyboardButton(text=t, callback_data=f"sch_set_hw_{t}")] for t in types]
+        return await callback.message.edit_text("📝 Выберите тип Д/З:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+    if data.startswith("sch_set_hw_"):
+        s["hw_type"] = data.replace("sch_set_hw_", "")
+        save_data()
+        return await callback.message.edit_text("🎓 <b>Настройки Режима Школы</b>", reply_markup=get_school_main_kb(u), parse_mode="HTML")
+
+    if data == "sch_topic":
+        u["state"] = "wait_school_topic"
+        return await callback.message.answer("📌 Напишите название текущей темы урока:")
+
+    if data == "sch_train_toggle":
+        s["training_mode"] = not s["training_mode"]
+        save_data()
+        await callback.answer("Отправьте 1-3 примера ваших прошлых работ текстом или файлом." if s["training_mode"] else "Режим обучения выключен.")
+        return await callback.message.edit_reply_markup(reply_markup=get_school_main_kb(u))
+
+    if data == "sch_train_clear":
+        s["training_samples"] = []
+        save_data()
+        await callback.answer("Примеры очищены!")
+        return await callback.message.edit_reply_markup(reply_markup=get_school_main_kb(u))
+# =========================================================================
+# --- ГРУППОВОЙ РЕЖИМ И МОДЕРАЦИЯ ---
+# =========================================================================
+async def is_group_admin(chat_id: int, user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        return member.status in ("administrator", "creator")
+    except Exception:
+        return False
+
+
+async def bot_has_group_permission(chat_id: int, permission: str) -> bool:
+    try:
+        me = await bot.get_me()
+        member = await bot.get_chat_member(chat_id, me.id)
+        if member.status == "creator":
+            return True
+        return member.status == "administrator" and bool(getattr(member, permission, False))
+    except Exception:
+        return False
+
+
+async def bot_can_moderate(chat_id: int) -> bool:
+    try:
+        me = await bot.get_me()
+        member = await bot.get_chat_member(chat_id, me.id)
+        return member.status in ("administrator", "creator")
+    except Exception:
+        return False
+
+
+def group_target_id(message: Message, args: list[str], command_name: str = "") -> int | None:
+    if message.reply_to_message and message.reply_to_message.from_user:
+        return message.reply_to_message.from_user.id
+    if command_name == "/mute" and len(args) < 2:
+        return None
+    if args and args[0].lstrip("@").isdigit():
+        return int(args[0].lstrip("@"))
+    return None
+
+
+async def handle_group_message(message: Message, user: dict):
+    chat_id = message.chat.id
+    uid = message.from_user.id
+    group = get_group(chat_id, message.chat.title or "Группа")
+    group["messages"] = int(group.get("messages", 0)) + 1
+    user_text = (message.text or message.caption or "").strip()
+    if message.new_chat_members:
+        names = ", ".join(html.escape(member.full_name) for member in message.new_chat_members[:8])
+        await message.answer(
+            f"👋 Добро пожаловать, {names}! Я ШколоAI. Напишите /grouphelp, чтобы увидеть групповые команды."
+        )
+        save_data()
+        return
+
+    command = (message.text or "").split(maxsplit=1)
+    head = command[0].split("@")[0].lower() if command else ""
+    args = command[1].split() if len(command) > 1 else []
+
+    if head in ("/grouphelp", "/helpgroup"):
+        return await message.reply(
+            "👥 <b>Команды группы</b>\n"
+            "/ai текст — задать вопрос ИИ\n/ai_on и /ai_off — включить или выключить ответы на обычные сообщения\n"
+            "/rules — правила группы; /setrules текст — установить правила (админы)\n"
+            "/warn — предупреждение (ответом на сообщение)\n/mute [мин] — ограничить участника\n"
+            "/unmute, /ban, /unban, /kick, /tempban — модерация (ответом на сообщение)\n"
+            "/unwarn, /clearwarns — управление предупреждениями.\n"
+            "/purge N — удалить последние N сообщений (до 100)\n"
+            "/roll [число], /coin, /groupstats — групповые приколюхи и статистика.\n\n"
+            "Для группового диалога упомяните бота или ответьте на его сообщение.", parse_mode="HTML"
+        )
+
+    if head == "/rules":
+        return await message.reply(f"📜 <b>Правила группы</b>\n{html.escape(group.get('rules', 'Правила не заданы.'))}", parse_mode="HTML")
+
+    if head == "/setrules":
+        if not await is_group_admin(chat_id, uid):
+            return await message.reply("⛔ Устанавливать правила могут только администраторы группы.")
+        rules = (message.text or "").partition(" ")[2].strip()
+        if not rules:
+            return await message.reply("Формат: /setrules текст правил")
+        group["rules"] = rules[:3000]
+        save_data()
+        return await message.reply("✅ Правила группы обновлены.")
+
+    if head == "/ai_on":
+        if not await is_group_admin(chat_id, uid):
+            return await message.reply("⛔ Включать автоответы могут только администраторы.")
+        group["ai_enabled"] = True
+        save_data()
+        return await message.reply("🤖 Автоответы ИИ включены. Для отключения: /ai_off")
+
+    if head == "/ai_off":
+        if not await is_group_admin(chat_id, uid):
+            return await message.reply("⛔ Выключать автоответы могут только администраторы.")
+        group["ai_enabled"] = False
+        save_data()
+        return await message.reply("🔕 Автоответы ИИ выключены. Бот по-прежнему отвечает на /ai и упоминания.")
+
+    if head in ("/roll", "/dice"):
+        import random
+        try:
+            sides = max(2, min(100000, int(args[0]))) if args else 6
+        except ValueError:
+            sides = 6
+        return await message.reply(f"🎲 Выпало: <b>{random.randint(1, sides)}</b> (из {sides})", parse_mode="HTML")
+
+    if head == "/coin":
+        import random
+        return await message.reply("🪙 Орёл!" if random.choice((True, False)) else "🪙 Решка!")
+
+    if head == "/groupstats":
+        active_warns = sum(len(v) if isinstance(v, list) else int(v or 0) for v in group.get("warnings", {}).values())
+        return await message.reply(
+            f"📊 <b>Статистика группы</b>\nСообщений с момента запуска учёта: <code>{group['messages']}</code>\n"
+            f"Участников с предупреждениями: <code>{len(group.get('warnings', {}))}</code>\nПредупреждений всего: <code>{active_warns}</code>\n"
+            f"ИИ: {'🟢 включён' if group.get('ai_enabled') else '🔴 только по команде/упоминанию'}",
+            parse_mode="HTML"
+        )
+
+    if head in ("/warn", "/warnings", "/unwarn", "/clearwarns", "/ban", "/unban", "/kick", "/tempban", "/mute", "/unmute"):
+        if not await is_group_admin(chat_id, uid):
+            return await message.reply("⛔ Эта команда доступна администраторам группы.")
+        target_id = None if head == "/clearwarns" else group_target_id(message, args, head)
+        if head == "/clearwarns":
+            group["warnings"] = {}
+            save_data()
+            return await message.reply("✅ Все предупреждения в этой группе очищены.")
+        if target_id is None:
+            return await message.reply("Ответьте командой на сообщение участника или укажите его числовой Telegram ID. Для /mute укажите длительность после ID или ответьте на сообщение.")
+        if target_id == uid:
+            return await message.reply("Нельзя применять эту команду к самому себе.")
+        warnings = group.setdefault("warnings", {})
+        wkey = str(target_id)
+        if head == "/warn":
+            count = int(warnings.get(wkey, 0)) + 1
+            warnings[wkey] = count
+            save_data()
+            if count >= 3:
+                try:
+                    if not await bot_has_group_permission(chat_id, "can_restrict_members"):
+                        raise PermissionError("Боту нужно право «Ограничивать участников».")
+                    await bot.restrict_chat_member(chat_id, target_id, permissions=ChatPermissions(can_send_messages=False), until_date=datetime.now() + timedelta(minutes=30))
+                    return await message.reply(f"⚠️ Участник <code>{target_id}</code> получил предупреждение {count}/3 и ограничение на 30 минут.", parse_mode="HTML")
+                except Exception as exc:
+                    return await message.reply(f"⚠️ Предупреждение {count}/3 выдано, но автоограничение не сработало: {html.escape(str(exc)[:200])}", parse_mode="HTML")
+            return await message.reply(f"⚠️ Предупреждение {count}/3 для <code>{target_id}</code>.", parse_mode="HTML")
+        if head == "/warnings":
+            return await message.reply(f"⚠️ У пользователя <code>{target_id}</code> предупреждений: <b>{int(warnings.get(wkey, 0))}</b>", parse_mode="HTML")
+        if head == "/unwarn":
+            current = max(0, int(warnings.get(wkey, 0)) - 1)
+            if current:
+                warnings[wkey] = current
+            else:
+                warnings.pop(wkey, None)
+            save_data()
+            return await message.reply(f"✅ Предупреждения пользователя <code>{target_id}</code>: <b>{current}</b>", parse_mode="HTML")
+        if head == "/tempban":
+            if not await bot_has_group_permission(chat_id, "can_restrict_members"):
+                return await message.reply("⚠️ Боту нужно право «Блокировать участников».")
+            duration_arg = args[0] if message.reply_to_message and args else (args[1] if len(args) > 1 else "1")
+            try:
+                days = max(1, min(366, int(duration_arg)))
+            except (TypeError, ValueError):
+                days = 1
+            until = datetime.now() + timedelta(days=days)
+            await bot.ban_chat_member(chat_id, target_id, until_date=until)
+            return await message.reply(f"⏳ Участник <code>{target_id}</code> заблокирован на {days} дн.", parse_mode="HTML")
+        if head == "/ban":
+            if not await bot_has_group_permission(chat_id, "can_restrict_members"):
+                return await message.reply("⚠️ Боту нужно право «Блокировать участников».")
+            await bot.ban_chat_member(chat_id, target_id)
+            return await message.reply(f"🚫 Участник <code>{target_id}</code> заблокирован.", parse_mode="HTML")
+        if head == "/unban":
+            if not await bot_has_group_permission(chat_id, "can_restrict_members"):
+                return await message.reply("⚠️ Боту нужно право «Блокировать участников».")
+            await bot.unban_chat_member(chat_id, target_id, only_if_banned=False)
+            warnings.pop(wkey, None)
+            save_data()
+            return await message.reply(f"✅ Блокировка пользователя <code>{target_id}</code> снята.", parse_mode="HTML")
+        if head == "/kick":
+            if not await bot_has_group_permission(chat_id, "can_restrict_members"):
+                return await message.reply("⚠️ Боту нужно право «Блокировать участников».")
+            await bot.ban_chat_member(chat_id, target_id)
+            await bot.unban_chat_member(chat_id, target_id, only_if_banned=False)
+            return await message.reply(f"👢 Участник <code>{target_id}</code> удалён из группы.", parse_mode="HTML")
+        if head == "/mute":
+            if not await bot_has_group_permission(chat_id, "can_restrict_members"):
+                return await message.reply("⚠️ Боту нужно право «Ограничивать участников».")
+            duration_arg = args[0] if message.reply_to_message and args else (args[1] if len(args) > 1 else "10")
+            try:
+                minutes = max(1, min(10080, int(duration_arg)))
+            except (TypeError, ValueError):
+                minutes = 10
+            await bot.restrict_chat_member(chat_id, target_id, permissions=ChatPermissions(can_send_messages=False), until_date=datetime.now() + timedelta(minutes=minutes))
+            return await message.reply(f"🔇 Участник <code>{target_id}</code> ограничен на {minutes} мин.", parse_mode="HTML")
+        if head == "/unmute":
+            if not await bot_has_group_permission(chat_id, "can_restrict_members"):
+                return await message.reply("⚠️ Боту нужно право «Ограничивать участников».")
+            permissions = ChatPermissions(can_send_messages=True, can_send_audios=True, can_send_documents=True,
+                                          can_send_photos=True, can_send_videos=True, can_send_video_notes=True,
+                                          can_send_voice_notes=True, can_send_polls=True, can_send_other_messages=True,
+                                          can_add_web_page_previews=True)
+            await bot.restrict_chat_member(chat_id, target_id, permissions=permissions)
+            return await message.reply(f"🔊 Ограничение пользователя <code>{target_id}</code> снято.", parse_mode="HTML")
+
+    if head == "/purge":
+        if not await is_group_admin(chat_id, uid):
+            return await message.reply("⛔ Команда доступна только администраторам.")
+        if not await bot_has_group_permission(chat_id, "can_delete_messages"):
+            return await message.reply("⚠️ Боту нужно право «Удалять сообщения».")
+        if not message.reply_to_message:
+            return await message.reply("Ответьте на сообщение командой /purge 20")
+        try:
+            count = max(1, min(100, int(args[0]) if args else 20))
+        except ValueError:
+            count = 20
+        start_id = message.reply_to_message.message_id
+        ids = list(range(start_id, min(message.message_id, start_id + count)))
+        try:
+            await bot.delete_messages(chat_id, ids)
+            await message.delete()
+        except Exception as exc:
+            return await message.reply(f"Не удалось удалить сообщения: {html.escape(str(exc)[:180])}", parse_mode="HTML")
+        return
 @dp.message()
 async def handle_all_messages(message: Message):
     if not message.from_user:
@@ -3853,9 +4164,7 @@ async def handle_all_messages(message: Message):
     u = get_user(uid)
 
     if message.chat.type in ("group", "supergroup"):
-        # Если вы не подключили group_agent.py, оставьте тут pass,
-        # но в данном примере handle_group_message будет перезаписан внутри setup_group_agent!
-        pass
+        return await handle_group_message(message, u)
 
     if u["banned"] and uid != ADMIN_ID:
         return await message.answer("🚫 Ваш аккаунт заблокирован.")

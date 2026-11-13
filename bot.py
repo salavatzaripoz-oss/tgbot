@@ -1007,11 +1007,146 @@ async def create_chat_completion(**kwargs):
 
 
 # --- РАСПОЗНАВАНИЕ ИЗОБРАЖЕНИЙ (VISION) ---
+# --- РАСПОЗНАВАНИЕ ИЗОБРАЖЕНИЙ (VISION) ---
 VISION_REFUSAL_MARKERS = (
     "не могу просматривать", "не вижу изображен", "не могу увидеть",
     "cannot see the image", "can't view images", "unable to view",
-    "я текстовая модель", "не умею работать с изображениями"
+    "я текстовая модель", "не умею работать с изображениями",
+    "не могу открыть изображен", "пришлите текст"
 )
+
+
+def get_vision_fallback_models(preferred_model: str) -> list[str]:
+    candidates = []
+    # Сначала всегда пробуем ту модель, которая выбрана у пользователя
+    if preferred_model:
+        candidates.append(preferred_model)
+
+    priority_vision = [
+        "gpt-6-luna", "gemini-3.8-flash", "gemini-3.6-flash",
+        "gpt-6-so", "sonnet-5", "gpt-6.1-sol", "gemini-4-argon",
+        "opus-5.5", "sonnet-5.5", "grok-4.7"
+    ]
+    for m in priority_vision:
+        if m in models_db and m not in candidates:
+            candidates.append(m)
+
+    for m, info in models_db.items():
+        if info.get("vision") and m not in candidates:
+            candidates.append(m)
+
+    return candidates or [DEFAULT_MODEL]
+
+
+async def create_vision_completion(
+    preferred_model: str,
+    sys_prompt: str,
+    history: list[dict],
+    user_text: str,
+    b64_image: str
+) -> str:
+    prompt_text = (
+        user_text.strip()
+        if user_text and user_text.strip()
+        else "Внимательно изучи это изображение. Если на нем задание, тест, код или задача — подробно реши его. Если текст — разбери и ответь. Если просто картинка — подробно опиши."
+    )
+
+    # Передаем краткий контекст текстом внутри самого запроса, чтобы не ломать мультимодальный массив messages
+    context_str = ""
+    if history:
+        recent_ text_lines = []
+        for h in history[-4:]:
+            role_label = "Пользователь" if h.get("role") == "user" else "Ассистент"
+            content_val = h.get("content", "")
+            if isinstance(content_val, str) and content_val.strip():
+                recent_text_lines.append(f"{role_label}: {content_val[:300]}")
+        if recent_text_lines:
+            context_str = "Краткий контекст прошлых сообщений:\n" + "\n".join(recent_text_lines) + "\n\n"
+
+    full_instruction = f"{sys_prompt}\n\n{context_str}Запрос пользователя к изображению: {prompt_text}"
+    vision_models = get_vision_fallback_models(preferred_model)
+    last_err = None
+
+    # Формируем 3 варианта payload для максимальной совместимости с любыми прокси OpenAI/Gemini/Claude
+    payload_variants = [
+        # Вариант 1: Стандартный OpenAI Vision (system + user с detail: auto)
+        [
+            {"role": "system", "content": sys_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": f"{context_str}{prompt_text}"},
+                    {"type": "image_url", "image_url": {"url": b64_image, "detail": "auto"}}
+                ]
+            }
+        ],
+        # Вариант 2: Одиночное сообщение user (лучше всего работает для Gemini / Claude через прокси)
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": full_instruction},
+                    {"type": "image_url", "image_url": {"url": b64_image}}
+                ]
+            }
+        ],
+        # Вариант 3: Упрощенный формат, где image_url передается строкой
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": full_instruction},
+                    {"type": "image_url", "image_url": b64_image}
+                ]
+            }
+        ]
+    ]
+
+    for mod in vision_models:
+        for msg_variant in payload_variants:
+            for client in ai_clients:
+                try:
+                    resp = await client.chat.completions.create(
+                        model=mod,
+                        messages=msg_variant,
+                        max_tokens=4000,
+                        stream=False
+                    )
+                    ans = (resp.choices[0].message.content or "").strip()
+                    if ans and not any(marker in ans.lower() for marker in VISION_REFUSAL_MARKERS):
+                        return ans
+                except Exception as e:
+                    last_err = e
+
+    # Прямой HTTP-запрос через aiohttp на случай, если SDK OpenAI модифицирует заголовки
+    headers = {
+        "Authorization": f"Bearer {AI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    base_clean = AI_BASE_URL.rstrip("/")
+    if not base_clean.endswith("/v1"):
+        base_clean += "/v1"
+
+    async with aiohttp.ClientSession() as session:
+        for mod in vision_models[:4]:
+            raw_payload = {
+                "model": mod,
+                "messages": payload_variants[1],
+                "stream": False
+            }
+            try:
+                async with session.post(f"{base_clean}/chat/completions", json=raw_payload, headers=headers, timeout=90) as r:
+                    if r.status == 200:
+                        data = await r.json(content_type=None)
+                        ans = (data.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+                        if ans and not any(marker in ans.lower() for marker in VISION_REFUSAL_MARKERS):
+                            return ans
+            except Exception as e:
+                last_err = e
+
+    if last_err:
+        raise last_err
+    return "⚠️ Не удалось распознать изображение. Попробуйте выбрать другую модель с иконкой 🖼."
 
 
 def get_vision_fallback_models(preferred_model: str) -> list[str]:
@@ -2135,11 +2270,34 @@ async def file_id_to_base64(file_id: str) -> str:
     file = await bot.get_file(file_id)
     bio = io.BytesIO()
     await bot.download_file(file.file_path, destination=bio)
-    encoded = base64.b64encode(bio.getvalue()).decode("utf-8")
+    raw_bytes = bio.getvalue()
+    encoded = base64.b64encode(raw_bytes).decode("utf-8")
 
     ext = (file.file_path or "").lower().split(".")[-1]
-    mime = "image/png" if ext == "png" else ("image/webp" if ext == "webp" else "image/jpeg")
+    if ext == "png":
+        mime = "image/png"
+    elif ext == "webp":
+        mime = "image/webp"
+    else:
+        mime = "image/jpeg"
     return f"data:{mime};base64,{encoded}"
+
+
+async def extract_message_image_b64(message: Message) -> str | None:
+    if message.photo:
+        # Выбираем размер фото ~800-1000px (до 350 КБ), чтобы прокси-API не сбрасывал запрос по лимиту размера JSON
+        chosen = message.photo[-1]
+        for p in reversed(message.photo):
+            if not p.file_size or p.file_size <= 380_000:
+                chosen = p
+                break
+        return await file_id_to_base64(chosen.file_id)
+
+    if is_image_document(message):
+        if message.document.file_size and message.document.file_size <= 4 * 1024 * 1024:
+            return await file_id_to_base64(message.document.file_id)
+
+    return None
 
 
 async def extract_message_image_b64(message: Message) -> str | None:
@@ -3173,7 +3331,7 @@ async def handle_requests(message: Message):
             )
 
     try:
-        # ВЕТКА 1: ЗАПРОС С ИЗОБРАЖЕНИЕМ (VISION)
+        # ВЕТКА 1: ЗАПРОС С ИЗОБРАЖЕНИЕМ (VISION) — работает всегда, когда есть фото!
         if image_b64 and not (rbx_mode and rbx_online):
             final_user_text = raw_text
             if web_context:
@@ -3195,25 +3353,44 @@ async def handle_requests(message: Message):
 
             u["history"].append({
                 "role": "user",
-                "content": f"[Пользователь прислал изображение. Подпись: {raw_text or 'без подписи'}]"
+                "content": f"[Пользователь прислал изображение. Запрос: {raw_text or 'без подписи'}]"
             })
             u["history"].append({"role": "assistant", "content": resp_text})
 
         # ВЕТКА 2: ТЕКСТОВЫЙ ЗАПРОС ИЛИ АГЕНТ ROBLOX STUDIO MCP
         else:
+            # Если пользователь прислал фото ВМЕСТЕ с включенным режимом Roblox Studio —
+            # сначала считываем описание/код с картинки через Vision, чтобы Roblox-агент знал, что делать!
+            vision_description_for_rbx = ""
+            if image_b64 and rbx_mode and rbx_online:
+                try:
+                    await temp.edit_text("🖼 Анализирую ваш скриншот для Roblox Studio...")
+                    vision_description_for_rbx = await create_vision_completion(
+                        preferred_model=u["current_model"],
+                        sys_prompt="Ты эксперт по Roblox Studio. Подробно опиши всё, что видишь на этом скриншоте (объекты, цвета, интерфейс, ошибки в консоли или структуру скриптов).",
+                        history=[],
+                        user_text=raw_text or "Опиши всё содержимое этого изображения для реализации в Roblox Studio.",
+                        b64_image=image_b64
+                    )
+                except Exception:
+                    vision_description_for_rbx = ""
+
             messages_payload = [{"role": "system", "content": sys_prompt}]
             for msg in u["history"][-10:]:
                 messages_payload.append(msg)
 
             user_content = raw_text
+            if vision_description_for_rbx:
+                user_content = (
+                    f"[Пользователь прикрепил изображение. Содержимое изображения]:\n{vision_description_for_rbx}\n\n"
+                    f"Запрос пользователя: {raw_text or 'Выполни действия в Roblox Studio на основе этого изображения.'}"
+                )
             if web_context:
                 user_content = (
                     f"{web_context}\n\n"
-                    f"---\nИспользуя найденную выше информацию из интернета, ответь на вопрос пользователя:\n{raw_text}"
+                    f"---\nИспользуя найденную выше информацию из интернета, ответь на вопрос пользователя:\n{user_content}"
                 )
 
-            messages_payload.append({"role": "user", "content": user_content})
-            active_model = u["current_model"]
 
             # ЕСЛИ АКТИВЕН ROBLOX MCP И STUDIO ПОДКЛЮЧЕНА -> ЗАПУСКАЕМ ЦИКЛ АГЕНТА (ДО 6 ШАГОВ)
             if rbx_mode and rbx_online:

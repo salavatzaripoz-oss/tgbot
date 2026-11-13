@@ -10,6 +10,7 @@ import base64
 import time
 import asyncio
 import urllib.parse
+import sys
 from datetime import datetime, timedelta
 from typing import Callable, Dict, Any, Awaitable
 
@@ -26,6 +27,8 @@ from aiogram.types import (
 from types import SimpleNamespace
 from openai import AsyncOpenAI
 from PIL import Image, ImageOps, UnidentifiedImageError
+
+from group_agent import setup_group_agent
 
 # Подгружаем переменные из .env
 load_dotenv()
@@ -119,8 +122,6 @@ AI_URL_VARIANTS = get_url_variants(AI_BASE_URL)
 PHOTO_URL_VARIANTS = get_url_variants(PHOTO_BASE_URL)
 
 ai_clients = [
-    # SDK по умолчанию повторяет некоторые запросы несколько раз. Для фото это
-    # создаёт скрытые повторы и долгое ожидание, поэтому повторами управляет код ниже.
     AsyncOpenAI(api_key=AI_API_KEY, base_url=u, timeout=90.0, max_retries=0)
     for u in AI_URL_VARIANTS
 ]
@@ -198,7 +199,6 @@ def rebuild_rbx_token_index():
 
 
 def save_data():
-    """Сохраняет базу атомарно, чтобы аварийное завершение не испортило JSON."""
     temp_file = f"{DATA_FILE}.tmp"
     try:
         serializable_users = {}
@@ -328,7 +328,6 @@ def load_data():
                         "roblox": {"active": False, "token": generate_rbx_token(uid)},
                     }
                     user.update(saved_user)
-                    # Миграция старых аккаунтов Premium в Pro.
                     if user.get("is_sub") and user.get("plan", "free") == "free":
                         user["plan"] = "pro"
                     user.setdefault("plan", "pro" if user.get("is_sub") else "free")
@@ -942,18 +941,18 @@ def build_rbxm_plugin_bytes(server_url: str, user_token: str) -> bytes:
     safe_cdata_code = lua_code.replace("]]>", "]]]]><![CDATA[>")
 
     rbxm_xml = f'''<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">
-\t<External>null</External>
-\t<External>nil</External>
-\t<Item class="Script" referent="RBX0">
-\t\t<Properties>
-\t\t\t<bool name="Disabled">false</bool>
-\t\t\t<Content name="LinkedSource"><null></null></Content>
-\t\t\t<string name="Name">ShkoloAI_MCP_Plugin</string>
-\t\t\t<token name="RunContext">0</token>
-\t\t\t<string name="ScriptGuid">{{{str(uuid.uuid4()).upper()}}}</string>
-\t\t\t<ProtectedString name="Source"><![CDATA[{safe_cdata_code}]]></ProtectedString>
-\t\t</Properties>
-\t</Item>
+	<External>null</External>
+	<External>nil</External>
+	<Item class="Script" referent="RBX0">
+		<Properties>
+			<bool name="Disabled">false</bool>
+			<Content name="LinkedSource"><null></null></Content>
+			<string name="Name">ShkoloAI_MCP_Plugin</string>
+			<token name="RunContext">0</token>
+			<string name="ScriptGuid">{{{str(uuid.uuid4()).upper()}}}</string>
+			<ProtectedString name="Source"><![CDATA[{safe_cdata_code}]]></ProtectedString>
+		</Properties>
+	</Item>
 </roblox>'''
     return rbxm_xml.encode("utf-8")
 
@@ -1008,8 +1007,6 @@ async def execute_roblox_mcp_tool(uid: int, tool_name: str, args: dict, timeout:
             "result": f"Превышено время ожидания ответа от Roblox Studio ({timeout} сек) для инструмента {tool_name}."
         }
     finally:
-        # Если плагин еще не забрал задачу, удаляем ее из очереди, чтобы она не
-        # выполнилась неожиданно уже после таймаута на стороне бота.
         pending = rbx_pending_tasks.get(token, [])
         rbx_pending_tasks[token] = [item for item in pending if item.get("id") != task_id]
         rbx_task_futures.pop(task_id, None)
@@ -1094,11 +1091,14 @@ async def start_mcp_http_server():
     app.router.add_post("/mcp/{endpoint_id}/poll", handle_mcp_poll)
     app.router.add_post("/mcp/{endpoint_id}/result", handle_mcp_result)
 
+    # >>> ПОДКЛЮЧАЕМ ГРУППОВОГО ИИ-АГЕНТА И ВЕБ-КОНСОЛЬ <<<
+    setup_group_agent(sys.modules[__name__], app)
+
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", MCP_PORT)
     await site.start()
-    print(f"🎮 Roblox Studio MCP HTTP-сервер запущен на порту {MCP_PORT} (URL: {bot_config['mcp_public_url']})")
+    print(f"🎮 Roblox Studio MCP + Group Console запущены на порту {MCP_PORT} (URL: {bot_config['mcp_public_url']})")
     return runner
 
 
@@ -1256,12 +1256,6 @@ VISION_REFUSAL_MARKERS = (
 
 
 def get_vision_fallback_models(preferred_model: str) -> list[str]:
-    """Возвращает все модели, которым администратор явно включил Vision.
-
-    Флаг models_db[model_id]["vision"] — единственный источник информации
-    о поддержке картинок. Сначала пробуем выбранную пользователем модель,
-    затем остальные модели с Vision в заданном приоритете и порядке каталога.
-    """
     priority_vision = [
         "gpt-6-luna", "gemini-3.8-flash", "gemini-3.6-flash",
         "gpt-6-so", "sonnet-5", "gpt-6.1-sol", "gemini-4-argon",
@@ -1285,7 +1279,6 @@ def get_vision_fallback_models(preferred_model: str) -> list[str]:
 
 
 def _vision_content_to_text(content: Any) -> str:
-    """Нормализует строковый и блочный content из OpenAI-compatible API."""
     if isinstance(content, str):
         return content.strip()
     if isinstance(content, list):
@@ -1300,7 +1293,6 @@ def _vision_content_to_text(content: Any) -> str:
 
 
 def _format_vision_error(exc: Exception) -> str:
-    """Возвращает диагностичную, но безопасную для лога причину ошибки API."""
     status = getattr(exc, "status_code", None)
     body = getattr(exc, "body", None)
     if isinstance(body, dict):
@@ -1324,13 +1316,6 @@ async def create_vision_completion(
     user: dict,
     progress_callback: Callable[[str, int, int], Awaitable[None]] | None = None,
 ) -> dict:
-    """Последовательно пробует доступные Vision-модели до первого полезного ответа.
-
-    Используется только каталог моделей с включённым флагом ``vision``.
-    Токены каждого ответа/отказа суммируются. Стоимость каждого вызова резервируется
-    до запроса и сверяется по usage после ответа. В пределах одной операции действует
-    общий предел 20% месячного бюджета подписки, а не отдельные 20% на каждую модель.
-    """
     prompt_text = user_text.strip() if user_text and user_text.strip() else (
         "Внимательно изучи изображение. Если на нём текст, задача или код — распознай "
         "их и ответь по существу. Если это скриншот интерфейса или ошибки — объясни, "
@@ -1359,8 +1344,6 @@ async def create_vision_completion(
         ]}
     ]
 
-    # 2 000 единиц — консервативная оценка изображения 1600 px при detail=auto.
-    # Реальные значения prompt_tokens от провайдера имеют приоритет над оценкой.
     estimated_input = max(
         2000,
         estimate_request_tokens(sys_prompt) + estimate_request_tokens(context + prompt_text) + 2000,
@@ -1387,7 +1370,6 @@ async def create_vision_completion(
             except Exception:
                 pass
 
-        # Второй base URL пробуем только если первый явно не нашёл маршрут.
         route_clients = [ai_clients[0]]
         route_labels = ["primary"]
         route_index = 0
@@ -1422,10 +1404,6 @@ async def create_vision_completion(
             )
             api_attempts += 1
             models_tried.append(model_id)
-            print(
-                f"[VISION] Попытка {api_attempts}: {model_id} "
-                f"({model_index}/{len(candidates)}), url={route_labels[route_index]}"
-            )
 
             try:
                 response = await route_clients[route_index].chat.completions.create(
@@ -1462,11 +1440,6 @@ async def create_vision_completion(
                 operation_cost_rub += actual_cost
 
                 if answer and not any(marker in answer.lower() for marker in VISION_REFUSAL_MARKERS):
-                    print(
-                        f"[VISION] Успех: {model_id}; попыток={api_attempts}; "
-                        f"токены={total_input_tokens + total_output_tokens}; "
-                        f"расход={operation_cost_rub:.4f} ₽"
-                    )
                     return {
                         "answer": answer,
                         "input_tokens": total_input_tokens,
@@ -1485,10 +1458,7 @@ async def create_vision_completion(
                 status = getattr(exc, "status_code", None)
                 reason = _format_vision_error(exc)
                 failures.append(f"{model_id}: {reason}")
-                print(f"[VISION] {model_id}: {reason}")
 
-                # 404/405 — вероятная ошибка варианта маршрута; проверяем второй URL
-                # той же модели. Сам отказ маршрута не учитываем как оплаченный.
                 if status in (404, 405):
                     record_ai_usage(user, 0, 0, 0.0, reserved_cost_rub=reserved)
                     if route_index == 0 and len(ai_clients) > 1:
@@ -1499,12 +1469,9 @@ async def create_vision_completion(
                     model_failed = True
                     break
 
-                # Явные ошибки формата/прав/авторизации обычно не тарифицируются.
                 if status in (400, 401, 403, 413, 415, 422):
                     record_ai_usage(user, 0, 0, 0.0, reserved_cost_rub=reserved)
                 else:
-                    # При таймауте/5xx провайдер мог принять запрос, поэтому
-                    # учитываем консервативную стоимость входа и изображения.
                     total_input_tokens += estimated_input
                     operation_cost_rub += record_ai_usage(
                         user,
@@ -1722,7 +1689,6 @@ def normalize_plan(user: dict) -> str:
 
 
 def plan_image_limits(plan: str) -> tuple[int, int]:
-    # (analysis/day, generation/day)
     return {"free": (0, 0), "pro": (4, 2), "max": (12, 6)}.get(plan, (0, 0))
 
 
@@ -1736,7 +1702,6 @@ def request_cost_cap(user: dict) -> float:
 
 
 def usage_percent(user: dict) -> float:
-    """Процент использованного лимита; внутренние единицы никогда не показываем."""
     plan = normalize_plan(user)
     limit = bot_config["free_limit"] if plan == "free" else bot_config["sub_limit"] * (2 if plan == "max" else 1)
     if limit <= 0:
@@ -1759,7 +1724,6 @@ def can_afford_request(
     estimated_output_tokens: int = 1200,
     extra_cost_rub: float = 0.0,
 ) -> tuple[bool, str]:
-    """Проверяет месячный лимит и предел 20% на одну операцию до обращения к API."""
     plan = normalize_plan(user)
     if plan == "free":
         return True, ""
@@ -1767,7 +1731,6 @@ def can_afford_request(
     cap = monthly_cost_cap(user)
     spent = float(user.get("plan_cost_rub", 0.0) or 0.0)
     remaining = max(0.0, cap - spent)
-    # Небольшой коэффициент запаса защищает от неточной оценки токенов.
     predicted = estimate_ai_cost_rub(estimated_input_tokens, estimated_output_tokens) * 1.20
     predicted += max(0.0, float(extra_cost_rub))
     per_request = request_cost_cap(user)
@@ -1783,7 +1746,6 @@ def can_afford_request(
 
 
 def reserve_request_cost(user: dict, input_tokens: int, output_tokens: int, extra_cost_rub: float = 0.0) -> float:
-    """Резервирует оценочную себестоимость до вызова провайдера для любого тарифа."""
     plan = normalize_plan(user)
     reserve = estimate_ai_cost_rub(input_tokens, output_tokens) * 1.20 + max(0.0, extra_cost_rub)
     user["api_cost_month_rub"] = round(float(user.get("api_cost_month_rub", 0.0) or 0.0) + reserve, 4)
@@ -1805,7 +1767,6 @@ def record_ai_usage(
     user["tokens"] = int(user.get("tokens", 0) or 0) + used_tokens
     cost = estimate_ai_cost_rub(input_tokens, output_tokens) + max(0.0, extra_cost_rub)
     reserve = max(0.0, float(reserved_cost_rub))
-    # В общей статистике расходы считаются для Free, Pro, Max и администратора.
     month_current = max(0.0, float(user.get("api_cost_month_rub", 0.0) or 0.0) - reserve)
     total_current = max(0.0, float(user.get("api_cost_total_rub", 0.0) or 0.0) - reserve)
     user["api_cost_month_rub"] = round(month_current + cost, 4)
@@ -1940,7 +1901,6 @@ CODE_BLOCK_RE = re.compile(r"```([a-zA-Z0-9_+-]*)\n?(.*?)```", re.DOTALL)
 
 def extract_code_blocks_and_clean_text(text: str) -> tuple[str, list[tuple[str, str]]]:
     code_blocks = []
-
     def replacer(match):
         lang = (match.group(1) or "text").strip()
         code = match.group(2).strip("\n")
@@ -1949,7 +1909,6 @@ def extract_code_blocks_and_clean_text(text: str) -> tuple[str, list[tuple[str, 
         code_blocks.append((lang, code))
         idx = len(code_blocks)
         return f"\n📌 [Код #{idx} ({lang}) вынесен в сообщение ниже 👇]\n"
-
     cleaned_text = CODE_BLOCK_RE.sub(replacer, text)
     return cleaned_text.strip(), code_blocks
 
@@ -1963,7 +1922,6 @@ def split_long_text_smart(text: str, max_len: int = 3400) -> list[str]:
 
     chunks = []
     current = ""
-
     paragraphs = text.split("\n\n")
     for para in paragraphs:
         candidate = f"{current}\n\n{para}" if current else para
@@ -1973,7 +1931,6 @@ def split_long_text_smart(text: str, max_len: int = 3400) -> list[str]:
             if current:
                 chunks.append(current.strip())
                 current = ""
-
             if len(para) <= max_len:
                 current = para
             else:
@@ -2004,7 +1961,6 @@ def split_long_text_smart(text: str, max_len: int = 3400) -> list[str]:
 
     if current.strip():
         chunks.append(current.strip())
-
     return chunks
 
 
@@ -2015,7 +1971,6 @@ def split_code_by_lines(code: str, max_len: int = 3400) -> list[str]:
     parts = []
     current_lines = []
     current_len = 0
-
     for line in code.split("\n"):
         line_len = len(line) + 1
         if current_len + line_len > max_len and current_lines:
@@ -2036,13 +1991,11 @@ def split_code_by_lines(code: str, max_len: int = 3400) -> list[str]:
 
     if current_lines:
         parts.append("\n".join(current_lines))
-
     return parts
 
 
 def markdown_to_tg_html(text: str) -> str:
     placeholders = {}
-
     def save_pl(val: str) -> str:
         key = f"@@PL{len(placeholders)}@@"
         placeholders[key] = val
@@ -2053,7 +2006,6 @@ def markdown_to_tg_html(text: str) -> str:
         lambda m: save_pl(f"<i>{html.escape(m.group(0))}</i>"),
         text
     )
-
     def repl_inline(m):
         return save_pl(f"<code>{html.escape(m.group(1))}</code>")
 
@@ -2084,8 +2036,6 @@ async def send_smart_ai_response(message: Message, full_text: str, programming: 
             file_name = f"shkoloai_code.{ext}"
             caption = f"💻 Готовый файл с кодом ({lang})."
         else:
-            # Несколько языков/файлов нельзя склеивать в исполняемый исходник.
-            # Отправляем один ZIP-архив с отдельными исходниками внутри.
             buffer = io.BytesIO()
             with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
                 for index, (lang, code) in enumerate(code_blocks, start=1):
@@ -2102,7 +2052,6 @@ async def send_smart_ai_response(message: Message, full_text: str, programming: 
         )
         return
     elif programming and not code_blocks:
-        # Если модель забыла Markdown-ограждение, сохраняем текст ответа как исходник.
         raw = full_text.strip()
         if raw:
             file_name = "shkoloai_code.txt"
@@ -2123,7 +2072,6 @@ async def send_smart_ai_response(message: Message, full_text: str, programming: 
             except Exception:
                 fallback_prefix = f"📄 Часть {idx}/{total_chunks}\n\n" if total_chunks > 1 else ""
                 await message.answer(fallback_prefix + raw_chunk, disable_web_page_preview=True)
-
             if total_chunks > 1:
                 await asyncio.sleep(0.3)
 
@@ -2143,7 +2091,6 @@ async def send_smart_ai_response(message: Message, full_text: str, programming: 
                 await message.answer(msg_html, parse_mode="HTML")
             except Exception:
                 await message.answer(part_str)
-
             if total_parts > 1:
                 await asyncio.sleep(0.3)
 
@@ -2156,7 +2103,6 @@ def get_main_kb(user_id: int):
     rbx_icon = "🎮 Roblox Studio (🟢)" if u["roblox"]["active"] else "🎮 Roblox Studio"
 
     first_row = [KeyboardButton(text="🧠 Модели ИИ")]
-    # Кнопка изображений не показывается бесплатным пользователям.
     if normalize_plan(u) != "free" or user_id == ADMIN_ID:
         first_row.append(KeyboardButton(text="🎨 Генерация фото"))
 
@@ -2533,7 +2479,6 @@ async def cb_adm_reviews_clear(callback: CallbackQuery):
 # --- МНОГОУРОВНЕВЫЙ ПОИСК В ИНТЕРНЕТЕ ---
 # =========================================================================
 async def build_search_query(raw_query: str) -> str:
-    """Быстрая подготовка поисковой строки без дополнительного платного LLM-вызова."""
     cleaned = re.sub(
         r"^(привет|здравствуй|подскажи|расскажи|пожалуйста|найди|поищи|что такое|кто такой)[,\s!]*",
         "", (raw_query or "").strip(), flags=re.I
@@ -2700,28 +2645,20 @@ async def extract_document_text(message: Message) -> str:
 
 
 def normalize_vision_image(raw_bytes: bytes) -> bytes:
-    """Декодирует реальный формат, исправляет ориентацию, уменьшает и кодирует JPEG.
-
-    Это устраняет частую причину зависаний/ошибок: отправку BMP/WEBP/PNG как
-    image/jpeg, чрезмерно тяжёлые оригиналы и неподдерживаемые метаданные.
-    """
     if not raw_bytes:
         raise ValueError("Telegram вернул пустой файл изображения.")
     try:
         with Image.open(io.BytesIO(raw_bytes)) as source:
-            # Не принимаем патологически большие изображения, которые могут
-            # расходовать память при распаковке.
             width, height = source.size
             if width <= 0 or height <= 0 or width * height > 40_000_000:
                 raise ValueError("Слишком большое разрешение изображения (максимум 40 Мп).")
             try:
-                source.seek(0)  # Для GIF используем первый кадр.
+                source.seek(0)
             except EOFError:
                 pass
             image = ImageOps.exif_transpose(source.copy())
             image.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
 
-            # OpenAI-compatible Vision надёжнее обрабатывает единый JPEG.
             if image.mode in ("RGBA", "LA"):
                 rgba = image.convert("RGBA")
                 background = Image.new("RGB", rgba.size, (255, 255, 255))
@@ -2733,8 +2670,6 @@ def normalize_vision_image(raw_bytes: bytes) -> bytes:
             output = io.BytesIO()
             image.save(output, format="JPEG", quality=84, optimize=True, progressive=True)
             data = output.getvalue()
-            # Для сверхдетализированных скриншотов уменьшаем ещё раз, чтобы
-            # не отправлять многомегабайтный base64 payload провайдеру.
             if len(data) > 1_500_000:
                 output = io.BytesIO()
                 image.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
@@ -2744,9 +2679,7 @@ def normalize_vision_image(raw_bytes: bytes) -> bytes:
                 raise ValueError("Не удалось подготовить изображение для анализа.")
             return data
     except (UnidentifiedImageError, OSError) as exc:
-        raise ValueError(
-            "Файл не удалось распознать как изображение. Отправьте PNG, JPG или WEBP."
-        ) from exc
+        raise ValueError("Файл не удалось распознать как изображение. Отправьте PNG, JPG или WEBP.") from exc
 
 
 async def file_id_to_base64(file_id: str, max_bytes: int | None = None) -> str:
@@ -2768,8 +2701,6 @@ async def file_id_to_base64(file_id: str, max_bytes: int | None = None) -> str:
     if max_bytes is not None and len(raw_bytes) > max_bytes:
         raise ValueError(f"Изображение превышает лимит {max_bytes // (1024 * 1024)} МБ")
 
-    # PIL может выполнять декодирование заметное время; выносим CPU-работу
-    # из event loop, чтобы бот продолжал отвечать остальным чатам.
     jpeg_bytes = await asyncio.to_thread(normalize_vision_image, raw_bytes)
     encoded = base64.b64encode(jpeg_bytes).decode("ascii")
     return f"data:image/jpeg;base64,{encoded}"
@@ -2777,8 +2708,6 @@ async def file_id_to_base64(file_id: str, max_bytes: int | None = None) -> str:
 
 async def extract_message_image_b64(message: Message) -> str | None:
     if message.photo:
-        # Telegram присылает несколько размеров одного фото; берём самый большой,
-        # который укладывается в лимит Vision, а не скачиваем файл без ограничений.
         candidates = [photo for photo in message.photo if (photo.file_size or 0) <= MAX_VISION_IMAGE_BYTES]
         if not candidates:
             return None
@@ -2964,8 +2893,6 @@ async def run_image_generation(message: Message, uid: int, prompt: str):
         u["image_generation_count"] = max(0, int(u.get("image_generation_count", 1)) - 1)
         return await message.answer(f"⚠️ {html.escape(budget_error)}", parse_mode="HTML")
 
-    # Резервируем стоимость до запроса к внешнему API. При сетевом таймауте
-    # нельзя достоверно узнать, успел ли провайдер списать деньги.
     _generation_reserved_cost = reserve_request_cost(u, 1, 1, extra_cost_rub=IMAGE_GENERATION_COST_RUB)
     save_data()
     user_last_img_prompt[uid] = prompt
@@ -3000,8 +2927,6 @@ async def run_image_generation(message: Message, uid: int, prompt: str):
         u["tokens"] = int(u.get("tokens", 0)) + 1000
         save_data()
     except Exception as e:
-        # Квота и резерв стоимости сохраняются: провайдер мог принять запрос,
-        # даже если соединение оборвалось до получения ответа.
         save_data()
         await wait_msg.edit_text(f"❌ Ошибка или таймаут генерации изображения ({bot_config['photo_model']}): {html.escape(str(e)[:400])}", parse_mode="HTML")
 
@@ -3243,7 +3168,6 @@ async def cb_adm_stats(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
     total_u = len(users_db)
-    # Не считаем истёкшие подписки активной выручкой, даже если владелец давно не писал боту.
     now = datetime.now()
     for account in users_db.values():
         sub_end = _parse_saved_datetime(account.get("sub_end"))
@@ -3561,7 +3485,6 @@ async def cb_adm_reply_user(callback: CallbackQuery):
 
 
 async def create_chat_completion_with_chunking(model_id: str, messages_payload: list[dict], prompt: str):
-    """Делит длинный запрос на логические блоки и агрегирует usage всех обращений."""
     chunks = split_long_text_smart(prompt, max_len=10000)
     base_messages = messages_payload[:-1]
     total_input_tokens = 0
@@ -3636,17 +3559,12 @@ async def create_chat_completion_with_chunking(model_id: str, messages_payload: 
 
 
 def estimate_chunked_cost_tokens(messages_payload: list[dict], prompt: str) -> tuple[int, int]:
-    """Консервативная оценка всех частей, включая повторяемую системную/историческую базу."""
     chunks = split_long_text_smart(prompt, max_len=10000)
     base_text = "\n".join(str(item.get("content", "")) for item in messages_payload[:-1])
     base_tokens = estimate_request_tokens(base_text)
     chunk_tokens = sum(estimate_request_tokens(chunk) for chunk in chunks)
-    # Контекст предыдущих блоков повторяется в следующих запросах.
-    # На поздних шагах передаётся до 9 000 символов сводного контекста (~2 250 токенов).
-    # Добавляем запас на инструкции и сериализацию каждого чанка.
     repeated_context = max(0, len(chunks) - 1) * 2600
     estimated_input = base_tokens * len(chunks) + chunk_tokens + repeated_context
-    # Считаем максимум, который разрешён max_tokens в каждом вызове.
     estimated_output = 4000 + max(0, len(chunks) - 1) * 1200
     return estimated_input, estimated_output
 
@@ -3684,13 +3602,11 @@ def _pending_followup_is_fresh(pending: Any) -> bool:
 
 
 def consume_pending_followup(container: dict, reply_text: str) -> dict | None:
-    """Return a stored clarification context; keep it until the follow-up succeeds."""
     pending = container.get("pending_followup")
     if not _pending_followup_is_fresh(pending):
         container["pending_followup"] = None
         return None
 
-    # Commands and empty messages should not accidentally consume a conversation context.
     clean_reply = (reply_text or "").strip()
     if not clean_reply or clean_reply.startswith("/"):
         return None
@@ -3699,7 +3615,6 @@ def consume_pending_followup(container: dict, reply_text: str) -> dict | None:
 
 
 def is_clarifying_question(answer: str) -> bool:
-    """Only remember explicit clarification questions at the end of an AI answer."""
     candidate = (answer or "").strip()
     if not candidate or "?" not in candidate:
         return False
@@ -3712,7 +3627,6 @@ def is_clarifying_question(answer: str) -> bool:
 
 
 def update_pending_followup(container: dict, original_task: str, assistant_answer: str) -> None:
-    """Persist the original task only when the assistant has actually asked for clarification."""
     if is_clarifying_question(assistant_answer):
         container["pending_followup"] = {
             "task": (original_task or "").strip()[:5000],
@@ -3737,7 +3651,6 @@ def build_followup_instruction(pending: dict, answer_text: str, speaker: str = "
 
 
 def should_return_literal_text_followup(pending: dict | None, answer_text: str, user: dict) -> bool:
-    """Avoid needless AI rewriting when the user supplied the exact short text requested."""
     if not pending or user.get("programming_mode") in {"general", "roblox"}:
         return False
     if user.get("roblox", {}).get("active"):
@@ -3754,7 +3667,6 @@ def should_return_literal_text_followup(pending: dict | None, answer_text: str, 
         return False
     if "?" not in question:
         return False
-    # This fast path is limited to the assistant's generic «Какой?» clarification.
     generic_what_question = re.search(r"\bкакой\s*\?\s*$", question, re.IGNORECASE)
     content_question = re.search(
         r"(?:какой текст|какое сообщение|какую фразу|что именно написать|что должно быть написано)",
@@ -3764,7 +3676,6 @@ def should_return_literal_text_followup(pending: dict | None, answer_text: str, 
 
 
 def save_short_followup_result(user: dict, original_task: str, user_reply: str) -> str:
-    """Save and return user-provided copy verbatim, without adding unsolicited chat filler."""
     result = (user_reply or "").strip()
     history = user.setdefault("history", [])
     history.append({"role": "user", "content": user_reply})
@@ -3824,7 +3735,6 @@ def build_system_prompt(uid: int, u: dict) -> str:
 
 
 async def handle_admin_input(message: Message) -> bool:
-    """Обрабатывает состояния админ-панели и ответы пользователям."""
     if message.from_user.id != ADMIN_ID:
         return False
 
@@ -3933,339 +3843,6 @@ async def handle_admin_input(message: Message) -> bool:
 
 
 # =========================================================================
-# --- ГРУППОВОЙ РЕЖИМ И МОДЕРАЦИЯ ---
-# =========================================================================
-async def is_group_admin(chat_id: int, user_id: int) -> bool:
-    try:
-        member = await bot.get_chat_member(chat_id, user_id)
-        return member.status in ("administrator", "creator")
-    except Exception:
-        return False
-
-
-async def bot_has_group_permission(chat_id: int, permission: str) -> bool:
-    try:
-        me = await bot.get_me()
-        member = await bot.get_chat_member(chat_id, me.id)
-        if member.status == "creator":
-            return True
-        return member.status == "administrator" and bool(getattr(member, permission, False))
-    except Exception:
-        return False
-
-
-async def bot_can_moderate(chat_id: int) -> bool:
-    # Совместимость со старым вызовом: проверяем базовую роль администратора.
-    try:
-        me = await bot.get_me()
-        member = await bot.get_chat_member(chat_id, me.id)
-        return member.status in ("administrator", "creator")
-    except Exception:
-        return False
-
-
-def group_target_id(message: Message, args: list[str], command_name: str = "") -> int | None:
-    if message.reply_to_message and message.reply_to_message.from_user:
-        return message.reply_to_message.from_user.id
-    # Для /mute одиночное число — это длительность, а не Telegram ID.
-    if command_name == "/mute" and len(args) < 2:
-        return None
-    if args and args[0].lstrip("@").isdigit():
-        return int(args[0].lstrip("@"))
-    return None
-
-
-async def handle_group_message(message: Message, user: dict):
-    chat_id = message.chat.id
-    uid = message.from_user.id
-    group = get_group(chat_id, message.chat.title or "Группа")
-    group["messages"] = int(group.get("messages", 0)) + 1
-    user_text = (message.text or message.caption or "").strip()
-    if message.new_chat_members:
-        names = ", ".join(html.escape(member.full_name) for member in message.new_chat_members[:8])
-        await message.answer(
-            f"👋 Добро пожаловать, {names}! Я ШколоAI. Напишите /grouphelp, чтобы увидеть групповые команды."
-        )
-        save_data()
-        return
-
-    command = (message.text or "").split(maxsplit=1)
-    head = command[0].split("@")[0].lower() if command else ""
-    args = command[1].split() if len(command) > 1 else []
-
-    if head in ("/grouphelp", "/helpgroup"):
-        return await message.reply(
-            "👥 <b>Команды группы</b>\n"
-            "/ai текст — задать вопрос ИИ\n/ai_on и /ai_off — включить или выключить ответы на обычные сообщения\n"
-            "/rules — правила группы; /setrules текст — установить правила (админы)\n"
-            "/warn — предупреждение (ответом на сообщение)\n/mute [мин] — ограничить участника\n"
-            "/unmute, /ban, /unban, /kick, /tempban — модерация (ответом на сообщение)\n"
-            "/unwarn, /clearwarns — управление предупреждениями.\n"
-            "/purge N — удалить последние N сообщений (до 100)\n"
-            "/roll [число], /coin, /groupstats — групповые приколюхи и статистика.\n\n"
-            "Для группового диалога упомяните бота или ответьте на его сообщение.", parse_mode="HTML"
-        )
-
-    if head == "/rules":
-        return await message.reply(f"📜 <b>Правила группы</b>\n{html.escape(group.get('rules', 'Правила не заданы.'))}", parse_mode="HTML")
-
-    if head == "/setrules":
-        if not await is_group_admin(chat_id, uid):
-            return await message.reply("⛔ Устанавливать правила могут только администраторы группы.")
-        rules = (message.text or "").partition(" ")[2].strip()
-        if not rules:
-            return await message.reply("Формат: /setrules текст правил")
-        group["rules"] = rules[:3000]
-        save_data()
-        return await message.reply("✅ Правила группы обновлены.")
-
-    if head == "/ai_on":
-        if not await is_group_admin(chat_id, uid):
-            return await message.reply("⛔ Включать автоответы могут только администраторы.")
-        group["ai_enabled"] = True
-        save_data()
-        return await message.reply("🤖 Автоответы ИИ включены. Для отключения: /ai_off")
-
-    if head == "/ai_off":
-        if not await is_group_admin(chat_id, uid):
-            return await message.reply("⛔ Выключать автоответы могут только администраторы.")
-        group["ai_enabled"] = False
-        save_data()
-        return await message.reply("🔕 Автоответы ИИ выключены. Бот по-прежнему отвечает на /ai и упоминания.")
-
-    if head in ("/roll", "/dice"):
-        import random
-        try:
-            sides = max(2, min(100000, int(args[0]))) if args else 6
-        except ValueError:
-            sides = 6
-        return await message.reply(f"🎲 Выпало: <b>{random.randint(1, sides)}</b> (из {sides})", parse_mode="HTML")
-
-    if head == "/coin":
-        import random
-        return await message.reply("🪙 Орёл!" if random.choice((True, False)) else "🪙 Решка!")
-
-    if head == "/groupstats":
-        active_warns = sum(len(v) if isinstance(v, list) else int(v or 0) for v in group.get("warnings", {}).values())
-        return await message.reply(
-            f"📊 <b>Статистика группы</b>\nСообщений с момента запуска учёта: <code>{group['messages']}</code>\n"
-            f"Участников с предупреждениями: <code>{len(group.get('warnings', {}))}</code>\nПредупреждений всего: <code>{active_warns}</code>\n"
-            f"ИИ: {'🟢 включён' if group.get('ai_enabled') else '🔴 только по команде/упоминанию'}",
-            parse_mode="HTML"
-        )
-
-    if head in ("/warn", "/warnings", "/unwarn", "/clearwarns", "/ban", "/unban", "/kick", "/tempban", "/mute", "/unmute"):
-        if not await is_group_admin(chat_id, uid):
-            return await message.reply("⛔ Эта команда доступна администраторам группы.")
-        target_id = None if head == "/clearwarns" else group_target_id(message, args, head)
-        if head == "/clearwarns":
-            group["warnings"] = {}
-            save_data()
-            return await message.reply("✅ Все предупреждения в этой группе очищены.")
-        if target_id is None:
-            return await message.reply("Ответьте командой на сообщение участника или укажите его числовой Telegram ID. Для /mute укажите длительность после ID или ответьте на сообщение.")
-        if target_id == uid:
-            return await message.reply("Нельзя применять эту команду к самому себе.")
-        warnings = group.setdefault("warnings", {})
-        wkey = str(target_id)
-        if head == "/warn":
-            count = int(warnings.get(wkey, 0)) + 1
-            warnings[wkey] = count
-            save_data()
-            if count >= 3:
-                try:
-                    if not await bot_has_group_permission(chat_id, "can_restrict_members"):
-                        raise PermissionError("Боту нужно право «Ограничивать участников».")
-                    await bot.restrict_chat_member(chat_id, target_id, permissions=ChatPermissions(can_send_messages=False), until_date=datetime.now() + timedelta(minutes=30))
-                    return await message.reply(f"⚠️ Участник <code>{target_id}</code> получил предупреждение {count}/3 и ограничение на 30 минут.", parse_mode="HTML")
-                except Exception as exc:
-                    return await message.reply(f"⚠️ Предупреждение {count}/3 выдано, но автоограничение не сработало: {html.escape(str(exc)[:200])}", parse_mode="HTML")
-            return await message.reply(f"⚠️ Предупреждение {count}/3 для <code>{target_id}</code>.", parse_mode="HTML")
-        if head == "/warnings":
-            return await message.reply(f"⚠️ У пользователя <code>{target_id}</code> предупреждений: <b>{int(warnings.get(wkey, 0))}</b>", parse_mode="HTML")
-        if head == "/unwarn":
-            current = max(0, int(warnings.get(wkey, 0)) - 1)
-            if current:
-                warnings[wkey] = current
-            else:
-                warnings.pop(wkey, None)
-            save_data()
-            return await message.reply(f"✅ Предупреждения пользователя <code>{target_id}</code>: <b>{current}</b>", parse_mode="HTML")
-        if head == "/tempban":
-            if not await bot_has_group_permission(chat_id, "can_restrict_members"):
-                return await message.reply("⚠️ Боту нужно право «Блокировать участников».")
-            duration_arg = args[0] if message.reply_to_message and args else (args[1] if len(args) > 1 else "1")
-            try:
-                days = max(1, min(366, int(duration_arg)))
-            except (TypeError, ValueError):
-                days = 1
-            until = datetime.now() + timedelta(days=days)
-            await bot.ban_chat_member(chat_id, target_id, until_date=until)
-            return await message.reply(f"⏳ Участник <code>{target_id}</code> заблокирован на {days} дн.", parse_mode="HTML")
-        if head == "/ban":
-            if not await bot_has_group_permission(chat_id, "can_restrict_members"):
-                return await message.reply("⚠️ Боту нужно право «Блокировать участников».")
-            await bot.ban_chat_member(chat_id, target_id)
-            return await message.reply(f"🚫 Участник <code>{target_id}</code> заблокирован.", parse_mode="HTML")
-        if head == "/unban":
-            if not await bot_has_group_permission(chat_id, "can_restrict_members"):
-                return await message.reply("⚠️ Боту нужно право «Блокировать участников».")
-            await bot.unban_chat_member(chat_id, target_id, only_if_banned=False)
-            warnings.pop(wkey, None)
-            save_data()
-            return await message.reply(f"✅ Блокировка пользователя <code>{target_id}</code> снята.", parse_mode="HTML")
-        if head == "/kick":
-            if not await bot_has_group_permission(chat_id, "can_restrict_members"):
-                return await message.reply("⚠️ Боту нужно право «Блокировать участников».")
-            await bot.ban_chat_member(chat_id, target_id)
-            await bot.unban_chat_member(chat_id, target_id, only_if_banned=False)
-            return await message.reply(f"👢 Участник <code>{target_id}</code> удалён из группы.", parse_mode="HTML")
-        if head == "/mute":
-            if not await bot_has_group_permission(chat_id, "can_restrict_members"):
-                return await message.reply("⚠️ Боту нужно право «Ограничивать участников».")
-            duration_arg = args[0] if message.reply_to_message and args else (args[1] if len(args) > 1 else "10")
-            try:
-                minutes = max(1, min(10080, int(duration_arg)))
-            except (TypeError, ValueError):
-                minutes = 10
-            await bot.restrict_chat_member(chat_id, target_id, permissions=ChatPermissions(can_send_messages=False), until_date=datetime.now() + timedelta(minutes=minutes))
-            return await message.reply(f"🔇 Участник <code>{target_id}</code> ограничен на {minutes} мин.", parse_mode="HTML")
-        if head == "/unmute":
-            if not await bot_has_group_permission(chat_id, "can_restrict_members"):
-                return await message.reply("⚠️ Боту нужно право «Ограничивать участников».")
-            permissions = ChatPermissions(can_send_messages=True, can_send_audios=True, can_send_documents=True,
-                                          can_send_photos=True, can_send_videos=True, can_send_video_notes=True,
-                                          can_send_voice_notes=True, can_send_polls=True, can_send_other_messages=True,
-                                          can_add_web_page_previews=True)
-            await bot.restrict_chat_member(chat_id, target_id, permissions=permissions)
-            return await message.reply(f"🔊 Ограничение пользователя <code>{target_id}</code> снято.", parse_mode="HTML")
-
-    if head == "/purge":
-        if not await is_group_admin(chat_id, uid):
-            return await message.reply("⛔ Команда доступна только администраторам.")
-        if not await bot_has_group_permission(chat_id, "can_delete_messages"):
-            return await message.reply("⚠️ Боту нужно право «Удалять сообщения».")
-        if not message.reply_to_message:
-            return await message.reply("Ответьте на сообщение командой /purge 20")
-        try:
-            count = max(1, min(100, int(args[0]) if args else 20))
-        except ValueError:
-            count = 20
-        start_id = message.reply_to_message.message_id
-        ids = list(range(start_id, min(message.message_id, start_id + count)))
-        try:
-            await bot.delete_messages(chat_id, ids)
-            await message.delete()
-        except Exception as exc:
-            return await message.reply(f"Не удалось удалить сообщения: {html.escape(str(exc)[:180])}", parse_mode="HTML")
-        return
-
-    # Для группы используем общую историю чата, но расходы списываем с автора запроса.
-    try:
-        bot_me = await bot.get_me()
-    except Exception:
-        bot_me = None
-    bot_username = (bot_me.username or "") if bot_me else ""
-    bot_id = bot_me.id if bot_me else None
-    mentioned = bool(message.text and bot_username and f"@{bot_username}".lower() in message.text.lower())
-    replied_to_bot = bool(
-        message.reply_to_message and message.reply_to_message.from_user and bot_id
-        and message.reply_to_message.from_user.id == bot_id
-    )
-    explicit_ai = head == "/ai" or mentioned or replied_to_bot
-    if not explicit_ai and not group.get("ai_enabled"):
-        save_data()
-        return
-    if head == "/ai":
-        user_text = message.text.partition(" ")[2].strip() if message.text else ""
-    elif mentioned and message.text and bot_username:
-        user_text = re.sub(r"@" + re.escape(bot_username), "", message.text, flags=re.I).strip()
-    if not user_text:
-        return await message.reply("Напишите вопрос после /ai или упомяните меня в сообщении.")
-    if user.get("banned") and uid != ADMIN_ID:
-        return
-    if not check_censorship_fast(user_text):
-        user["strikes"] = int(user.get("strikes", 0)) + 1
-        save_data()
-        return await message.reply(f"⚠️ Запрос отклонён. Предупреждение {user['strikes']}/3.")
-    now_ts = time.time()
-    if uid != ADMIN_ID and now_ts - anti_spam.get(uid, 0) < 0.8:
-        return
-    anti_spam[uid] = now_ts
-    group_history = group.setdefault("history", [])
-    plan = normalize_plan(user)
-    user_token_limit = bot_config["free_limit"] if plan == "free" else bot_config["sub_limit"] * (2 if plan == "max" else 1)
-    if uid != ADMIN_ID and int(user.get("tokens", 0)) >= user_token_limit:
-        return await message.reply("⚠️ Лимит использования исчерпан: 100%. Дождитесь сброса лимита или смените тариф.")
-
-    group_prompt = (
-        "Ты ИИ-ассистент группового чата Telegram. Отвечай дружелюбно, не перегружай чат. "
-        "Учитывай, что ответ видят все участники. Не раскрывай личные данные участников.\n"
-        "Если участник отвечает на твой уточняющий вопрос, продолжай предыдущую задачу; "
-        "не добавляй к короткому тексту шаблонные фразы и лишние приветствия. Для кода сохраняй язык и формат исходной задачи.\n"
-        f"Название группы: {group.get('title', 'Группа')}.\nПравила группы: {group.get('rules', '')}"
-    )
-    messages = [{"role": "system", "content": group_prompt}]
-    for item in group_history[-12:]:
-        if item.get("role") in ("user", "assistant"):
-            messages.append({"role": item["role"], "content": item.get("content", "")})
-    group_user_prompt = f"{message.from_user.full_name}: {user_text}"
-    group_pending = consume_pending_followup(group, user_text)
-    if group_pending:
-        group_user_prompt = (
-            build_followup_instruction(group_pending, user_text, speaker=message.from_user.full_name)
-        )
-        # Keep the speaker attribution, while making the original task and clarification explicit.
-        group_user_prompt = f"Участник {message.from_user.full_name} отвечает в групповом чате.\n{group_user_prompt}"
-    messages.append({"role": "user", "content": group_user_prompt})
-    if (not message.photo and not message.document
-            and should_return_literal_text_followup(group_pending, user_text, user)):
-        literal_result = (user_text or "").strip()
-        group_history.extend([
-            {"role": "user", "content": f"{message.from_user.full_name}: {user_text}"},
-            {"role": "assistant", "content": literal_result},
-        ])
-        group["history"] = group_history[-MAX_GROUP_HISTORY:]
-        group["pending_followup"] = None
-        save_data()
-        return await send_smart_ai_response(message, literal_result)
-    est_in, est_out = estimate_chunked_cost_tokens(messages, group_user_prompt)
-    affordable, reason = can_afford_request(user, est_in, est_out)
-    if not affordable and uid != ADMIN_ID:
-        return await message.reply(f"⚠️ {html.escape(reason)}", parse_mode="HTML")
-    group_reserved_cost = reserve_request_cost(user, est_in, est_out)
-    save_data()
-    status = await message.reply("🤖 Думаю...")
-    try:
-        response, _ = await create_chat_completion_with_chunking(
-            user.get("current_model", DEFAULT_MODEL), messages, group_user_prompt
-        )
-        answer = (response.choices[0].message.content or "").strip()
-        if not answer:
-            answer = "Не получилось сформировать ответ. Попробуйте переформулировать запрос."
-        group_history.extend([
-            {"role": "user", "content": f"{message.from_user.full_name}: {user_text}"},
-            {"role": "assistant", "content": answer}
-        ])
-        group["history"] = group_history[-MAX_GROUP_HISTORY:]
-        task_for_followup = group_pending.get("task", user_text) if group_pending else user_text
-        update_pending_followup(group, task_for_followup, answer)
-        usage = getattr(response, "usage", None)
-        input_used = int(getattr(usage, "prompt_tokens", 0) or est_in)
-        output_used = int(getattr(usage, "completion_tokens", 0) or estimate_request_tokens(answer))
-        record_ai_usage(user, input_used, output_used, reserved_cost_rub=group_reserved_cost)
-        save_data()
-        await status.delete()
-        await send_smart_ai_response(message, answer, programming=user.get("programming_mode") == "general")
-    except Exception as exc:
-        try:
-            await status.edit_text(f"❌ Ошибка ИИ: {html.escape(str(exc)[:300])}", parse_mode="HTML")
-        except Exception:
-            await message.reply(f"❌ Ошибка ИИ: {str(exc)[:200]}")
-    save_data()
-
-
-# =========================================================================
 # --- ГЛАВНЫЙ ОБРАБОТЧИК СООБЩЕНИЙ, ФОТО, ФАЙЛОВ И ROBLOX MCP ---
 # =========================================================================
 @dp.message()
@@ -4276,18 +3853,18 @@ async def handle_all_messages(message: Message):
     u = get_user(uid)
 
     if message.chat.type in ("group", "supergroup"):
-        return await handle_group_message(message, u)
+        # Если вы не подключили group_agent.py, оставьте тут pass,
+        # но в данном примере handle_group_message будет перезаписан внутри setup_group_agent!
+        pass
 
     if u["banned"] and uid != ADMIN_ID:
         return await message.answer("🚫 Ваш аккаунт заблокирован.")
 
-    # Проверка ввода админа
     if uid == ADMIN_ID and await handle_admin_input(message):
         return
 
     user_text = (message.text or message.caption or "").strip()
 
-    # Переключение поиска меняет настройку и отправляется модели как отдельный запрос-контекст.
     if user_text.startswith("🌐 Поиск:"):
         u["web_search"] = not bool(u.get("web_search", False))
         enabled = bool(u["web_search"])
@@ -4327,7 +3904,6 @@ async def handle_all_messages(message: Message):
                 if model_answer:
                     confirmation = model_answer
             except Exception as exc:
-                # При сетевом таймауте оставляем резерв: провайдер мог принять запрос.
                 confirmation += f"\nИИ не подтвердил изменение: {str(exc)[:180]}"
         else:
             confirmation += f"\nЗапрос к ИИ пропущен из-за лимита расходов: {budget_error}"
@@ -4339,7 +3915,6 @@ async def handle_all_messages(message: Message):
         await send_smart_ai_response(message, confirmation)
         return await message.answer("Настройка поиска обновлена.", reply_markup=get_main_kb(uid))
 
-    # --- ОБРАБОТКА АКТИВНЫХ СОСТОЯНИЙ ПОЛЬЗОВАТЕЛЯ ---
     state = u.get("state")
 
     if state == "wait_review_text":
@@ -4414,11 +3989,8 @@ async def handle_all_messages(message: Message):
             parse_mode="HTML"
         )
 
-    # Сохраняем контекст уточнения до основного AI-запроса. Ответ может быть коротким,
-    # например «Привет», «для друга», «на Python» или «сделай красным».
     pending_followup = consume_pending_followup(u, user_text)
 
-    # --- РЕЖИМ ОБУЧЕНИЯ ШКОЛЫ (КОПИРОВАНИЕ СТИЛЯ) ---
     if u["school"]["active"] and u["school"]["hw_type"] == "Письменное" and u["school"]["training_mode"]:
         sample_txt = user_text
         if message.document and not is_image_document(message):
@@ -4433,13 +4005,11 @@ async def handle_all_messages(message: Message):
                 parse_mode="HTML"
             )
 
-    # --- АНТИСПАМ (0.8 СЕК ДЛЯ БЫСТРОГО ОТКЛИКА) ---
     now_ts = time.time()
     if uid != ADMIN_ID and now_ts - anti_spam.get(uid, 0) < 0.8:
         return
     anti_spam[uid] = now_ts
 
-    # --- ЦЕНЗУРА ---
     if not check_censorship_fast(user_text):
         u["strikes"] = u.get("strikes", 0) + 1
         if u["strikes"] >= 3 and uid != ADMIN_ID:
@@ -4449,7 +4019,6 @@ async def handle_all_messages(message: Message):
         save_data()
         return await message.answer(f"⚠️ Запрос содержит запрещенный контент! Предупреждение {u['strikes']}/3.")
 
-    # --- ПРОВЕРКА ЛИМИТА ТОКЕНОВ ---
     plan = normalize_plan(u)
     limit = bot_config["free_limit"] if plan == "free" else bot_config["sub_limit"] * (2 if plan == "max" else 1)
     if uid != ADMIN_ID and u["tokens"] >= limit:
@@ -4463,9 +4032,6 @@ async def handle_all_messages(message: Message):
             parse_mode="HTML"
         )
 
-    # Если исходная задача явно просила короткий текст, а ИИ спросил общий «Какой?»,
-    # пользовательский ответ и есть готовый текст. Не отправляем его на повторную
-    # генерацию, чтобы модель не добавляла «Как дела?» и другие шаблонные фразы.
     if (not message.photo and not message.document
             and should_return_literal_text_followup(pending_followup, user_text, u)):
         literal_result = save_short_followup_result(u, str(pending_followup.get("task", "")), user_text)
@@ -4473,7 +4039,6 @@ async def handle_all_messages(message: Message):
         remember_spy_answer(message, literal_result)
         return await send_smart_ai_response(message, literal_result)
 
-    # Фото на Free запрещено до скачивания файла — это экономит трафик и ресурсы.
     has_image = bool(message.photo or is_image_document(message))
     if has_image and normalize_plan(u) == "free" and uid != ADMIN_ID:
         return await message.answer(
@@ -4481,7 +4046,6 @@ async def handle_all_messages(message: Message):
             parse_mode="HTML"
         )
 
-    # --- ИЗВЛЕЧЕНИЕ ИЗОБРАЖЕНИЯ ИЛИ ДОКУМЕНТА ---
     try:
         b64_img = await extract_message_image_b64(message) if has_image else None
     except ValueError as image_error:
@@ -4507,13 +4071,11 @@ async def handle_all_messages(message: Message):
     sys_prompt = build_system_prompt(uid, u)
     model_id = u["current_model"]
 
-    # Мгновенная реакция в чате (typing indicator + статус)
     try:
         await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
     except Exception:
         pass
 
-    # --- ЕСЛИ ОТПРАВЛЕНО ФОТО (VISION) ---
     if b64_img:
         if normalize_plan(u) == "free" and uid != ADMIN_ID:
             return await message.answer("🔒 Анализ изображений доступен только на Pro и Max.", parse_mode="HTML")
@@ -4557,19 +4119,14 @@ async def handle_all_messages(message: Message):
             u["history"] = u["history"][-14:]
             task_for_followup = pending_followup.get("task", user_text or "[Изображение]") if pending_followup else (user_text or "[Изображение]")
             update_pending_followup(u, task_for_followup, ans)
-            # Все попытки моделей уже учтены внутри create_vision_completion:
-            # суммированы prompt/completion tokens и реальная оценка расходов.
             save_data()
             remember_spy_answer(message, ans)
             return await send_smart_ai_response(message, ans, programming=u.get("programming_mode") == "general")
         except Exception as e:
-            # При ошибке провайдера сохраняем диагностику в лог. Квота и бюджет
-            # не возвращаются автоматически: неизвестно, принял ли API изображение.
             print(f"[VISION ERROR] uid={uid}: {type(e).__name__}: {e}")
             save_data()
             return await wait_msg.edit_text(f"❌ Не удалось проанализировать изображение: {html.escape(str(e)[:700])}")
 
-    # --- ПОИСК В ИНТЕРНЕТЕ (ЕСЛИ ВКЛЮЧЕН) ---
     web_context = ""
     wait_msg = await message.answer(
         "🌐 <i>Ищу актуальную информацию...</i>" if u["web_search"] else "💭 <i>Думаю...</i>",
@@ -4612,7 +4169,6 @@ async def handle_all_messages(message: Message):
         total_completion_tokens = int(getattr(resp.usage, "completion_tokens", 0) or estimated_out)
         ai_reply = (resp.choices[0].message.content or "").strip()
 
-        # --- ЦИКЛ ВЫПОЛНЕНИЯ КОМАНД В ROBLOX STUDIO (MCP AGENT LOOP) ---
         if u["roblox"]["active"]:
             step = 0
             while step < 5:
@@ -4677,7 +4233,6 @@ async def handle_all_messages(message: Message):
                 resp = tool_response
                 ai_reply = (resp.choices[0].message.content or "").strip()
 
-        # Очищаем служебные теги <mcp_call>, если остались
         clean_reply = MCP_CALL_RE.sub("", ai_reply).strip() or "✅ Действия успешно выполнены в Roblox Studio!"
 
         try:
@@ -4717,9 +4272,6 @@ async def main():
         load_data()
         mcp_runner = await start_mcp_http_server()
 
-        # Для polling удаляем webhook, но НЕ удаляем ожидающие обновления.
-        # Важно: это не устраняет TelegramConflictError, если запущен второй
-        # экземпляр бота с тем же BOT_TOKEN — должен работать только один.
         await bot.delete_webhook(drop_pending_updates=False)
         print(f"🚀 Бот ШколоAI успешно запущен! Администратор: {ADMIN_ID}")
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())

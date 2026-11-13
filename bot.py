@@ -2108,6 +2108,7 @@ def get_main_kb(user_id: int):
 
     kb = [
         first_row,
+        [KeyboardButton(text="👥 Управление группами")],
         [KeyboardButton(text=school_icon), KeyboardButton(text=rbx_icon)],
         [KeyboardButton(text=f"🌐 Поиск: {web_icon}"), KeyboardButton(text="👤 Профиль")],
         [KeyboardButton(text="💻 Программирование"), KeyboardButton(text="⚙️ Свой промпт")],

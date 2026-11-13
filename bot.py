@@ -16,6 +16,7 @@ import aiohttp
 from aiohttp import web
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
+from aiogram.enums import ChatAction
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton,
@@ -40,16 +41,23 @@ def clean_env(key: str, default: str) -> str:
 
 
 # --- КОНФИГУРАЦИЯ ---
-BOT_TOKEN = clean_env("BOT_TOKEN", "8130566129:AAHGfVKiIorLhqGAU_HtbCPjSyXQlWgbzVw")
-ADMIN_ID = int(clean_env("ADMIN_ID", "5656256968"))
+BOT_TOKEN = clean_env("BOT_TOKEN", "")
+ADMIN_ID = int(clean_env("ADMIN_ID", "0"))
 
-AI_API_KEY = clean_env("AI_API_KEY", "sk-eF2ZQEE1uyLh6VRq1x26zryHbbHqKT7plceJQ37U3Au1IrHm")
+AI_API_KEY = clean_env("AI_API_KEY", "")
 AI_BASE_URL = clean_env("AI_BASE_URL", "https://anymodel.ghostly.su/v1")
 
 # Отдельный ключ, URL и модель GPT Image 2.5 для генерации изображений
 PHOTO_GENERATIONAL_KEY = clean_env("PHOTO_GENERATIONAL_KEY", AI_API_KEY)
 PHOTO_BASE_URL = clean_env("PHOTO_BASE_URL", "https://api.podpiski-neiroseti.shop")
 PHOTO_MODEL = clean_env("PHOTO_MODEL", "gpt-image-2.5")
+
+if not BOT_TOKEN:
+    raise RuntimeError("Не задан BOT_TOKEN. Добавьте токен Telegram-бота в .env.")
+if ADMIN_ID <= 0:
+    raise RuntimeError("Не задан корректный ADMIN_ID в .env.")
+if not AI_API_KEY:
+    raise RuntimeError("Не задан AI_API_KEY в .env.")
 
 # --- НАСТРОЙКИ ROBLOX STUDIO MCP СЕРВЕРА ---
 MCP_PORT = int(clean_env("MCP_PORT", clean_env("PORT", "8080")))
@@ -131,6 +139,7 @@ rbx_sessions: dict[str, dict] = {}
 rbx_pending_tasks: dict[str, list[dict]] = {}
 rbx_task_events: dict[str, asyncio.Event] = {}
 rbx_task_futures: dict[str, asyncio.Future] = {}
+rbx_task_owners: dict[str, str] = {}
 
 
 def generate_rbx_token(uid: int) -> str:
@@ -145,57 +154,161 @@ def rebuild_rbx_token_index():
 
 
 def save_data():
+    """Сохраняет базу атомарно, чтобы аварийное завершение не испортило JSON."""
+    temp_file = f"{DATA_FILE}.tmp"
     try:
         serializable_users = {}
-        for uid, u in users_db.items():
-            u_copy = dict(u)
-            u_copy["sub_end"] = u["sub_end"].isoformat() if u.get("sub_end") else None
-            u_copy["reset_date"] = u["reset_date"].isoformat() if u.get("reset_date") else None
-            serializable_users[str(uid)] = u_copy
+        for uid, user in users_db.items():
+            user_copy = dict(user)
+            user_copy["sub_end"] = user["sub_end"].isoformat() if user.get("sub_end") else None
+            user_copy["reset_date"] = user["reset_date"].isoformat() if user.get("reset_date") else None
+            serializable_users[str(uid)] = user_copy
 
         payload = {
             "bot_config": bot_config,
             "models_db": models_db,
             "users_db": serializable_users,
-            "reviews_db": reviews_db
+            "reviews_db": reviews_db,
         }
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"[DB Warning] Ошибка сохранения данных: {e}")
+        with open(temp_file, "w", encoding="utf-8") as file:
+            json.dump(payload, file, ensure_ascii=False, indent=2)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temp_file, DATA_FILE)
+    except Exception as exc:
+        print(f"[DB Warning] Ошибка сохранения данных: {exc}")
+        try:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+        except OSError:
+            pass
+
+
+def _parse_saved_datetime(value, fallback=None):
+    if not value:
+        return fallback
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return fallback
 
 
 def load_data():
     global reviews_db
     if not os.path.exists(DATA_FILE):
         return
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            payload = json.load(f)
 
-        if "bot_config" in payload:
-            bot_config.update(payload["bot_config"])
-            if bot_config.get("photo_model") == "dall-e-3":
-                bot_config["photo_model"] = PHOTO_MODEL
-            if "spy_mode" not in bot_config:
-                bot_config["spy_mode"] = False
-            if "mcp_public_url" not in bot_config:
-                bot_config["mcp_public_url"] = MCP_PUBLIC_URL
-        if "models_db" in payload and payload["models_db"]:
-            models_db.update(payload["models_db"])
-        if "reviews_db" in payload and isinstance(payload["reviews_db"], list):
-            reviews_db = payload["reviews_db"]
-        if "users_db" in payload:
-            for uid_str, u in payload["users_db"].items():
-                uid = int(uid_str)
-                u["sub_end"] = datetime.fromisoformat(u["sub_end"]) if u.get("sub_end") else None
-                u["reset_date"] = datetime.fromisoformat(u["reset_date"]) if u.get("reset_date") else (datetime.now() + timedelta(days=30))
-                if "roblox" not in u:
-                    u["roblox"] = {"active": False, "token": generate_rbx_token(uid)}
-                users_db[uid] = u
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as file:
+            payload = json.load(file)
+        if not isinstance(payload, dict):
+            raise ValueError("Корневой элемент базы должен быть JSON-объектом")
+
+        stored_config = payload.get("bot_config")
+        if isinstance(stored_config, dict):
+            bot_config.update(stored_config)
+        if bot_config.get("photo_model") == "dall-e-3":
+            bot_config["photo_model"] = PHOTO_MODEL
+        bot_config.setdefault("spy_mode", False)
+        bot_config.setdefault("mcp_public_url", MCP_PUBLIC_URL)
+        bot_config.setdefault("free_limit", 45000)
+        bot_config.setdefault("sub_limit", 1000000)
+
+        stored_models = payload.get("models_db")
+        if isinstance(stored_models, dict):
+            for model_id, info in stored_models.items():
+                if isinstance(info, dict):
+                    current = models_db.get(model_id, {})
+                    current.update(info)
+                    current.setdefault("name", model_id)
+                    current.setdefault("premium", False)
+                    current.setdefault("vision", False)
+                    models_db[model_id] = current
+
+        stored_reviews = payload.get("reviews_db")
+        if isinstance(stored_reviews, list):
+            reviews_db = stored_reviews
+
+        stored_users = payload.get("users_db")
+        if isinstance(stored_users, dict):
+            now = datetime.now()
+            for uid_text, saved_user in stored_users.items():
+                try:
+                    uid = int(uid_text)
+                    if not isinstance(saved_user, dict):
+                        continue
+
+                    user = {
+                        "is_sub": False,
+                        "sub_end": None,
+                        "tokens": 0,
+                        "reset_date": now + timedelta(days=30),
+                        "current_model": DEFAULT_MODEL,
+                        "custom_prompt": "",
+                        "web_search": False,
+                        "banned": False,
+                        "strikes": 0,
+                        "history": [],
+                        "state": None,
+                        "temp_score": 10,
+                        "school": {
+                            "active": False,
+                            "grade": "9 класс",
+                            "quarter": "1 четверть",
+                            "level": "Средний",
+                            "hw_type": "Письменное",
+                            "topic": "Общая",
+                            "training_mode": False,
+                            "training_samples": [],
+                        },
+                        "roblox": {"active": False, "token": generate_rbx_token(uid)},
+                    }
+                    user.update(saved_user)
+
+                    school = dict(user["school"]) if isinstance(user.get("school"), dict) else {}
+                    school_defaults = {
+                        "active": False,
+                        "grade": "9 класс",
+                        "quarter": "1 четверть",
+                        "level": "Средний",
+                        "hw_type": "Письменное",
+                        "topic": "Общая",
+                        "training_mode": False,
+                        "training_samples": [],
+                    }
+                    school_defaults.update(school)
+                    user["school"] = school_defaults
+
+                    roblox = dict(user["roblox"]) if isinstance(user.get("roblox"), dict) else {}
+                    roblox.setdefault("active", False)
+                    if not roblox.get("token"):
+                        roblox["token"] = generate_rbx_token(uid)
+                    user["roblox"] = roblox
+
+                    user["sub_end"] = _parse_saved_datetime(user.get("sub_end"))
+                    user["reset_date"] = _parse_saved_datetime(
+                        user.get("reset_date"), now + timedelta(days=30)
+                    )
+                    user["history"] = user["history"] if isinstance(user.get("history"), list) else []
+                    if not isinstance(user["school"].get("training_samples"), list):
+                        user["school"]["training_samples"] = []
+                    user["tokens"] = max(0, int(user.get("tokens", 0) or 0))
+                    user["strikes"] = max(0, int(user.get("strikes", 0) or 0))
+
+                    model_id = user.get("current_model")
+                    model_info = models_db.get(model_id)
+                    if not model_info or (model_info.get("premium") and not user.get("is_sub") and uid != ADMIN_ID):
+                        user["current_model"] = DEFAULT_MODEL if DEFAULT_MODEL in models_db else next(iter(models_db))
+
+                    users_db[uid] = user
+                except Exception as user_exc:
+                    print(f"[DB Warning] Не удалось загрузить пользователя {uid_text}: {user_exc}")
+
         rebuild_rbx_token_index()
-    except Exception as e:
-        print(f"[DB Warning] Ошибка чтения данных: {e}")
+    except Exception as exc:
+        print(f"[DB Warning] Ошибка чтения данных: {exc}")
 
 
 # =========================================================================
@@ -209,6 +322,7 @@ ROBLOX_PLUGIN_LUA_TEMPLATE = r'''--[[
 local HttpService = game:GetService("HttpService")
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
 local Selection = game:GetService("Selection")
+local ScriptEditorService = game:GetService("ScriptEditorService")
 
 local DEFAULT_SERVER_URL = "__SERVER_URL__"
 local DEFAULT_TOKEN = "__USER_TOKEN__"
@@ -471,7 +585,13 @@ tools.read_script = function(args)
     if not target:IsA("LuaSourceContainer") then
         error("Объект " .. target:GetFullName() .. " не является скриптом (" .. target.ClassName .. ")")
     end
-    return target.Source
+    local ok, source = pcall(function()
+        return ScriptEditorService:GetEditorSource(target)
+    end)
+    if not ok then
+        error("Не удалось прочитать исходник через ScriptEditorService: " .. tostring(source))
+    end
+    return source
 end
 
 tools.write_script = function(args)
@@ -490,12 +610,30 @@ tools.write_script = function(args)
     if scr and not scr:IsA("LuaSourceContainer") then
         scr = nil
     end
+
+    local created = false
     if not scr then
         scr = Instance.new(className)
         scr.Name = scriptName
+        created = true
+    end
+
+    local newSource = tostring(args.source or "")
+    local writeOk, writeError = pcall(function()
+        ScriptEditorService:UpdateSourceAsync(scr, function(_oldSource)
+            return newSource
+        end)
+    end)
+    if not writeOk then
+        if created then
+            scr:Destroy()
+        end
+        error("Не удалось записать исходник через ScriptEditorService: " .. tostring(writeError))
+    end
+
+    if created then
         scr.Parent = parent
     end
-    scr.Source = args.source or ""
     Selection:Set({scr})
     ChangeHistoryService:SetWaypoint("After ShkoloAI write_script")
     return "Скрипт успешно сохранен: " .. scr:GetFullName()
@@ -714,11 +852,15 @@ addLog("👋 Плагин ШколоAI готов! Нажмите «Подклю
 '''
 
 
+def _escape_lua_string(value: str) -> str:
+    return (str(value).replace("\\", "\\\\")
+            .replace('"', '\\"').replace("\r", "\\r").replace("\n", "\\n"))
+
 def build_rbxm_plugin_bytes(server_url: str, user_token: str) -> bytes:
     lua_code = (
         ROBLOX_PLUGIN_LUA_TEMPLATE
-        .replace("__SERVER_URL__", server_url)
-        .replace("__USER_TOKEN__", user_token)
+        .replace("__SERVER_URL__", _escape_lua_string(server_url))
+        .replace("__USER_TOKEN__", _escape_lua_string(user_token))
     )
     safe_cdata_code = lua_code.replace("]]>", "]]]]><![CDATA[>")
 
@@ -767,6 +909,7 @@ async def execute_roblox_mcp_tool(uid: int, tool_name: str, args: dict, timeout:
     loop = asyncio.get_running_loop()
     fut = loop.create_future()
     rbx_task_futures[task_id] = fut
+    rbx_task_owners[task_id] = token
 
     if token not in rbx_pending_tasks:
         rbx_pending_tasks[token] = []
@@ -788,7 +931,12 @@ async def execute_roblox_mcp_tool(uid: int, tool_name: str, args: dict, timeout:
             "result": f"Превышено время ожидания ответа от Roblox Studio ({timeout} сек) для инструмента {tool_name}."
         }
     finally:
+        # Если плагин еще не забрал задачу, удаляем ее из очереди, чтобы она не
+        # выполнилась неожиданно уже после таймаута на стороне бота.
+        pending = rbx_pending_tasks.get(token, [])
+        rbx_pending_tasks[token] = [item for item in pending if item.get("id") != task_id]
         rbx_task_futures.pop(task_id, None)
+        rbx_task_owners.pop(task_id, None)
 
 
 async def handle_mcp_health(request: web.Request) -> web.Response:
@@ -841,15 +989,19 @@ async def handle_mcp_result(request: web.Request) -> web.Response:
     token = (data.get("token") or "").strip()
     task_id = data.get("task_id")
     success = bool(data.get("success", False))
-    result_str = str(data.get("result", ""))
+    result_str = str(data.get("result", ""))[:12000]
 
-    if token in rbx_sessions:
-        rbx_sessions[token]["last_seen"] = time.time()
+    if token not in rbx_token_to_uid:
+        return web.json_response({"error": "Unauthorized token"}, status=401)
+    if not task_id or rbx_task_owners.get(task_id) != token:
+        return web.json_response({"error": "Unknown task"}, status=404)
 
+    rbx_sessions.setdefault(token, {})["last_seen"] = time.time()
     fut = rbx_task_futures.get(task_id)
-    if fut and not fut.done():
-        fut.set_result({"success": success, "result": result_str})
+    if not fut or fut.done():
+        return web.json_response({"error": "Task is no longer pending"}, status=404)
 
+    fut.set_result({"success": success, "result": result_str})
     return web.json_response({"ok": True})
 
 
@@ -865,6 +1017,7 @@ async def start_mcp_http_server():
     site = web.TCPSite(runner, "0.0.0.0", MCP_PORT)
     await site.start()
     print(f"🎮 Roblox Studio MCP HTTP-сервер запущен на порту {MCP_PORT} (URL: {bot_config['mcp_public_url']})")
+    return runner
 
 
 ROBLOX_MCP_SYSTEM_PROMPT = """
@@ -2398,6 +2551,7 @@ async def cb_cancel_state(callback: CallbackQuery):
     u["state"] = None
     if callback.from_user.id == ADMIN_ID:
         admin_state.pop(ADMIN_ID, None)
+        admin_reply_target.pop(ADMIN_ID, None)
     await callback.message.edit_text("❌ Действие отменено.")
 
 
@@ -2444,6 +2598,7 @@ async def admin_panel_cmd(message: Message):
     if message.from_user.id != ADMIN_ID:
         return
     admin_state.pop(ADMIN_ID, None)
+    admin_reply_target.pop(ADMIN_ID, None)
     await message.answer(
         "👑 <b>Панель управления ботом</b>\nВыберите нужный раздел:",
         reply_markup=get_admin_main_kb(),
@@ -2456,6 +2611,7 @@ async def cb_adm_back_main(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
     admin_state.pop(ADMIN_ID, None)
+    admin_reply_target.pop(ADMIN_ID, None)
     await callback.message.edit_text(
         "👑 <b>Панель управления ботом</b>\nВыберите нужный раздел:",
         reply_markup=get_admin_main_kb(),
@@ -2511,252 +2667,6 @@ async def cb_adm_stats(callback: CallbackQuery):
     )
 
 
-@dp.callback_query(F.data == "adm_panel_limits")
-async def cb_adm_limits(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"✏️ Изменить FREE лимит ({bot_config['free_limit']})", callback_data="adm_edit_free_lim")],
-        [InlineKeyboardButton(text=f"✏️ Изменить SUB лимит ({bot_config['sub_limit']})", callback_data="adm_edit_sub_lim")],
-        [InlineKeyboardButton(text="🔄 Сбросить токены ВСЕМ юзерам", callback_data="adm_reset_all_tokens")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_back_main")]
-    ])
-    await callback.message.edit_text(
-        "🎚 <b>Управление лимитами токенов</b>\nВыберите параметр для изменения:",
-        reply_markup=kb,
-        parse_mode="HTML"
-    )
-
-
-@dp.callback_query(F.data.in_({"adm_edit_free_lim", "adm_edit_sub_lim", "adm_reset_all_tokens"}))
-async def cb_adm_limits_action(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    if callback.data == "adm_reset_all_tokens":
-        for u in users_db.values():
-            u["tokens"] = 0
-        save_data()
-        await callback.answer("✅ Токены всех пользователей сброшены!", show_alert=True)
-        return await cb_adm_limits(callback)
-
-    admin_state[ADMIN_ID] = {"action": callback.data}
-    label = "бесплатного (FREE)" if callback.data == "adm_edit_free_lim" else "подписочного (SUB)"
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="adm_back_main")]])
-    await callback.message.edit_text(f"🔢 Введите новое числовое значение для <b>{label}</b> лимита:", reply_markup=kb, parse_mode="HTML")
-
-
-def render_admin_models_kb():
-    buttons = []
-    for m_id, info in models_db.items():
-        prem = "💎" if info["premium"] else "🆓"
-        vis = "🖼" if info["vision"] else "📝"
-        buttons.append([
-            InlineKeyboardButton(text=f"{info['name']} ({prem}/{vis})", callback_data=f"adm_mod_open_{m_id}")
-        ])
-    buttons.append([InlineKeyboardButton(text="➕ Добавить новую модель", callback_data="adm_mod_add")])
-    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="adm_back_main")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-@dp.callback_query(F.data == "adm_panel_models")
-async def cb_adm_models(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    await callback.message.edit_text(
-        "🧠 <b>Управление моделями ИИ</b>\nНажмите на модель, чтобы изменить её статус (Free/Premium, Vision) или удалить:",
-        reply_markup=render_admin_models_kb(),
-        parse_mode="HTML"
-    )
-
-
-@dp.callback_query(F.data.startswith("adm_mod_open_"))
-async def cb_adm_model_detail(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    m_id = callback.data.replace("adm_mod_open_", "")
-    if m_id not in models_db:
-        return await cb_adm_models(callback)
-
-    info = models_db[m_id]
-    prem_txt = "💎 Только Premium" if info["premium"] else "🆓 Доступна всем"
-    vis_txt = "🖼 Да (Vision)" if info["vision"] else "❌ Нет"
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"Доступ: {prem_txt} (Переключить)", callback_data=f"adm_mod_tprem_{m_id}")],
-        [InlineKeyboardButton(text=f"Фото: {vis_txt} (Переключить)", callback_data=f"adm_mod_tvis_{m_id}")],
-        [InlineKeyboardButton(text="🗑 Удалить модель", callback_data=f"adm_mod_del_{m_id}")],
-        [InlineKeyboardButton(text="🔙 К списку моделей", callback_data="adm_panel_models")]
-    ])
-    await callback.message.edit_text(
-        f"⚙️ <b>Настройка модели</b>\n"
-        f"ID: <code>{m_id}</code>\n"
-        f"Название: <b>{info['name']}</b>",
-        reply_markup=kb,
-        parse_mode="HTML"
-    )
-
-
-@dp.callback_query(F.data.startswith("adm_mod_tprem_") | F.data.startswith("adm_mod_tvis_") | F.data.startswith("adm_mod_del_"))
-async def cb_adm_model_modify(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    data = callback.data
-    if data.startswith("adm_mod_tprem_"):
-        m_id = data.replace("adm_mod_tprem_", "")
-        if m_id in models_db:
-            models_db[m_id]["premium"] = not models_db[m_id]["premium"]
-            save_data()
-        return await cb_adm_model_detail(callback)
-
-    elif data.startswith("adm_mod_tvis_"):
-        m_id = data.replace("adm_mod_tvis_", "")
-        if m_id in models_db:
-            models_db[m_id]["vision"] = not models_db[m_id]["vision"]
-            save_data()
-        return await cb_adm_model_detail(callback)
-
-    elif data.startswith("adm_mod_del_"):
-        m_id = data.replace("adm_mod_del_", "")
-        if len(models_db) <= 1:
-            return await callback.answer("Нельзя удалить последнюю модель!", show_alert=True)
-        models_db.pop(m_id, None)
-        save_data()
-        await callback.answer("Модель удалена!")
-        return await cb_adm_models(callback)
-
-
-@dp.callback_query(F.data == "adm_mod_add")
-async def cb_adm_model_add(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    admin_state[ADMIN_ID] = {"action": "add_model"}
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="adm_panel_models")]])
-    await callback.message.edit_text(
-        "➕ <b>Добавление новой модели</b>\n\n"
-        "Отправьте данные в формате:\n"
-        "<code>id_модели | Название | premium(1 или 0) | vision(1 или 0)</code>\n\n"
-        "Пример:\n<code>gpt-5-turbo | GPT-5 Turbo | 1 | 1</code>",
-        reply_markup=kb,
-        parse_mode="HTML"
-    )
-
-
-def render_user_manage_card(tid: int) -> tuple[str, InlineKeyboardMarkup]:
-    u = get_user(tid)
-    sub_str = f"💎 Активна (до {u['sub_end'].strftime('%d.%m.%Y')})" if (u["is_sub"] and u["sub_end"]) else ("💎 Активна" if u["is_sub"] else "🆓 Нет")
-    ban_str = "🚫 Забанен" if u["banned"] else "✅ Активен"
-    text = (
-        f"👤 <b>Карточка пользователя</b> <code>{tid}</code>\n\n"
-        f"Статус: {ban_str}\n"
-        f"Подписка: {sub_str}\n"
-        f"Токены: <code>{u['tokens']}</code>\n"
-        f"Текущая модель: <code>{u['current_model']}</code>"
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="💎 +30 дней Sub", callback_data=f"adm_u_sub30_{tid}"),
-            InlineKeyboardButton(text="❌ Забрать Sub", callback_data=f"adm_u_unsub_{tid}")
-        ],
-        [
-            InlineKeyboardButton(text="🚫 Бан / Разбан", callback_data=f"adm_u_ban_{tid}"),
-            InlineKeyboardButton(text="🔄 Сброс токенов", callback_data=f"adm_u_rst_{tid}")
-        ],
-        [InlineKeyboardButton(text="✉️ Написать пользователю", callback_data=f"adm_reply_{tid}")],
-        [InlineKeyboardButton(text="🔙 В админ-панель", callback_data="adm_back_main")]
-    ])
-    return text, kb
-
-
-@dp.callback_query(F.data == "adm_panel_user")
-async def cb_adm_panel_user(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    admin_state[ADMIN_ID] = {"action": "find_user"}
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="adm_back_main")]])
-    await callback.message.edit_text("🔍 Введите <b>Telegram ID</b> пользователя для управления:", reply_markup=kb, parse_mode="HTML")
-
-
-@dp.callback_query(F.data.startswith("adm_u_"))
-async def cb_adm_user_card_actions(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    parts = callback.data.split("_")
-    act = parts[2]
-    tid = int(parts[3])
-    u = get_user(tid)
-
-    if act == "open":
-        text, kb = render_user_manage_card(tid)
-        await callback.answer()
-        return await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
-    elif act == "sub30":
-        u["is_sub"] = True
-        u["sub_end"] = datetime.now() + timedelta(days=30)
-        await callback.answer("Выдана подписка на 30 дней!")
-        try:
-            await bot.send_message(tid, "🎉 Вам выдана подписка <b>Premium</b> на 30 дней!", parse_mode="HTML")
-        except Exception:
-            pass
-    elif act == "unsub":
-        u["is_sub"] = False
-        u["sub_end"] = None
-        await callback.answer("Подписка отключена!")
-    elif act == "ban":
-        u["banned"] = not u["banned"]
-        await callback.answer("Статус бана изменен!")
-    elif act == "rst":
-        u["tokens"] = 0
-        await callback.answer("Токены пользователя обнулены!")
-
-    save_data()
-    text, kb = render_user_manage_card(tid)
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-
-
-@dp.callback_query(F.data == "adm_panel_photomod")
-async def cb_adm_photomod(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    admin_state[ADMIN_ID] = {"action": "set_photo_model"}
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="adm_back_main")]])
-    await callback.message.edit_text(
-        f"🎨 Текущая модель для генерации изображений: <code>{bot_config['photo_model']}</code>\n\n"
-        f"Введите название модели (например: <code>gpt-image-2.5</code> или <code>GPT Image 2.5</code>):",
-        reply_markup=kb,
-        parse_mode="HTML"
-    )
-
-
-@dp.callback_query(F.data == "adm_panel_mcpurl")
-async def cb_adm_mcpurl(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    admin_state[ADMIN_ID] = {"action": "set_mcp_url"}
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="adm_back_main")]])
-    await callback.message.edit_text(
-        f"🌐 Текущий публичный URL вашего MCP-сервера (вшивается в плагин .rbxm):\n"
-        f"<code>{bot_config.get('mcp_public_url')}</code>\n\n"
-        f"Введите новый URL (например, <code>http://ВАШ_IP:8080</code> или домен):",
-        reply_markup=kb,
-        parse_mode="HTML"
-    )
-
-
-@dp.callback_query(F.data == "adm_panel_limits")
-async def cb_adm_limits(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"✏️ Изменить FREE лимит ({bot_config['free_limit']})", callback_data="adm_edit_free_lim")],
-        [InlineKeyboardButton(text=f"✏️ Изменить SUB лимит ({bot_config['sub_limit']})", callback_data="adm_edit_sub_lim")],
-        [InlineKeyboardButton(text="🔄 Сбросить токены ВСЕМ юзерам", callback_data="adm_reset_all_tokens")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_back_main")]
-    ])
-    await callback.message.edit_text(
-        "🎚 <b>Управление лимитами токенов</b>\nВыберите параметр для изменения:",
-        reply_markup=kb,
-        parse_mode="HTML"
-    )
 @dp.callback_query(F.data == "adm_panel_limits")
 async def cb_adm_limits(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -3126,6 +3036,10 @@ async def handle_admin_input(message: Message) -> bool:
         return True
 
     elif act == "set_mcp_url":
+        parsed_url = urllib.parse.urlparse(txt)
+        if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+            await message.answer("❌ Укажите корректный URL, начинающийся с http:// или https://")
+            return True
         bot_config["mcp_public_url"] = txt.rstrip("/")
         admin_state.pop(ADMIN_ID, None)
         save_data()
@@ -3433,18 +3347,15 @@ async def main():
     load_data()
     mcp_runner = await start_mcp_http_server()
 
-    # Сбрасываем старый вебхук и накопившиеся апдейты для быстрого старта
-    await bot.delete_webhook(drop_pending_updates=True)
-    print(f"🚀 Бот ШколоAI успешно запущен! Администратор: {ADMIN_ID}")
-
     try:
+        # Сбрасываем старый вебхук и накопившиеся апдейты для быстрого старта.
+        await bot.delete_webhook(drop_pending_updates=True)
+        print(f"🚀 Бот ШколоAI успешно запущен! Администратор: {ADMIN_ID}")
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         print("⏳ Сохранение данных и остановка сервисов...")
-        save_data(force_sync=True)
+        save_data()
         await mcp_runner.cleanup()
-        if http_session and not http_session.closed:
-            await http_session.close()
         await bot.session.close()
 
 

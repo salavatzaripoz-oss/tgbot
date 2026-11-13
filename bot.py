@@ -2742,12 +2742,21 @@ async def cb_adm_mcpurl(callback: CallbackQuery):
     )
 
 
-@dp.callback_query(F.data == "adm_panel_broadcast")
-async def cb_adm_broadcast(callback: CallbackQuery):
+@dp.callback_query(F.data == "adm_panel_limits")
+async def cb_adm_limits(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
-    admin_state[ADMIN_ID] = {"action": "broadcast"}
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboard
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"✏️ Изменить FREE лимит ({bot_config['free_limit']})", callback_data="adm_edit_free_lim")],
+        [InlineKeyboardButton(text=f"✏️ Изменить SUB лимит ({bot_config['sub_limit']})", callback_data="adm_edit_sub_lim")],
+        [InlineKeyboardButton(text="🔄 Сбросить токены ВСЕМ юзерам", callback_data="adm_reset_all_tokens")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_back_main")]
+    ])
+    await callback.message.edit_text(
+        "🎚 <b>Управление лимитами токенов</b>\nВыберите параметр для изменения:",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
 @dp.callback_query(F.data == "adm_panel_limits")
 async def cb_adm_limits(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:

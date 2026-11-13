@@ -3,3 +3,4 @@ aiohttp>=3.9,<4.0
 python-dotenv>=1.0,<2.0
 openai>=1.40,<3.0
 duckduckgo-search>=6.2,<9.0
+Pillow>=10.0,<13.0

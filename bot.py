@@ -25,6 +25,7 @@ from aiogram.types import (
 )
 from types import SimpleNamespace
 from openai import AsyncOpenAI
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 # Подгружаем переменные из .env
 load_dotenv()
@@ -117,7 +118,12 @@ def get_url_variants(raw_url: str) -> list[str]:
 AI_URL_VARIANTS = get_url_variants(AI_BASE_URL)
 PHOTO_URL_VARIANTS = get_url_variants(PHOTO_BASE_URL)
 
-ai_clients = [AsyncOpenAI(api_key=AI_API_KEY, base_url=u, timeout=120.0) for u in AI_URL_VARIANTS]
+ai_clients = [
+    # SDK по умолчанию повторяет некоторые запросы несколько раз. Для фото это
+    # создаёт скрытые повторы и долгое ожидание, поэтому повторами управляет код ниже.
+    AsyncOpenAI(api_key=AI_API_KEY, base_url=u, timeout=90.0, max_retries=0)
+    for u in AI_URL_VARIANTS
+]
 photo_clients = [AsyncOpenAI(api_key=PHOTO_GENERATIONAL_KEY, base_url=u, timeout=120.0) for u in PHOTO_URL_VARIANTS]
 
 
@@ -1266,6 +1272,37 @@ def get_vision_fallback_models(preferred_model: str) -> list[str]:
     return candidates or [DEFAULT_MODEL]
 
 
+def _vision_content_to_text(content: Any) -> str:
+    """Нормализует строковый и блочный content из OpenAI-compatible API."""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+            elif hasattr(item, "text") and isinstance(item.text, str):
+                parts.append(item.text)
+        return "\n".join(part.strip() for part in parts if part.strip()).strip()
+    return ""
+
+
+def _format_vision_error(exc: Exception) -> str:
+    """Возвращает диагностичную, но безопасную для лога причину ошибки API."""
+    status = getattr(exc, "status_code", None)
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        error_data = body.get("error", body)
+        if isinstance(error_data, dict):
+            detail = error_data.get("message") or error_data.get("detail")
+        else:
+            detail = str(error_data)
+    else:
+        detail = str(exc)
+    prefix = f"HTTP {status}: " if status else ""
+    return (prefix + str(detail or exc))[:450]
+
+
 async def create_vision_completion(
     preferred_model: str,
     sys_prompt: str,
@@ -1273,9 +1310,16 @@ async def create_vision_completion(
     user_text: str,
     b64_image: str
 ) -> str:
-    """Быстрый vision-запрос: не перебираем десятки комбинаций и не ждём по 120 секунд."""
+    """Отправляет уменьшенное корректно размеченное изображение в Vision API.
+
+    Не запускает каскад десятков моделей и не обрывает нормальный ответ коротким
+    asyncio.wait_for. Сначала используется выбранная Vision-модель, затем одна
+    резервная. Подробности отказа провайдера сохраняются в лог.
+    """
     prompt_text = user_text.strip() if user_text and user_text.strip() else (
-        "Изучи изображение. Если на нём текст, задача или код — распознай и помоги."
+        "Внимательно изучи изображение. Если на нём текст, задача или код — распознай "
+        "их и ответь по существу. Если это скриншот интерфейса или ошибки — объясни, "
+        "что на нём видно и как исправить проблему."
     )
     context_lines = []
     for item in history[-4:]:
@@ -1286,44 +1330,84 @@ async def create_vision_completion(
     context = "Контекст диалога:\n" + "\n".join(context_lines) + "\n\n" if context_lines else ""
 
     candidates = []
-    if preferred_model in models_db and models_db[preferred_model].get("vision"):
+    if preferred_model and models_db.get(preferred_model, {}).get("vision"):
         candidates.append(preferred_model)
-    for model_id in get_vision_fallback_models(preferred_model):
-        if models_db.get(model_id, {}).get("vision") and model_id not in candidates:
-            candidates.append(model_id)
-    candidates = candidates[:2]
+    # Берём только одну резервную модель, а не перебираем всю базу.
+    fallback_model = next(
+        (model_id for model_id in get_vision_fallback_models(preferred_model)
+         if model_id != preferred_model and models_db.get(model_id, {}).get("vision")),
+        None
+    )
+    if fallback_model:
+        candidates.append(fallback_model)
+    if not candidates:
+        raise RuntimeError(
+            f"Для выбранной модели «{preferred_model}» не заявлена поддержка изображений, "
+            "а резервная Vision-модель не настроена. Выберите модель с поддержкой фото."
+        )
 
     payload = [
         {"role": "system", "content": sys_prompt},
         {"role": "user", "content": [
             {"type": "text", "text": f"{context}{prompt_text}"},
-            {"type": "image_url", "image_url": {"url": b64_image, "detail": "low"}}
+            {"type": "image_url", "image_url": {"url": b64_image, "detail": "auto"}}
         ]}
     ]
-    last_error = None
-    for model_id in candidates:
-        # Только один основной endpoint на модель; второй — резерв при сетевой ошибке.
-        for client in ai_clients[:2]:
-            try:
-                response = await asyncio.wait_for(
-                    client.chat.completions.create(
+
+    failures = []
+    # Альтернативный URL пробуем только при явной ошибке маршрута. При сетевой
+    # ошибке/таймауте не повторяем изображение другой моделью: провайдер мог уже
+    # принять и тарифицировать запрос.
+    for model_index, model_id in enumerate(candidates):
+        client = ai_clients[0]
+        try:
+            response = await client.chat.completions.create(
+                model=model_id,
+                messages=payload,
+                max_tokens=1800,
+                stream=False
+            )
+            answer = _vision_content_to_text(response.choices[0].message.content)
+            if answer and not any(marker in answer.lower() for marker in VISION_REFUSAL_MARKERS):
+                return answer
+            failures.append(f"{model_id}: API вернул пустой ответ или отказ по изображению")
+        except Exception as exc:
+            status = getattr(exc, "status_code", None)
+            reason = _format_vision_error(exc)
+            failures.append(f"{model_id}: {reason}")
+            print(f"[VISION] {model_id}: {reason}")
+
+            # 404/405 могут означать, что провайдер ожидает другой вариант base URL.
+            # 400/422 обычно указывают, что модель не принимает vision payload.
+            if status in (404, 405) and len(ai_clients) > 1:
+                try:
+                    response = await ai_clients[1].chat.completions.create(
                         model=model_id,
                         messages=payload,
                         max_tokens=1800,
                         stream=False
-                    ),
-                    timeout=24.0
-                )
-                answer = (response.choices[0].message.content or "").strip()
-                if answer and not any(marker in answer.lower() for marker in VISION_REFUSAL_MARKERS):
-                    return answer
-                last_error = RuntimeError("Модель не вернула распознанный ответ по изображению.")
-            except Exception as exc:
-                last_error = exc
-            # Не делаем полный перебор всех моделей, если уже есть рабочий ответ.
-    if last_error:
-        raise RuntimeError(f"Анализ изображения не завершился: {str(last_error)[:300]}") from last_error
-    raise RuntimeError("Нет доступной модели с поддержкой изображений.")
+                    )
+                    answer = _vision_content_to_text(response.choices[0].message.content)
+                    if answer and not any(marker in answer.lower() for marker in VISION_REFUSAL_MARKERS):
+                        return answer
+                    failures.append(f"{model_id} / резервный URL: пустой ответ или отказ")
+                except Exception as fallback_exc:
+                    fallback_reason = _format_vision_error(fallback_exc)
+                    failures.append(f"{model_id} / резервный URL: {fallback_reason}")
+                    print(f"[VISION] {model_id} / резервный URL: {fallback_reason}")
+            elif status not in (400, 404, 405, 422):
+                # Не делаем второй платный запрос, когда неизвестно, получил ли
+                # первый провайдер изображение. Пользователь увидит точную ошибку.
+                break
+
+        print(f"[VISION] Модель {model_index + 1}/{len(candidates)} завершена")
+
+    details = " | ".join(failures[-4:])
+    raise RuntimeError(
+        "Vision API не обработал изображение. "
+        "Проверьте, что AI_BASE_URL поддерживает /chat/completions с image_url, "
+        f"ключ API имеет доступ к Vision, а модель поддерживает картинки. Детали: {details}"
+    )
 
 
 # =========================================================================
@@ -2480,25 +2564,80 @@ async def extract_document_text(message: Message) -> str:
     return raw_bytes.decode("utf-8", errors="ignore")
 
 
+def normalize_vision_image(raw_bytes: bytes) -> bytes:
+    """Декодирует реальный формат, исправляет ориентацию, уменьшает и кодирует JPEG.
+
+    Это устраняет частую причину зависаний/ошибок: отправку BMP/WEBP/PNG как
+    image/jpeg, чрезмерно тяжёлые оригиналы и неподдерживаемые метаданные.
+    """
+    if not raw_bytes:
+        raise ValueError("Telegram вернул пустой файл изображения.")
+    try:
+        with Image.open(io.BytesIO(raw_bytes)) as source:
+            # Не принимаем патологически большие изображения, которые могут
+            # расходовать память при распаковке.
+            width, height = source.size
+            if width <= 0 or height <= 0 or width * height > 40_000_000:
+                raise ValueError("Слишком большое разрешение изображения (максимум 40 Мп).")
+            try:
+                source.seek(0)  # Для GIF используем первый кадр.
+            except EOFError:
+                pass
+            image = ImageOps.exif_transpose(source.copy())
+            image.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
+
+            # OpenAI-compatible Vision надёжнее обрабатывает единый JPEG.
+            if image.mode in ("RGBA", "LA"):
+                rgba = image.convert("RGBA")
+                background = Image.new("RGB", rgba.size, (255, 255, 255))
+                background.paste(rgba, mask=rgba.getchannel("A"))
+                image = background
+            else:
+                image = image.convert("RGB")
+
+            output = io.BytesIO()
+            image.save(output, format="JPEG", quality=84, optimize=True, progressive=True)
+            data = output.getvalue()
+            # Для сверхдетализированных скриншотов уменьшаем ещё раз, чтобы
+            # не отправлять многомегабайтный base64 payload провайдеру.
+            if len(data) > 1_500_000:
+                output = io.BytesIO()
+                image.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
+                image.save(output, format="JPEG", quality=76, optimize=True, progressive=True)
+                data = output.getvalue()
+            if not data:
+                raise ValueError("Не удалось подготовить изображение для анализа.")
+            return data
+    except (UnidentifiedImageError, OSError) as exc:
+        raise ValueError(
+            "Файл не удалось распознать как изображение. Отправьте PNG, JPG или WEBP."
+        ) from exc
+
+
 async def file_id_to_base64(file_id: str, max_bytes: int | None = None) -> str:
-    file = await bot.get_file(file_id)
-    if max_bytes is not None and getattr(file, "file_size", None) and file.file_size > max_bytes:
-        raise ValueError(f"Изображение превышает лимит {max_bytes // (1024 * 1024)} МБ")
-    bio = io.BytesIO()
-    await bot.download_file(file.file_path, destination=bio)
-    raw_bytes = bio.getvalue()
+    try:
+        file = await bot.get_file(file_id)
+        file_size = getattr(file, "file_size", None)
+        if max_bytes is not None and file_size and file_size > max_bytes:
+            raise ValueError(f"Изображение превышает лимит {max_bytes // (1024 * 1024)} МБ")
+
+        bio = io.BytesIO()
+        await bot.download_file(file.file_path, destination=bio)
+        raw_bytes = bio.getvalue()
+    except ValueError:
+        raise
+    except Exception as exc:
+        print(f"[VISION DOWNLOAD] Не удалось скачать Telegram file_id={file_id[:12]}: {type(exc).__name__}: {exc}")
+        raise ValueError("Не удалось скачать изображение из Telegram. Попробуйте отправить его ещё раз.") from exc
+
     if max_bytes is not None and len(raw_bytes) > max_bytes:
         raise ValueError(f"Изображение превышает лимит {max_bytes // (1024 * 1024)} МБ")
-    encoded = base64.b64encode(raw_bytes).decode("utf-8")
 
-    ext = (file.file_path or "").lower().split(".")[-1]
-    if ext == "png":
-        mime = "image/png"
-    elif ext == "webp":
-        mime = "image/webp"
-    else:
-        mime = "image/jpeg"
-    return f"data:{mime};base64,{encoded}"
+    # PIL может выполнять декодирование заметное время; выносим CPU-работу
+    # из event loop, чтобы бот продолжал отвечать остальным чатам.
+    jpeg_bytes = await asyncio.to_thread(normalize_vision_image, raw_bytes)
+    encoded = base64.b64encode(jpeg_bytes).decode("ascii")
+    return f"data:image/jpeg;base64,{encoded}"
 
 
 async def extract_message_image_b64(message: Message) -> str | None:
@@ -4254,15 +4393,15 @@ async def handle_all_messages(message: Message):
             return await message.answer(f"⚠️ {html.escape(budget_error)}", parse_mode="HTML")
         vision_reserved_cost = reserve_request_cost(u, estimated_in, 1800, extra_cost_rub=VISION_IMAGE_COST_RUB)
         save_data()
-        wait_msg = await message.answer("🖼 <i>Анализирую изображение (ограниченный таймаут)...</i>", parse_mode="HTML")
+        wait_msg = await message.answer("🖼 <i>Подготавливаю изображение и анализирую его...</i>", parse_mode="HTML")
         try:
-            ans = await asyncio.wait_for(create_vision_completion(
+            ans = await create_vision_completion(
                 preferred_model=model_id,
                 sys_prompt=sys_prompt,
                 history=u["history"],
                 user_text=user_text,
                 b64_image=b64_img
-            ), timeout=85.0)
+            )
             try:
                 await wait_msg.delete()
             except Exception:
@@ -4280,10 +4419,11 @@ async def handle_all_messages(message: Message):
             remember_spy_answer(message, ans)
             return await send_smart_ai_response(message, ans, programming=u.get("programming_mode") == "general")
         except Exception as e:
-            # При таймауте неизвестно, успел ли провайдер обработать и тарифицировать фото.
-            # Квота и зарезервированная себестоимость остаются списанными.
+            # При ошибке провайдера сохраняем диагностику в лог. Квота и бюджет
+            # не возвращаются автоматически: неизвестно, принял ли API изображение.
+            print(f"[VISION ERROR] uid={uid}: {type(e).__name__}: {e}")
             save_data()
-            return await wait_msg.edit_text(f"❌ Анализ фото не завершился: {html.escape(str(e)[:500])}")
+            return await wait_msg.edit_text(f"❌ Не удалось проанализировать изображение: {html.escape(str(e)[:700])}")
 
     # --- ПОИСК В ИНТЕРНЕТЕ (ЕСЛИ ВКЛЮЧЕН) ---
     web_context = ""

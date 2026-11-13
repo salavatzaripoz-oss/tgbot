@@ -26,7 +26,7 @@ AI_API_KEY = os.getenv("AI_API_KEY", "sk-eF2ZQEE1uyLh6VRq1x26zryHbbHqKT7plceJQ37
 AI_BASE_URL = os.getenv("AI_BASE_URL", "https://anymodel.ghostly.su/v1").strip()
 
 FREE_LIMIT = int(os.getenv("FREE_LIMIT", "45000").strip())
-SUB_LIMIT = int(os.getenv("SUB_LIMIT", "100000").strip())
+SUB_LIMIT = int(os.getenv("SUB_LIMIT", "1000000").strip())
 BASE_SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "Ты полезный ИИ-ассистент. Отвечай четко, структурированно и по делу.")
 
 bot = Bot(token=BOT_TOKEN)

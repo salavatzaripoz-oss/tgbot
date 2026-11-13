@@ -3344,19 +3344,25 @@ async def handle_all_messages(message: Message):
 # --- ЗАПУСК БОТА И MCP СЕРВЕРА (ОПТИМИЗИРОВАНО ДЛЯ ХОСТИНГА) ---
 # =========================================================================
 async def main():
-    load_data()
-    mcp_runner = await start_mcp_http_server()
-
+    mcp_runner = None
     try:
-        # Сбрасываем старый вебхук и накопившиеся апдейты для быстрого старта.
-        await bot.delete_webhook(drop_pending_updates=True)
+        load_data()
+        mcp_runner = await start_mcp_http_server()
+
+        # Для polling удаляем webhook, но НЕ удаляем ожидающие обновления.
+        # Важно: это не устраняет TelegramConflictError, если запущен второй
+        # экземпляр бота с тем же BOT_TOKEN — должен работать только один.
+        await bot.delete_webhook(drop_pending_updates=False)
         print(f"🚀 Бот ШколоAI успешно запущен! Администратор: {ADMIN_ID}")
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         print("⏳ Сохранение данных и остановка сервисов...")
-        save_data()
-        await mcp_runner.cleanup()
-        await bot.session.close()
+        try:
+            save_data()
+        finally:
+            if mcp_runner is not None:
+                await mcp_runner.cleanup()
+            await bot.session.close()
 
 
 if __name__ == "__main__":

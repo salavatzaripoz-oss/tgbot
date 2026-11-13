@@ -306,6 +306,7 @@ def load_data():
                         "banned": False,
                         "strikes": 0,
                         "history": [],
+                        "pending_followup": None,
                         "state": None,
                         "temp_score": 10,
                         "school": {
@@ -1650,6 +1651,7 @@ def get_user(user_id: int) -> dict:
     user.setdefault("image_analysis_count", 0)
     user.setdefault("image_generation_count", 0)
     user.setdefault("history", [])
+    user.setdefault("pending_followup", None)
     user.setdefault("tokens", 0)
     user.setdefault("reset_date", now + timedelta(days=30))
 
@@ -1703,6 +1705,7 @@ def get_group(chat_id: int, chat_title: str = "") -> dict:
     group.setdefault("title", chat_title or "Группа")
     group.setdefault("ai_enabled", False)
     group.setdefault("history", [])
+    group.setdefault("pending_followup", None)
     group.setdefault("warnings", {})
     group.setdefault("rules", "Правила пока не заданы.")
     group.setdefault("messages", 0)
@@ -1933,8 +1936,13 @@ def get_main_kb(user_id: int):
     school_icon = "🎓 Школа (Активна)" if u["school"]["active"] else "🎓 Режим Школы"
     rbx_icon = "🎮 Roblox Studio (🟢)" if u["roblox"]["active"] else "🎮 Roblox Studio"
 
+    first_row = [KeyboardButton(text="🧠 Модели ИИ")]
+    # Кнопка изображений не показывается бесплатным пользователям.
+    if normalize_plan(u) != "free" or user_id == ADMIN_ID:
+        first_row.append(KeyboardButton(text="🎨 Генерация фото"))
+
     kb = [
-        [KeyboardButton(text="🧠 Модели ИИ"), KeyboardButton(text="🎨 Генерация фото")],
+        first_row,
         [KeyboardButton(text=school_icon), KeyboardButton(text=rbx_icon)],
         [KeyboardButton(text=f"🌐 Поиск: {web_icon}"), KeyboardButton(text="👤 Профиль")],
         [KeyboardButton(text="💻 Программирование"), KeyboardButton(text="⚙️ Свой промпт")],
@@ -2100,7 +2108,7 @@ async def cb_rbx_regen_token(callback: CallbackQuery):
     rbx_endpoint_to_uid[new_endpoint] = uid
     save_data()
 
-    await callback.answer("🔑 Токен успешно перевыпущен! Скачайте плагин заново или вставьте новый токен в окно плагина.", show_alert=True)
+    await callback.answer("🔑 Ключ и персональный URL обновлены. Обязательно скачайте новый .rbxm-плагин: старые данные подключения больше не действуют.", show_alert=True)
     await callback.message.edit_text(
         render_roblox_menu_text(uid),
         reply_markup=get_roblox_menu_kb(uid),
@@ -2125,7 +2133,7 @@ async def cb_rbx_download_plugin(callback: CallbackQuery):
         "1️⃣ В Roblox Studio откройте вкладку <b>Plugins</b> сверху и нажмите <b>Plugins Folder</b> (откроется папка плагинов на ПК).\n"
         "2️⃣ Перетащите скачанный файл <code>ShkoloAI_Roblox_MCP.rbxm</code> в эту папку (или перетащите прямо в окно Studio -> ПКМ по скрипту -> <i>Save as Local Plugin</i>).\n"
         "3️⃣ В настройках игры (<b>Home -> Game Settings -> Security</b>) включите <b>Allow HTTP Requests</b>.\n"
-        "4️⃣ Нажмите кнопку <b>ШколоAI MCP</b> на верхней панели плагинов и нажмите <b>«ПОДКЛЮЧИТЬСЯ К БОТУ»</b>!"
+        "4️⃣ Нажмите кнопку <b>ШколоAI MCP</b> на верхней панели плагинов и нажмите <b>«ПОДКЛЮЧИТЬСЯ К БОТУ»</b>. При первом обращении Roblox Studio может показать запрос разрешения плагину связаться с доменом сервера — разрешите его."
     )
     await callback.message.answer_document(document=plugin_file, caption=caption, parse_mode="HTML")
     await callback.answer("📥 Отправляю файл плагина .rbxm...")
@@ -2554,6 +2562,7 @@ async def cb_programming_mode(callback: CallbackQuery):
         msg = "🎮 Режим Roblox Studio включён. Подключите ваш персональный MCP-плагин."
     else:
         u["programming_mode"] = "off"
+        u["roblox"]["active"] = False
         msg = "Обычный режим общения включён."
     save_data()
     await callback.answer(msg, show_alert=True)
@@ -2606,6 +2615,7 @@ async def start_cmd(message: Message):
     if u["banned"]:
         return await message.answer("🚫 Вы заблокированы.")
     u["state"] = None
+    u["pending_followup"] = None
     await message.answer(
         "👋 <b>Добро пожаловать в ШколоAI!</b>\n\n"
         "• 🧠 Задавайте любые вопросы и пишите код\n"
@@ -2624,6 +2634,7 @@ async def clear_memory(message: Message):
     uid = message.from_user.id
     u = get_user(uid)
     u["history"] = []
+    u["pending_followup"] = None
     u["state"] = None
     user_image_cache.pop(uid, None)
     save_data()
@@ -2959,9 +2970,19 @@ async def cb_adm_stats(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
     total_u = len(users_db)
+    # Не считаем истёкшие подписки активной выручкой, даже если владелец давно не писал боту.
+    now = datetime.now()
+    for account in users_db.values():
+        sub_end = _parse_saved_datetime(account.get("sub_end"))
+        if account.get("is_sub") and sub_end and now > sub_end:
+            account["is_sub"] = False
+            account["plan"] = "free"
+            account["sub_end"] = None
+            account["plan_cost_rub"] = 0.0
     sub_u = sum(1 for v in users_db.values() if normalize_plan(v) != "free")
     pro_u = sum(1 for v in users_db.values() if normalize_plan(v) == "pro")
     max_u = sum(1 for v in users_db.values() if normalize_plan(v) == "max")
+    save_data()
     total_cost = sum(float(v.get("api_cost_month_rub", v.get("plan_cost_rub", 0.0)) or 0.0) for v in users_db.values())
     expected_revenue = pro_u * PLAN_CONFIG["pro"]["price_rub"] + max_u * PLAN_CONFIG["max"]["price_rub"]
     subscription_cost_ceiling = expected_revenue * 0.50
@@ -3348,7 +3369,9 @@ def estimate_chunked_cost_tokens(messages_payload: list[dict], prompt: str) -> t
     base_tokens = estimate_request_tokens(base_text)
     chunk_tokens = sum(estimate_request_tokens(chunk) for chunk in chunks)
     # Контекст предыдущих блоков повторяется в следующих запросах.
-    repeated_context = max(0, len(chunks) - 1) * 1200
+    # На поздних шагах передаётся до 9 000 символов сводного контекста (~2 250 токенов).
+    # Добавляем запас на инструкции и сериализацию каждого чанка.
+    repeated_context = max(0, len(chunks) - 1) * 2600
     estimated_input = base_tokens * len(chunks) + chunk_tokens + repeated_context
     # Считаем максимум, который разрешён max_tokens в каждом вызове.
     estimated_output = 4000 + max(0, len(chunks) - 1) * 1200
@@ -3356,10 +3379,142 @@ def estimate_chunked_cost_tokens(messages_payload: list[dict], prompt: str) -> t
 
 
 # =========================================================================
+# --- КОНТЕКСТ КОРОТКИХ ОТВЕТОВ И УТОЧНЯЮЩИХ ВОПРОСОВ ---
+# =========================================================================
+FOLLOWUP_TTL_SECONDS = 45 * 60
+CLARIFICATION_QUESTION_RE = re.compile(
+    r"(?:какой|какая|какое|какие|какую|каким|какому|какими|"
+    r"что именно|для кого|кому|на каком|в каком|какой именно|"
+    r"уточни|уточните|можешь уточнить|можете уточнить|"
+    r"сколько|где|когда|какова цель|какая цель|какой результат|"
+    r"какой язык|какую платформу|какой формат|какой стиль)",
+    re.IGNORECASE,
+)
+TEXT_DELIVERY_TASK_RE = re.compile(
+    r"\b(?:сгенерируй|напиши|создай|составь|выдай|подготовь|сформируй)\b"
+    r".{0,140}\b(?:текст|сообщени[еяе]|фраз[ууы]|строк[ууи]|надпис[ьи])\b",
+    re.IGNORECASE | re.DOTALL,
+)
+PROGRAMMING_TASK_RE = re.compile(
+    r"\b(?:код|скрипт|программ|функци|алгоритм|luau|lua|python|javascript|typescript|roblox studio)\b",
+    re.IGNORECASE,
+)
+
+
+def _pending_followup_is_fresh(pending: Any) -> bool:
+    if not isinstance(pending, dict):
+        return False
+    created = _parse_saved_datetime(pending.get("created_at"))
+    if created is None:
+        return False
+    return (datetime.now() - created).total_seconds() <= FOLLOWUP_TTL_SECONDS
+
+
+def consume_pending_followup(container: dict, reply_text: str) -> dict | None:
+    """Return a stored clarification context; keep it until the follow-up succeeds."""
+    pending = container.get("pending_followup")
+    if not _pending_followup_is_fresh(pending):
+        container["pending_followup"] = None
+        return None
+
+    # Commands and empty messages should not accidentally consume a conversation context.
+    clean_reply = (reply_text or "").strip()
+    if not clean_reply or clean_reply.startswith("/"):
+        return None
+
+    return pending
+
+
+def is_clarifying_question(answer: str) -> bool:
+    """Only remember explicit clarification questions at the end of an AI answer."""
+    candidate = (answer or "").strip()
+    if not candidate or "?" not in candidate:
+        return False
+    tail = candidate[-650:]
+    last_question = tail.rfind("?")
+    if last_question < 0 or len(tail) - last_question > 220:
+        return False
+    question_part = tail[max(0, last_question - 260):last_question]
+    return bool(CLARIFICATION_QUESTION_RE.search(question_part))
+
+
+def update_pending_followup(container: dict, original_task: str, assistant_answer: str) -> None:
+    """Persist the original task only when the assistant has actually asked for clarification."""
+    if is_clarifying_question(assistant_answer):
+        container["pending_followup"] = {
+            "task": (original_task or "").strip()[:5000],
+            "question": (assistant_answer or "").strip()[-2000:],
+            "created_at": datetime.now().isoformat(),
+        }
+    else:
+        container["pending_followup"] = None
+
+
+def build_followup_instruction(pending: dict, answer_text: str, speaker: str = "пользователь") -> str:
+    original_task = str(pending.get("task", "")).strip()
+    clarification = str(pending.get("question", "")).strip()
+    return (
+        "[ПРОДОЛЖЕНИЕ ДИАЛОГА — ОТВЕТ НА УТОЧНЕНИЕ]\n"
+        f"Исходная задача {speaker}:\n{original_task[:5000]}\n\n"
+        f"Твой уточняющий вопрос:\n{clarification[:2000]}\n\n"
+        f"Короткий/новый ответ {speaker}:\n{(answer_text or '').strip()[:3000]}\n\n"
+        "Считай последнее сообщение ответом на свой вопрос, а не новой несвязанной задачей. "
+        "Продолжи исходную задачу, подставив ответ в недостающее место. Не придумывай отсутствующие требования."
+    )
+
+
+def should_return_literal_text_followup(pending: dict | None, answer_text: str, user: dict) -> bool:
+    """Avoid needless AI rewriting when the user supplied the exact short text requested."""
+    if not pending or user.get("programming_mode") in {"general", "roblox"}:
+        return False
+    if user.get("roblox", {}).get("active"):
+        return False
+
+    task = str(pending.get("task", "")).strip()
+    question = str(pending.get("question", "")).strip()
+    reply = (answer_text or "").strip()
+    if not TEXT_DELIVERY_TASK_RE.search(task):
+        return False
+    if PROGRAMMING_TASK_RE.search(task):
+        return False
+    if not reply or len(reply) > 240 or "\n" in reply or reply.startswith("/"):
+        return False
+    if "?" not in question:
+        return False
+    # This fast path is limited to the assistant's generic «Какой?» clarification.
+    generic_what_question = re.search(r"\bкакой\s*\?\s*$", question, re.IGNORECASE)
+    content_question = re.search(
+        r"(?:какой текст|какое сообщение|какую фразу|что именно написать|что должно быть написано)",
+        question, re.IGNORECASE,
+    )
+    return bool(generic_what_question or content_question)
+
+
+def save_short_followup_result(user: dict, original_task: str, user_reply: str) -> str:
+    """Save and return user-provided copy verbatim, without adding unsolicited chat filler."""
+    result = (user_reply or "").strip()
+    history = user.setdefault("history", [])
+    history.append({"role": "user", "content": user_reply})
+    history.append({"role": "assistant", "content": result})
+    user["history"] = history[-14:]
+    user["pending_followup"] = None
+    return result
+
+
+# =========================================================================
 # --- СБОРКА СИСТЕМНОГО ПРОМПТА И ОБРАБОТКА ВВОДА АДМИНА ---
 # =========================================================================
 def build_system_prompt(uid: int, u: dict) -> str:
-    parts = [BASE_SYSTEM_PROMPT]
+    parts = [
+        BASE_SYSTEM_PROMPT,
+        "[ПРАВИЛА АДАПТАЦИИ К ДИАЛОГУ]:\n"
+        "- Учитывай предыдущие реплики, а не воспринимай каждое короткое сообщение изолированно.\n"
+        "- Если пользователь отвечает на твой уточняющий вопрос, продолжай исходную задачу и используй ответ как недостающий параметр.\n"
+        "- Не превращай короткий текст пользователя в шаблонную фразу, приветствие, рекламу или длинное сообщение без прямой просьбы.\n"
+        "- Для текста, предназначенного для копирования/вставки, сохраняй указанный смысл и длину; не добавляй «Как дела?», вступления и объяснения от себя.\n"
+        "- Для программирования, если краткий ответ уточняет язык, платформу, имя объекта или поведение, продолжай исходную задачу и выдавай полный код в нужном окружении.\n"
+        "- Если данных достаточно, сразу дай результат. Задавай повторный вопрос только когда без него действительно нельзя выполнить запрос."
+    ]
 
     if u.get("custom_prompt"):
         parts.append(f"\n[ПОЛЬЗОВАТЕЛЬСКИЙ ПРОМПТ]:\n{u['custom_prompt']}")
@@ -3479,7 +3634,11 @@ async def handle_admin_input(message: Message) -> bool:
         bot_config["mcp_public_url"] = txt.rstrip("/")
         admin_state.pop(ADMIN_ID, None)
         save_data()
-        await message.answer(f"✅ Публичный URL Roblox MCP изменен на:\n<code>{html.escape(user_mcp_url(uid))}</code>", reply_markup=get_admin_main_kb(), parse_mode="HTML")
+        await message.answer(
+            f"✅ Базовый публичный URL Roblox MCP изменен на:\n<code>{html.escape(bot_config['mcp_public_url'])}</code>\n"
+            "Персональные URL пользователей формируются автоматически. Пользователям нужно скачать плагины заново.",
+            reply_markup=get_admin_main_kb(), parse_mode="HTML"
+        )
         return True
 
     elif act == "broadcast":
@@ -3752,6 +3911,14 @@ async def handle_group_message(message: Message, user: dict):
         return await message.reply("Напишите вопрос после /ai или упомяните меня в сообщении.")
     if user.get("banned") and uid != ADMIN_ID:
         return
+    if not check_censorship_fast(user_text):
+        user["strikes"] = int(user.get("strikes", 0)) + 1
+        save_data()
+        return await message.reply(f"⚠️ Запрос отклонён. Предупреждение {user['strikes']}/3.")
+    now_ts = time.time()
+    if uid != ADMIN_ID and now_ts - anti_spam.get(uid, 0) < 0.8:
+        return
+    anti_spam[uid] = now_ts
     group_history = group.setdefault("history", [])
     plan = normalize_plan(user)
     user_token_limit = bot_config["free_limit"] if plan == "free" else bot_config["sub_limit"] * (2 if plan == "max" else 1)
@@ -3761,6 +3928,8 @@ async def handle_group_message(message: Message, user: dict):
     group_prompt = (
         "Ты ИИ-ассистент группового чата Telegram. Отвечай дружелюбно, не перегружай чат. "
         "Учитывай, что ответ видят все участники. Не раскрывай личные данные участников.\n"
+        "Если участник отвечает на твой уточняющий вопрос, продолжай предыдущую задачу; "
+        "не добавляй к короткому тексту шаблонные фразы и лишние приветствия. Для кода сохраняй язык и формат исходной задачи.\n"
         f"Название группы: {group.get('title', 'Группа')}.\nПравила группы: {group.get('rules', '')}"
     )
     messages = [{"role": "system", "content": group_prompt}]
@@ -3768,7 +3937,25 @@ async def handle_group_message(message: Message, user: dict):
         if item.get("role") in ("user", "assistant"):
             messages.append({"role": item["role"], "content": item.get("content", "")})
     group_user_prompt = f"{message.from_user.full_name}: {user_text}"
+    group_pending = consume_pending_followup(group, user_text)
+    if group_pending:
+        group_user_prompt = (
+            build_followup_instruction(group_pending, user_text, speaker=message.from_user.full_name)
+        )
+        # Keep the speaker attribution, while making the original task and clarification explicit.
+        group_user_prompt = f"Участник {message.from_user.full_name} отвечает в групповом чате.\n{group_user_prompt}"
     messages.append({"role": "user", "content": group_user_prompt})
+    if (not message.photo and not message.document
+            and should_return_literal_text_followup(group_pending, user_text, user)):
+        literal_result = (user_text or "").strip()
+        group_history.extend([
+            {"role": "user", "content": f"{message.from_user.full_name}: {user_text}"},
+            {"role": "assistant", "content": literal_result},
+        ])
+        group["history"] = group_history[-MAX_GROUP_HISTORY:]
+        group["pending_followup"] = None
+        save_data()
+        return await send_smart_ai_response(message, literal_result)
     est_in, est_out = estimate_chunked_cost_tokens(messages, group_user_prompt)
     affordable, reason = can_afford_request(user, est_in, est_out)
     if not affordable and uid != ADMIN_ID:
@@ -3788,6 +3975,8 @@ async def handle_group_message(message: Message, user: dict):
             {"role": "assistant", "content": answer}
         ])
         group["history"] = group_history[-MAX_GROUP_HISTORY:]
+        task_for_followup = group_pending.get("task", user_text) if group_pending else user_text
+        update_pending_followup(group, task_for_followup, answer)
         usage = getattr(response, "usage", None)
         input_used = int(getattr(usage, "prompt_tokens", 0) or est_in)
         output_used = int(getattr(usage, "completion_tokens", 0) or estimate_request_tokens(answer))
@@ -3825,15 +4014,57 @@ async def handle_all_messages(message: Message):
 
     user_text = (message.text or message.caption or "").strip()
 
-    # Переключение поиска учитывается как системное событие в истории диалога.
+    # Переключение поиска меняет настройку и отправляется модели как отдельный запрос-контекст.
     if user_text.startswith("🌐 Поиск:"):
         u["web_search"] = not bool(u.get("web_search", False))
-        event_text = "Пользователь включил веб-поиск." if u["web_search"] else "Пользователь выключил веб-поиск."
-        u["history"].append({"role": "user", "content": f"[Настройка] {event_text}"})
+        enabled = bool(u["web_search"])
+        event_text = (
+            "Пользователь включил веб-поиск. В следующих ответах используй поиск для актуальных фактов, "
+            "когда это уместно."
+            if enabled else
+            "Пользователь выключил веб-поиск. Не используй внешний поиск в следующих ответах, пока он снова его не включит."
+        )
+        setting_event = f"[Настройка] {event_text}"
+        u["history"].append({"role": "user", "content": setting_event})
+        u["history"] = u["history"][-14:]
+        status = "🟢 включён" if enabled else "🔴 выключен"
+        confirmation = f"🌐 Поиск {status}. Настройка сохранена и добавлена в контекст диалога."
+
+        setting_prompt = build_system_prompt(uid, u)
+        setting_messages = [{"role": "system", "content": setting_prompt}]
+        setting_messages.extend(u["history"][-12:])
+        estimated_in = estimate_request_tokens("\n".join(str(x.get("content", "")) for x in setting_messages))
+        estimated_out = 300
+        affordable, budget_error = can_afford_request(u, estimated_in, estimated_out)
+        if affordable or uid == ADMIN_ID:
+            reserved = reserve_request_cost(u, estimated_in, estimated_out)
+            save_data()
+            try:
+                response = await asyncio.wait_for(
+                    create_chat_completion(
+                        model=u["current_model"], messages=setting_messages, max_tokens=300, stream=False
+                    ),
+                    timeout=45.0
+                )
+                model_answer = (response.choices[0].message.content or "").strip()
+                usage = getattr(response, "usage", None)
+                input_used = int(getattr(usage, "prompt_tokens", 0) or estimated_in)
+                output_used = int(getattr(usage, "completion_tokens", 0) or estimate_request_tokens(model_answer))
+                record_ai_usage(u, input_used, output_used, reserved_cost_rub=reserved)
+                if model_answer:
+                    confirmation = model_answer
+            except Exception as exc:
+                # При сетевом таймауте оставляем резерв: провайдер мог принять запрос.
+                confirmation += f"\nИИ не подтвердил изменение: {str(exc)[:180]}"
+        else:
+            confirmation += f"\nЗапрос к ИИ пропущен из-за лимита расходов: {budget_error}"
+
+        u["history"].append({"role": "assistant", "content": confirmation})
         u["history"] = u["history"][-14:]
         save_data()
-        status = "🟢 включён" if u["web_search"] else "🔴 выключен"
-        return await message.answer(f"🌐 Поиск {status}. Изменение сохранено в контексте диалога.", reply_markup=get_main_kb(uid))
+        remember_spy_answer(message, confirmation)
+        await send_smart_ai_response(message, confirmation)
+        return await message.answer("Настройка поиска обновлена.", reply_markup=get_main_kb(uid))
 
     # --- ОБРАБОТКА АКТИВНЫХ СОСТОЯНИЙ ПОЛЬЗОВАТЕЛЯ ---
     state = u.get("state")
@@ -3910,6 +4141,10 @@ async def handle_all_messages(message: Message):
             parse_mode="HTML"
         )
 
+    # Сохраняем контекст уточнения до основного AI-запроса. Ответ может быть коротким,
+    # например «Привет», «для друга», «на Python» или «сделай красным».
+    pending_followup = consume_pending_followup(u, user_text)
+
     # --- РЕЖИМ ОБУЧЕНИЯ ШКОЛЫ (КОПИРОВАНИЕ СТИЛЯ) ---
     if u["school"]["active"] and u["school"]["hw_type"] == "Письменное" and u["school"]["training_mode"]:
         sample_txt = user_text
@@ -3954,6 +4189,16 @@ async def handle_all_messages(message: Message):
             reply_markup=kb,
             parse_mode="HTML"
         )
+
+    # Если исходная задача явно просила короткий текст, а ИИ спросил общий «Какой?»,
+    # пользовательский ответ и есть готовый текст. Не отправляем его на повторную
+    # генерацию, чтобы модель не добавляла «Как дела?» и другие шаблонные фразы.
+    if (not message.photo and not message.document
+            and should_return_literal_text_followup(pending_followup, user_text, u)):
+        literal_result = save_short_followup_result(u, str(pending_followup.get("task", "")), user_text)
+        save_data()
+        remember_spy_answer(message, literal_result)
+        return await send_smart_ai_response(message, literal_result)
 
     # Фото на Free запрещено до скачивания файла — это экономит трафик и ресурсы.
     has_image = bool(message.photo or is_image_document(message))
@@ -4026,6 +4271,8 @@ async def handle_all_messages(message: Message):
             u["history"].append({"role": "user", "content": user_text or "[Изображение]"})
             u["history"].append({"role": "assistant", "content": ans})
             u["history"] = u["history"][-14:]
+            task_for_followup = pending_followup.get("task", user_text or "[Изображение]") if pending_followup else (user_text or "[Изображение]")
+            update_pending_followup(u, task_for_followup, ans)
             input_est = estimated_in
             output_est = estimate_request_tokens(ans)
             record_ai_usage(u, input_est, output_est, VISION_IMAGE_COST_RUB, reserved_cost_rub=vision_reserved_cost)
@@ -4052,8 +4299,12 @@ async def handle_all_messages(message: Message):
             web_context = ""
 
     full_user_prompt = user_text
+    if pending_followup:
+        full_user_prompt = build_followup_instruction(
+            pending_followup, user_text, speaker="пользователь"
+        )
     if web_context:
-        full_user_prompt = f"{user_text}\n\n[АКТУАЛЬНЫЕ ДАННЫЕ ИЗ ИНТЕРНЕТА]:\n{web_context}"
+        full_user_prompt += f"\n\n[АКТУАЛЬНЫЕ ДАННЫЕ ИЗ ИНТЕРНЕТА]:\n{web_context}"
 
     messages_payload = [{"role": "system", "content": sys_prompt}]
     for h in u["history"][-12:]:
@@ -4104,7 +4355,15 @@ async def handle_all_messages(message: Message):
                 })
 
                 tool_input_estimate = estimate_request_tokens(json.dumps(messages_payload, ensure_ascii=False))
+                tool_turn_prediction = estimate_ai_cost_rub(tool_input_estimate, 4000) * 1.20
                 tool_affordable, tool_budget_error = can_afford_request(u, tool_input_estimate, 4000)
+                if (normalize_plan(u) != "free" and
+                        text_reserved_cost + tool_turn_prediction > request_cost_cap(u)):
+                    tool_affordable = False
+                    tool_budget_error = (
+                        f"Общий бюджет одного сообщения превысил лимит {request_cost_cap(u):.2f} ₽ "
+                        "(20% месячного бюджета расходов)."
+                    )
                 if not tool_affordable and uid != ADMIN_ID:
                     tool_summary = "\n".join(tool_results)[:5000]
                     ai_reply = (
@@ -4145,6 +4404,8 @@ async def handle_all_messages(message: Message):
         u["history"].append({"role": "user", "content": user_text})
         u["history"].append({"role": "assistant", "content": clean_reply})
         u["history"] = u["history"][-14:]
+        task_for_followup = pending_followup.get("task", user_text) if pending_followup else user_text
+        update_pending_followup(u, task_for_followup, clean_reply)
 
         if total_prompt_tokens <= 0:
             total_prompt_tokens = estimate_request_tokens(full_user_prompt) + estimate_request_tokens(sys_prompt)

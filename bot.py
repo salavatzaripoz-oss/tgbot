@@ -83,6 +83,52 @@ MAX_VISION_IMAGE_BYTES = 2 * 1024 * 1024
 MAX_DOCUMENT_IMAGE_BYTES = 4 * 1024 * 1024
 MAX_GROUP_HISTORY = 30
 MAX_GROUPS_STORED = 500
+MAX_GROUP_ARCHIVE = 1500
+
+# Отдельные тарифы группы. Личные Pro/Max и их лимиты не затрагиваются.
+GROUP_PLAN_CONFIG = {
+    "free": {
+        "title": "Бесплатный",
+        "price_rub": 0,
+        "features": set(),
+    },
+    "filter": {
+        "title": "Фильтр",
+        "price_rub": 79,
+        "features": {"censor", "activity", "usercard", "smalltalk"},
+    },
+    "shield": {
+        "title": "Щит",
+        "price_rub": 149,
+        "features": {"censor", "activity", "usercard", "smalltalk", "anti_spam"},
+    },
+    "storm": {
+        "title": "Шторм",
+        "price_rub": 249,
+        "features": {"censor", "activity", "usercard", "smalltalk", "anti_spam", "anti_wave"},
+    },
+    "court": {
+        "title": "Суд",
+        "price_rub": 349,
+        "features": {
+            "censor", "activity", "usercard", "smalltalk", "anti_spam", "anti_wave",
+            "history", "premium_roles", "group_model", "group_prompt", "group_images",
+        },
+    },
+}
+
+GROUP_ROLE_PERMISSIONS = {
+    "warn", "mute", "kick", "ban", "setrules", "settings", "viewusers", "viewhistory"
+}
+GROUP_DEFAULT_ROLES = {
+    "member": {"rank": 0, "permissions": [], "inherits": None},
+    "helper": {"rank": 10, "permissions": ["warn"], "inherits": "member"},
+    "moderator": {"rank": 20, "permissions": ["warn", "mute", "kick"], "inherits": "helper"},
+    "senior": {"rank": 30, "permissions": ["warn", "mute", "kick", "ban", "viewusers"], "inherits": "moderator"},
+}
+
+group_message_windows = {}
+group_wave_windows = {}
 
 bot_config = {
     "free_limit": int(clean_env("FREE_LIMIT", "45000")),
@@ -1784,20 +1830,98 @@ def get_user(user_id: int) -> dict:
 def get_group(chat_id: int, chat_title: str = "") -> dict:
     key = str(chat_id)
     if key not in groups_db:
-        groups_db[key] = {"title": chat_title or "Группа", "ai_enabled": False, "history": [],
-                          "warnings": {}, "rules": "Правила пока не заданы.", "messages": 0,
-                          "members_seen": [], "created_at": datetime.now().isoformat()}
+        groups_db[key] = {
+            "title": chat_title or "Группа",
+            "ai_enabled": False,
+            "agent_enabled": True,
+            "nickname": "ШколоAI",
+            "history": [],
+            "pending_followup": None,
+            "warnings": {},
+            "rules": "Правила пока не заданы.",
+            "messages": 0,
+            "members_seen": [],
+            "created_at": datetime.now().isoformat(),
+            "plan": "free",
+            "sub_end": None,
+            "owner_id": None,
+            "censor_enabled": False,
+            "censor_words": [],
+            "activity_enabled": False,
+            "anti_spam_enabled": False,
+            "anti_wave_enabled": False,
+            "smalltalk_enabled": False,
+            "history_enabled": False,
+            "roles_enabled": False,
+            "group_images_enabled": False,
+            "custom_prompt": "",
+            "model": None,
+            "roles": json.loads(json.dumps(GROUP_DEFAULT_ROLES)),
+            "user_roles": {},
+            "user_stats": {},
+            "chat_archive": [],
+            "last_message_ts": time.time(),
+            "last_smalltalk_ts": 0,
+            "image_month": current_month_key(),
+            "image_generation_count": 0,
+            "spam_strikes": {},
+        }
         while len(groups_db) > MAX_GROUPS_STORED:
             groups_db.pop(next(iter(groups_db)))
+
     group = groups_db[key]
-    group.setdefault("title", chat_title or "Группа")
-    group.setdefault("ai_enabled", False)
-    group.setdefault("history", [])
-    group.setdefault("pending_followup", None)
-    group.setdefault("warnings", {})
-    group.setdefault("rules", "Правила пока не заданы.")
-    group.setdefault("messages", 0)
-    group.setdefault("members_seen", [])
+    defaults = {
+        "title": chat_title or "Группа",
+        "ai_enabled": False,
+        "agent_enabled": True,
+        "nickname": "ШколоAI",
+        "history": [],
+        "pending_followup": None,
+        "warnings": {},
+        "rules": "Правила пока не заданы.",
+        "messages": 0,
+        "members_seen": [],
+        "plan": "free",
+        "sub_end": None,
+        "owner_id": None,
+        "censor_enabled": False,
+        "censor_words": [],
+        "activity_enabled": False,
+        "anti_spam_enabled": False,
+        "anti_wave_enabled": False,
+        "smalltalk_enabled": False,
+        "history_enabled": False,
+        "roles_enabled": False,
+        "group_images_enabled": False,
+        "custom_prompt": "",
+        "model": None,
+        "roles": json.loads(json.dumps(GROUP_DEFAULT_ROLES)),
+        "user_roles": {},
+        "user_stats": {},
+        "chat_archive": [],
+        "last_message_ts": time.time(),
+        "last_smalltalk_ts": 0,
+        "image_month": current_month_key(),
+        "image_generation_count": 0,
+        "spam_strikes": {},
+    }
+    for name, value in defaults.items():
+        if name not in group or group[name] is None:
+            group[name] = value
+    if not isinstance(group.get("roles"), dict):
+        group["roles"] = json.loads(json.dumps(GROUP_DEFAULT_ROLES))
+    if not isinstance(group.get("user_roles"), dict):
+        group["user_roles"] = {}
+    if not isinstance(group.get("user_stats"), dict):
+        group["user_stats"] = {}
+    if not isinstance(group.get("chat_archive"), list):
+        group["chat_archive"] = []
+    if not isinstance(group.get("censor_words"), list):
+        group["censor_words"] = []
+    if chat_title:
+        group["title"] = chat_title
+    if group.get("plan") not in GROUP_PLAN_CONFIG:
+        group["plan"] = "free"
     return group
 
 
@@ -2870,10 +2994,8 @@ async def run_image_generation(message: Message, uid: int, prompt: str):
         u["tokens"] = int(u.get("tokens", 0)) + 1000
         save_data()
     except Exception as e:
-        # ВОЗВРАТ ЗАРЕЗЕРВИРОВАННЫХ СРЕДСТВ ПРИ ОШИБКЕ/ТАЙМАУТЕ ГЕНЕРАЦИИ.
-        # Деньги были отложены заранее (см. reserve_request_cost выше); если запрос
-        # не завершился успехом, списание отменяется, чтобы не морозить бюджет навсегда.
-        record_ai_usage(u, 0, 0, 0.0, reserved_cost_rub=_generation_reserved_cost)
+        # Квота и резерв стоимости сохраняются: провайдер мог принять запрос,
+        # даже если соединение оборвалось до получения ответа.
         save_data()
         await wait_msg.edit_text(f"❌ Ошибка или таймаут генерации изображения ({bot_config['photo_model']}): {html.escape(str(e)[:400])}", parse_mode="HTML")
 
@@ -3805,8 +3927,83 @@ async def handle_admin_input(message: Message) -> bool:
 
 
 # =========================================================================
-# --- ГРУППОВОЙ РЕЖИМ И МОДЕРАЦИЯ ---
+# --- ГРУППОВОЙ АГЕНТ, ПОДПИСКИ, МОДЕРАЦИЯ И ИСТОРИЯ ---
 # =========================================================================
+def get_group_plan(group: dict) -> str:
+    plan = str(group.get("plan", "free")).lower()
+    if plan not in GROUP_PLAN_CONFIG:
+        plan = "free"
+    sub_end = _parse_saved_datetime(group.get("sub_end"))
+    if plan != "free" and (sub_end is None or datetime.now() >= sub_end):
+        group["plan"] = "free"
+        group["sub_end"] = None
+        group["censor_enabled"] = False
+        group["activity_enabled"] = False
+        group["anti_spam_enabled"] = False
+        group["anti_wave_enabled"] = False
+        group["smalltalk_enabled"] = False
+        group["history_enabled"] = False
+        group["roles_enabled"] = False
+        group["group_images_enabled"] = False
+        group["model"] = None
+        group["custom_prompt"] = ""
+        plan = "free"
+        save_data()
+    return plan
+
+
+def group_has_feature(group: dict, feature: str) -> bool:
+    plan = get_group_plan(group)
+    return feature in GROUP_PLAN_CONFIG[plan]["features"]
+
+
+def group_feature_label(feature: str) -> str:
+    return {
+        "censor": "цензура",
+        "activity": "учёт активности",
+        "usercard": "карточка участника",
+        "smalltalk": "авторазговоры",
+        "anti_spam": "антиспам",
+        "anti_wave": "защита от спам-волн",
+        "history": "архив истории",
+        "premium_roles": "премиальные роли",
+        "group_model": "переключение модели группы",
+        "group_prompt": "системный промпт группы",
+        "group_images": "генерация изображений в группе",
+    }.get(feature, feature)
+
+
+def group_feature_denied_text(group: dict, feature: str) -> str:
+    required = next(
+        (cfg["title"] for plan, cfg in GROUP_PLAN_CONFIG.items()
+         if feature in cfg["features"]),
+        "платный тариф",
+    )
+    return (
+        f"🔒 Функция «{html.escape(group_feature_label(feature))}» доступна на тарифе "
+        f"<b>{html.escape(required)}</b> и выше. Откройте /groupsub, чтобы посмотреть тарифы."
+    )
+
+
+def group_plan_status_text(group: dict) -> str:
+    plan = get_group_plan(group)
+    cfg = GROUP_PLAN_CONFIG[plan]
+    until = _parse_saved_datetime(group.get("sub_end"))
+    until_text = f"\n⏳ Действует до: <code>{until.strftime('%d.%m.%Y %H:%M')}</code>" if until else ""
+    return (
+        f"👥 <b>Подписка группы</b>\nТариф: <b>{html.escape(cfg['title'])}</b> "
+        f"({cfg['price_rub']} ₽/мес.){until_text}\n"
+        f"AI: {'🟢 автоответы' if group.get('ai_enabled') else '🔴 по команде/упоминанию'}\n"
+        f"Цензор: {'🟢' if group.get('censor_enabled') and group_has_feature(group, 'censor') else '🔴'} | "
+        f"Антиспам: {'🟢' if group.get('anti_spam_enabled') and group_has_feature(group, 'anti_spam') else '🔴'} | "
+        f"Анти-волна: {'🟢' if group.get('anti_wave_enabled') and group_has_feature(group, 'anti_wave') else '🔴'}\n"
+        f"Активность: {'🟢' if group.get('activity_enabled') and group_has_feature(group, 'activity') else '🔴'} | "
+        f"Архив: {'🟢' if group.get('history_enabled') and group_has_feature(group, 'history') else '🔴'} | "
+        f"Роли: {'🟢' if group.get('roles_enabled') and group_has_feature(group, 'premium_roles') else '🔴'} | "
+        f"Изображения: {'🟢' if group.get('group_images_enabled') and group_has_feature(group, 'group_images') else '🔴'}"
+    )
+
+
 async def is_group_admin(chat_id: int, user_id: int) -> bool:
     try:
         member = await bot.get_chat_member(chat_id, user_id)
@@ -3827,7 +4024,6 @@ async def bot_has_group_permission(chat_id: int, permission: str) -> bool:
 
 
 async def bot_can_moderate(chat_id: int) -> bool:
-    # Совместимость со старым вызовом: проверяем базовую роль администратора.
     try:
         me = await bot.get_me()
         member = await bot.get_chat_member(chat_id, me.id)
@@ -3839,44 +4035,563 @@ async def bot_can_moderate(chat_id: int) -> bool:
 def group_target_id(message: Message, args: list[str], command_name: str = "") -> int | None:
     if message.reply_to_message and message.reply_to_message.from_user:
         return message.reply_to_message.from_user.id
-    # Для /mute одиночное число — это длительность, а не Telegram ID.
     if command_name == "/mute" and len(args) < 2:
+        return None
+    if command_name == "/clearwarns":
         return None
     if args and args[0].lstrip("@").isdigit():
         return int(args[0].lstrip("@"))
     return None
 
 
+async def get_group_role_rank(chat_id: int, group: dict, user_id: int) -> int:
+    if await is_group_admin(chat_id, user_id):
+        return 1000
+    role_name = str(group.get("user_roles", {}).get(str(user_id), "member")) if group.get("roles_enabled") else "member"
+    role = group.get("roles", {}).get(role_name, {})
+    return max(0, min(999, int(role.get("rank", 0) or 0)))
+
+
+def get_group_role_permissions(group: dict, role_name: str) -> set[str]:
+    roles = group.get("roles", {})
+    found: set[str] = set()
+    current = role_name
+    visited = set()
+    for _ in range(8):
+        if not current or current in visited:
+            break
+        visited.add(current)
+        role = roles.get(current)
+        if not isinstance(role, dict):
+            break
+        for perm in role.get("permissions", []):
+            if perm in GROUP_ROLE_PERMISSIONS:
+                found.add(perm)
+        current = role.get("inherits")
+    return found
+
+
+async def group_has_permission(chat_id: int, group: dict, user_id: int, permission: str) -> bool:
+    if await is_group_admin(chat_id, user_id):
+        return True
+    if not group.get("roles_enabled"):
+        return False
+    role_name = str(group.get("user_roles", {}).get(str(user_id), "member"))
+    return permission in get_group_role_permissions(group, role_name)
+
+
+async def can_group_manage_target(chat_id: int, group: dict, actor_id: int, target_id: int) -> bool:
+    if actor_id == target_id:
+        return False
+    if await is_group_admin(chat_id, target_id):
+        return False
+    actor_rank = await get_group_role_rank(chat_id, group, actor_id)
+    target_rank = await get_group_role_rank(chat_id, group, target_id)
+    return actor_rank > target_rank
+
+
+def _safe_display_name(value: str, limit: int = 60) -> str:
+    return html.escape((value or "Участник")[:limit])
+
+
+def record_group_activity(message: Message, group: dict) -> None:
+    now = time.time()
+    group["last_message_ts"] = now
+    group["messages"] = int(group.get("messages", 0) or 0) + 1
+    if not message.from_user:
+        return
+
+    if group_has_feature(group, "activity") and group.get("activity_enabled"):
+        stats = group.setdefault("user_stats", {})
+        uid_key = str(message.from_user.id)
+        entry = stats.setdefault(uid_key, {
+            "name": message.from_user.full_name or "Участник",
+            "username": message.from_user.username or "",
+            "messages": 0,
+            "first_seen": datetime.now().isoformat(timespec="minutes"),
+            "last_seen": datetime.now().isoformat(timespec="minutes"),
+        })
+        entry["name"] = message.from_user.full_name or entry.get("name", "Участник")
+        entry["username"] = message.from_user.username or ""
+        entry["messages"] = int(entry.get("messages", 0) or 0) + 1
+        entry["last_seen"] = datetime.now().isoformat(timespec="minutes")
+        if len(stats) > 500:
+            # Данные старых неактивных участников удаляются первыми.
+            oldest_key = min(stats, key=lambda k: stats[k].get("last_seen", ""))
+            if oldest_key != uid_key:
+                stats.pop(oldest_key, None)
+
+    archive_text = (message.text or message.caption or "").strip()
+    if (group_has_feature(group, "history") and group.get("history_enabled")
+            and archive_text and not archive_text.startswith("/")):
+        archive = group.setdefault("chat_archive", [])
+        archive.append({
+            "user_id": message.from_user.id,
+            "name": message.from_user.full_name or "Участник",
+            "text": archive_text[:1200],
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        })
+        del archive[:-MAX_GROUP_ARCHIVE]
+
+
+def group_censor_match(group: dict, text: str) -> str | None:
+    if not text:
+        return None
+    if BAD_PATTERNS.search(text):
+        return "сообщение нарушает встроенный фильтр безопасности"
+    for word in group.get("censor_words", []):
+        candidate = str(word).strip()
+        if not candidate:
+            continue
+        try:
+            if re.search(r"(?<!\w)" + re.escape(candidate) + r"(?!\w)", text, flags=re.IGNORECASE):
+                return candidate
+        except re.error:
+            continue
+    return None
+
+
+def detect_group_flood(message: Message, group: dict) -> str | None:
+    if not message.from_user:
+        return None
+    plan = get_group_plan(group)
+    anti_spam_on = group_has_feature(group, "anti_spam") and group.get("anti_spam_enabled")
+    anti_wave_on = group_has_feature(group, "anti_wave") and group.get("anti_wave_enabled")
+    if not anti_spam_on and not anti_wave_on:
+        return None
+
+    now = time.monotonic()
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    key = (chat_id, user_id)
+    per_user = group_message_windows.setdefault(key, [])
+    text = (message.text or message.caption or "").strip().lower()[:180]
+    is_sticker = bool(message.sticker or message.animation)
+    per_user.append((now, text, is_sticker))
+    per_user[:] = [item for item in per_user if now - item[0] <= 8.0]
+
+    if anti_wave_on:
+        wave = group_wave_windows.setdefault(chat_id, [])
+        wave.append((now, user_id))
+        wave[:] = [item for item in wave if now - item[0] <= 7.0]
+        wave_limit = 26 if plan == "storm" else 32
+        unique_senders = {item[1] for item in wave}
+        if len(wave) >= wave_limit and len(unique_senders) >= 7:
+            return "обнаружена массовая волна сообщений"
+
+    recent = [item for item in per_user if now - item[0] <= (3.0 if plan == "storm" else 4.0)]
+    stickers = sum(1 for item in recent if item[2])
+    duplicate_texts = [item[1] for item in recent if item[1]]
+    duplicate_count = max((duplicate_texts.count(value) for value in set(duplicate_texts)), default=0)
+    msg_limit = 4 if plan == "storm" else 6
+    sticker_limit = 3 if plan == "storm" else 5
+    duplicate_limit = 2 if plan == "storm" else 3
+
+    if len(recent) >= msg_limit:
+        return "слишком частая отправка сообщений"
+    if stickers >= sticker_limit:
+        return "поток стикеров или анимаций"
+    if duplicate_count >= duplicate_limit:
+        return "повторяющиеся сообщения"
+    return None
+
+
+async def moderate_group_violation(message: Message, group: dict, reason: str, severe: bool = False) -> None:
+    chat_id = message.chat.id
+    uid = message.from_user.id if message.from_user else 0
+    deleted = False
+    if await bot_has_group_permission(chat_id, "can_delete_messages"):
+        try:
+            await message.delete()
+            deleted = True
+        except Exception:
+            pass
+
+    strikes = group.setdefault("spam_strikes", {})
+    count = int(strikes.get(str(uid), 0) or 0) + 1
+    strikes[str(uid)] = count
+    muted = False
+    if (severe or count >= 2) and await bot_has_group_permission(chat_id, "can_restrict_members"):
+        duration = 5 if severe else (2 if get_group_plan(group) in ("storm", "court") else 1)
+        try:
+            await bot.restrict_chat_member(
+                chat_id,
+                uid,
+                permissions=ChatPermissions(can_send_messages=False),
+                until_date=datetime.now() + timedelta(minutes=duration),
+            )
+            muted = True
+        except Exception:
+            pass
+    save_data()
+    if not deleted:
+        try:
+            await message.reply("⚠️ Антиспам: " + html.escape(reason) + ".")
+        except Exception:
+            pass
+    elif muted:
+        try:
+            await bot.send_message(chat_id, f"🔇 Антиспам временно ограничил участника на {duration} мин. Причина: {html.escape(reason)}.")
+        except Exception:
+            pass
+
+
+async def group_smalltalk_loop() -> None:
+    import random
+    starters = [
+        "Небольшой вопрос для чата: какую игру вы бы посоветовали пройти хотя бы раз?",
+        "Мини-опрос: что важнее в игре — сюжет, атмосфера или геймплей?",
+        "Давайте оживим чат: какой факт недавно вас удивил?",
+        "Вопрос дня: какой навык вы хотели бы освоить за одну неделю?",
+        "У меня есть тема для спора: лучше короткая игра без лишнего контента или большая песочница?",
+        "Пора размять чат: назовите по одному фильму, сериалу или игре, которые стоит попробовать.",
+    ]
+    while True:
+        await asyncio.sleep(60)
+        now = time.time()
+        for key, group in list(groups_db.items()):
+            try:
+                if not group_has_feature(group, "smalltalk") or not group.get("smalltalk_enabled"):
+                    continue
+                last_activity = float(group.get("last_message_ts", now) or now)
+                last_auto = float(group.get("last_smalltalk_ts", 0) or 0)
+                if now - last_activity < 3600 or now - last_auto < 6 * 3600:
+                    continue
+                chat_id = int(key)
+                nickname = str(group.get("nickname", "ШколоAI"))[:32]
+                await bot.send_message(chat_id, f"💬 <b>{html.escape(nickname)}:</b> {random.choice(starters)}", parse_mode="HTML")
+                group["last_smalltalk_ts"] = now
+                save_data()
+            except Exception:
+                continue
+
+
+async def send_group_plan_request(message: Message) -> None:
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🧹 Фильтр — 79 ₽/мес.", callback_data=f"gplanreq|{message.chat.id}|filter")],
+        [InlineKeyboardButton(text="🛡 Щит — 149 ₽/мес.", callback_data=f"gplanreq|{message.chat.id}|shield")],
+        [InlineKeyboardButton(text="🌪 Шторм — 249 ₽/мес.", callback_data=f"gplanreq|{message.chat.id}|storm")],
+        [InlineKeyboardButton(text="⚖️ Суд — 349 ₽/мес.", callback_data=f"gplanreq|{message.chat.id}|court")],
+    ])
+    await message.reply(
+        "💳 <b>Тарифы для группы</b>\n\n"
+        "<b>Фильтр — 79 ₽/мес.</b>\nЦензор, статистика активности, карточка участника и авто-темы.\n\n"
+        "<b>Щит — 149 ₽/мес.</b>\nВсё из Фильтра + защита от повторов, флудов и потоков стикеров.\n\n"
+        "<b>Шторм — 249 ₽/мес.</b>\nУсиленная защита от спам-волн и более строгие пороги антифлуда.\n\n"
+        "<b>Суд — 349 ₽/мес.</b>\nВсё из Шторма + архив чата, история участника, роли с наследованием прав, выбор модели, промпт группы и генерация изображений.\n\n"
+        "Выберите тариф для отправки заявки. Подключение подтверждает администратор вручную; автоматической оплаты в этой версии нет. Функции включаются и выключаются командами группы.",
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
+
+
+@dp.callback_query(F.data.startswith("gplanreq|"))
+async def cb_group_plan_request(callback: CallbackQuery):
+    try:
+        _, chat_text, plan = callback.data.split("|", 2)
+        chat_id = int(chat_text)
+    except Exception:
+        return await callback.answer("Некорректная заявка.", show_alert=True)
+    if plan not in GROUP_PLAN_CONFIG or plan == "free":
+        return await callback.answer("Неизвестный тариф.", show_alert=True)
+    if not await is_group_admin(chat_id, callback.from_user.id):
+        return await callback.answer("Вы должны быть администратором этой группы.", show_alert=True)
+
+    title = callback.message.chat.title if callback.message and callback.message.chat else str(chat_id)
+    requester = callback.from_user
+    price = GROUP_PLAN_CONFIG[plan]["price_rub"]
+    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Подключить на 30 дней", callback_data=f"gplangrant|{chat_id}|{plan}|30|{requester.id}")],
+        [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"gplandeny|{chat_id}|{plan}")],
+    ])
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            "📥 <b>Заявка на групповую подписку</b>\n"
+            f"Группа: <b>{html.escape(title or str(chat_id))}</b>\n"
+            f"Chat ID: <code>{chat_id}</code>\n"
+            f"Заявитель: {html.escape(requester.full_name)} (<code>{requester.id}</code>)\n"
+            f"Тариф: <b>{html.escape(GROUP_PLAN_CONFIG[plan]['title'])}</b> — {price} ₽/мес.",
+            reply_markup=admin_kb,
+            parse_mode="HTML",
+        )
+    except Exception:
+        return await callback.answer("Сначала откройте личный чат с ботом и отправьте /start.", show_alert=True)
+    await callback.answer("Заявка отправлена администратору.", show_alert=True)
+    try:
+        await callback.message.reply("📨 Заявка отправлена. Подключение произойдёт после подтверждения администратора.")
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data.startswith("gplangrant|"))
+async def cb_group_plan_grant(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return await callback.answer("Недостаточно прав.", show_alert=True)
+    try:
+        _, chat_text, plan, days_text, requester_text = callback.data.split("|", 4)
+        chat_id = int(chat_text)
+        days = max(1, min(366, int(days_text)))
+        requester_id = int(requester_text)
+    except Exception:
+        return await callback.answer("Некорректные данные тарифа.", show_alert=True)
+    if plan not in GROUP_PLAN_CONFIG or plan == "free":
+        return await callback.answer("Неизвестный тариф.", show_alert=True)
+    group = get_group(chat_id)
+    group["plan"] = plan
+    group["sub_end"] = (datetime.now() + timedelta(days=days)).isoformat()
+    group["owner_id"] = requester_id
+    save_data()
+    await callback.answer("Тариф группы подключён.", show_alert=True)
+    try:
+        await bot.send_message(
+            chat_id,
+            f"✅ Группе подключён тариф <b>{html.escape(GROUP_PLAN_CONFIG[plan]['title'])}</b> на {days} дней.\n"
+            "Настройте функции через /grouphelp и /groupplan.",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+    try:
+        await callback.message.edit_text((callback.message.text or "Заявка") + "\n\n✅ Подключено.")
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data.startswith("gplandeny|"))
+async def cb_group_plan_deny(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return await callback.answer("Недостаточно прав.", show_alert=True)
+    await callback.answer("Заявка отклонена.")
+    try:
+        _, chat_text, _plan = callback.data.split("|", 2)
+        await bot.send_message(int(chat_text), "Заявка на групповую подписку отклонена администратором.")
+    except Exception:
+        pass
+    try:
+        await callback.message.edit_text((callback.message.text or "Заявка") + "\n\n❌ Отклонено.")
+    except Exception:
+        pass
+
+
+@dp.message(Command("grantgroup"))
+async def cmd_grant_group_plan(message: Message):
+    if not message.from_user or message.from_user.id != ADMIN_ID:
+        return
+    args = (message.text or "").split()
+    if len(args) < 3:
+        return await message.reply("Формат: /grantgroup CHAT_ID filter|shield|storm|court [дней]")
+    try:
+        chat_id = int(args[1])
+        plan = args[2].lower()
+        days = max(1, min(366, int(args[3]))) if len(args) > 3 else 30
+    except (ValueError, TypeError):
+        return await message.reply("Проверьте CHAT_ID, тариф и срок.")
+    if plan not in GROUP_PLAN_CONFIG or plan == "free":
+        return await message.reply("Тариф: filter, shield, storm или court.")
+    group = get_group(chat_id)
+    group["plan"] = plan
+    group["sub_end"] = (datetime.now() + timedelta(days=days)).isoformat()
+    group["owner_id"] = ADMIN_ID
+    save_data()
+    await message.reply(f"✅ Для группы <code>{chat_id}</code> подключён тариф <b>{GROUP_PLAN_CONFIG[plan]['title']}</b> на {days} дней.", parse_mode="HTML")
+    try:
+        await bot.send_message(chat_id, f"✅ Подключён групповой тариф <b>{GROUP_PLAN_CONFIG[plan]['title']}</b> на {days} дней.", parse_mode="HTML")
+    except Exception:
+        pass
+
+
+async def handle_group_natural_setting(message: Message, group: dict, user_text: str) -> bool:
+    if not group.get("agent_enabled") or len(user_text) > 100 or not message.from_user:
+        return False
+
+    text = re.sub(r"^школоai[,:! ]*", "", user_text.strip().lower())
+    match = re.fullmatch(
+        r"(включи|включить|выключи|выключить)\s+"
+        r"(автоответы|ии|цензор|цензуру|активность|антиспам|анти-спам|антиволну|анти-волну|разговоры|авторазговоры)",
+        text,
+    )
+    if match:
+        if not await is_group_admin(message.chat.id, message.from_user.id):
+            await message.reply("⛔ Настройки группового агента могут менять только администраторы группы.")
+            return True
+        enable = match.group(1).startswith("включ")
+        target = match.group(2)
+        mapping = {
+            "автоответы": ("ai_enabled", None), "ии": ("ai_enabled", None),
+            "цензор": ("censor_enabled", "censor"), "цензуру": ("censor_enabled", "censor"),
+            "активность": ("activity_enabled", "activity"),
+            "антиспам": ("anti_spam_enabled", "anti_spam"), "анти-спам": ("anti_spam_enabled", "anti_spam"),
+            "антиволну": ("anti_wave_enabled", "anti_wave"), "анти-волну": ("anti_wave_enabled", "anti_wave"),
+            "разговоры": ("smalltalk_enabled", "smalltalk"), "авторазговоры": ("smalltalk_enabled", "smalltalk"),
+        }
+        field, feature = mapping[target]
+        if enable and feature and not group_has_feature(group, feature):
+            await message.reply(group_feature_denied_text(group, feature), parse_mode="HTML")
+            return True
+        group[field] = enable
+        save_data()
+        await message.reply(f"✅ {target.capitalize()}: {'включено' if enable else 'выключено'}.")
+        return True
+
+    # Простые команды модерации естественным языком срабатывают только
+    # как ответ на сообщение конкретного участника и после проверки роли.
+    action_match = re.fullmatch(
+        r"(предупреди|замути|мут|размуть|размути|забань|бан|кикни|удали)"
+        r"(?:\s+на\s+(\d{1,3})\s*(?:м|мин|минут(?:у|ы)?|д|дн|дней)?)?",
+        text,
+    )
+    if action_match:
+        if not message.reply_to_message or not message.reply_to_message.from_user:
+            await message.reply("Ответьте этой просьбой на сообщение участника, чтобы я точно понял цель действия.")
+            return True
+        verb = action_match.group(1)
+        amount = int(action_match.group(2) or 0)
+        action = "warn" if verb == "предупреди" else "mute" if verb in ("замути", "мут", "размуть", "размути") else "ban" if verb in ("забань", "бан") else "kick"
+        if verb in ("размуть", "размути"):
+            action = "unmute"
+        target_id = message.reply_to_message.from_user.id
+        permission = "warn" if action == "warn" else "mute" if action in ("mute", "unmute") else "ban" if action == "ban" else "kick"
+        if not await group_has_permission(message.chat.id, group, message.from_user.id, permission):
+            await message.reply("⛔ У вашей роли нет права на это действие.")
+            return True
+        if not await can_group_manage_target(message.chat.id, group, message.from_user.id, target_id):
+            await message.reply("⛔ Нельзя применять это действие к себе или участнику с равной/более высокой ролью.")
+            return True
+        if action == "warn":
+            warnings = group.setdefault("warnings", {})
+            count = int(warnings.get(str(target_id), 0) or 0) + 1
+            warnings[str(target_id)] = count
+            save_data()
+            await message.reply(f"⚠️ Предупреждение выдано: {count}/3.")
+            return True
+        if not await bot_has_group_permission(message.chat.id, "can_restrict_members"):
+            await message.reply("⚠️ Для этого действия боту нужно право «Ограничивать участников» или «Блокировать участников».")
+            return True
+        if action == "mute":
+            minutes = max(1, min(10080, amount or 10))
+            await bot.restrict_chat_member(
+                message.chat.id, target_id,
+                permissions=ChatPermissions(can_send_messages=False),
+                until_date=datetime.now() + timedelta(minutes=minutes),
+            )
+            await message.reply(f"🔇 Участник ограничен на {minutes} мин.")
+            return True
+        if action == "unmute":
+            permissions = ChatPermissions(
+                can_send_messages=True, can_send_audios=True, can_send_documents=True,
+                can_send_photos=True, can_send_videos=True, can_send_video_notes=True,
+                can_send_voice_notes=True, can_send_polls=True, can_send_other_messages=True,
+                can_add_web_page_previews=True,
+            )
+            await bot.restrict_chat_member(message.chat.id, target_id, permissions=permissions)
+            await message.reply("🔊 Ограничение снято.")
+            return True
+        if not await bot_has_group_permission(message.chat.id, "can_restrict_members"):
+            await message.reply("⚠️ Боту нужно право «Блокировать участников».")
+            return True
+        if action == "ban":
+            days = max(1, min(366, amount or 0)) if amount else None
+            until = datetime.now() + timedelta(days=days) if days else None
+            await bot.ban_chat_member(message.chat.id, target_id, until_date=until)
+            await message.reply("🚫 Участник заблокирован.")
+        else:
+            await bot.ban_chat_member(message.chat.id, target_id)
+            await bot.unban_chat_member(message.chat.id, target_id, only_if_banned=False)
+            await message.reply("👢 Участник удалён из группы.")
+        return True
+
+    return False
+
+
+async def run_group_image_generation(message: Message, group: dict, user: dict, prompt: str) -> None:
+    chat_id = message.chat.id
+    month = current_month_key()
+    if group.get("image_month") != month:
+        group["image_month"] = month
+        group["image_generation_count"] = 0
+    used = int(group.get("image_generation_count", 0) or 0)
+    if used >= 5:
+        return await message.reply("⚠️ Лимит групповой генерации на тарифе Суд: 5 изображений в месяц.")
+
+    affordable, budget_error = can_afford_request(user, 1, 1, extra_cost_rub=IMAGE_GENERATION_COST_RUB)
+    if not affordable and message.from_user.id != ADMIN_ID:
+        return await message.reply(f"⚠️ {html.escape(budget_error)}", parse_mode="HTML")
+    reserved = reserve_request_cost(user, 1, 1, extra_cost_rub=IMAGE_GENERATION_COST_RUB)
+    group["image_generation_count"] = used + 1
+    save_data()
+    status = await message.reply("🎨 Готовлю изображение для группы…")
+    try:
+        image_data, is_bytes = await asyncio.wait_for(generate_image_api(prompt), timeout=120.0)
+        try:
+            await status.delete()
+        except Exception:
+            pass
+        photo = BufferedInputFile(image_data, filename="group_image.png") if is_bytes else image_data
+        await message.answer_photo(
+            photo=photo,
+            caption=f"🎨 Запрос: {html.escape(prompt[:180])}\nТариф группы: Суд",
+            parse_mode="HTML",
+        )
+        record_ai_usage(user, 0, 0, extra_cost_rub=IMAGE_GENERATION_COST_RUB, reserved_cost_rub=reserved)
+        save_data()
+    except Exception as exc:
+        save_data()
+        try:
+            await status.edit_text(f"❌ Не удалось сгенерировать изображение: {html.escape(str(exc)[:300])}", parse_mode="HTML")
+        except Exception:
+            pass
+
+
 async def handle_group_message(message: Message, user: dict):
+    if not message.from_user:
+        return
     chat_id = message.chat.id
     uid = message.from_user.id
     group = get_group(chat_id, message.chat.title or "Группа")
-    group["messages"] = int(group.get("messages", 0)) + 1
+    record_group_activity(message, group)
     user_text = (message.text or message.caption or "").strip()
+
     if message.new_chat_members:
         names = ", ".join(html.escape(member.full_name) for member in message.new_chat_members[:8])
-        await message.answer(
-            f"👋 Добро пожаловать, {names}! Я ШколоAI. Напишите /grouphelp, чтобы увидеть групповые команды."
-        )
         save_data()
-        return
+        return await message.answer(
+            f"👋 Добро пожаловать, {names}! Я {html.escape(str(group.get('nickname', 'ШколоAI')))}. "
+            "Напишите /grouphelp, чтобы увидеть команды."
+        )
 
     command = (message.text or "").split(maxsplit=1)
     head = command[0].split("@")[0].lower() if command else ""
     args = command[1].split() if len(command) > 1 else []
 
+    # Простые просьбы администратора об изменении настроек исполняются без API-вызова.
+    if user_text and await handle_group_natural_setting(message, group, user_text):
+        return
+
     if head in ("/grouphelp", "/helpgroup"):
         return await message.reply(
-            "👥 <b>Команды группы</b>\n"
-            "/ai текст — задать вопрос ИИ\n/ai_on и /ai_off — включить или выключить ответы на обычные сообщения\n"
-            "/rules — правила группы; /setrules текст — установить правила (админы)\n"
-            "/warn — предупреждение (ответом на сообщение)\n/mute [мин] — ограничить участника\n"
-            "/unmute, /ban, /unban, /kick, /tempban — модерация (ответом на сообщение)\n"
-            "/unwarn, /clearwarns — управление предупреждениями.\n"
-            "/purge N — удалить последние N сообщений (до 100)\n"
-            "/roll [число], /coin, /groupstats — групповые приколюхи и статистика.\n\n"
-            "Для группового диалога упомяните бота или ответьте на его сообщение.", parse_mode="HTML"
+            "👥 <b>Команды группового агента</b>\n"
+            "/ai текст — спросить ИИ; /ai_on и /ai_off — автоответы.\n"
+            "/groupsub — тарифы; /groupplan — состояние подписки.\n"
+            "/censor_on/off — цензор; /censor_add слово, /censor_remove слово, /censor_list.\n"
+            "/activity_on/off — учёт активности; /antispam_on/off — базовая защита; /antiwave_on/off — защита от волн.\n"
+            "/smalltalk_on/off — авторазговоры; /topic и /joke — тема и шутка; /nickname — имя агента.\n"
+            "/usercard — публичная карточка участника. /history_on/off, /chathistory, /userhistory, /history_clear — архив тарифа Суд.\n"
+            "/roles_on/off — внутренняя иерархия; /groupimages_on/off — генерация изображений в группе.\n"
+            "/groupmodel ID, /groupmodels, /gprompt текст, /groupimage запрос — тариф Суд.\n"
+            "/roles, /role_set, /role_create, /role_remove — премиальные роли тарифа Суд.\n"
+            "/rules, /setrules, /groupstats; /warn, /warnings, /unwarn, /clearwarns, /mute, /unmute, /ban, /unban, /kick, /tempban, /purge.\n\n"
+            "Настройки и модерацию могут менять администраторы группы. Права внутренних ролей не дают Telegram-админку и не позволяют управлять администраторами.",
+            parse_mode="HTML",
         )
+
+    if head in ("/groupsub", "/grouptariffs"):
+        if not await is_group_admin(chat_id, uid):
+            return await message.reply("⛔ Запрашивать тариф группы могут только её администраторы.")
+        return await send_group_plan_request(message)
+
+    if head == "/groupplan":
+        return await message.reply(group_plan_status_text(group), parse_mode="HTML")
 
     if head == "/rules":
         return await message.reply(f"📜 <b>Правила группы</b>\n{html.escape(group.get('rules', 'Правила не заданы.'))}", parse_mode="HTML")
@@ -3891,25 +4606,96 @@ async def handle_group_message(message: Message, user: dict):
         save_data()
         return await message.reply("✅ Правила группы обновлены.")
 
-    if head == "/ai_on":
+    if head in ("/ai_on", "/ai_off", "/agent_on", "/agent_off"):
         if not await is_group_admin(chat_id, uid):
-            return await message.reply("⛔ Включать автоответы могут только администраторы.")
-        group["ai_enabled"] = True
+            return await message.reply("⛔ Настройки группового агента меняют только администраторы.")
+        field = "ai_enabled" if head.startswith("/ai_") else "agent_enabled"
+        enabled = head.endswith("_on")
+        group[field] = enabled
         save_data()
-        return await message.reply("🤖 Автоответы ИИ включены. Для отключения: /ai_off")
+        label = "Автоответы ИИ" if field == "ai_enabled" else "Режим агента"
+        return await message.reply(f"✅ {label}: {'включены' if enabled else 'выключены'}.")
 
-    if head == "/ai_off":
+    toggle_commands = {
+        "/censor_on": ("censor_enabled", "censor", True), "/censor_off": ("censor_enabled", "censor", False),
+        "/activity_on": ("activity_enabled", "activity", True), "/activity_off": ("activity_enabled", "activity", False),
+        "/antispam_on": ("anti_spam_enabled", "anti_spam", True), "/antispam_off": ("anti_spam_enabled", "anti_spam", False),
+        "/antiwave_on": ("anti_wave_enabled", "anti_wave", True), "/antiwave_off": ("anti_wave_enabled", "anti_wave", False),
+        "/smalltalk_on": ("smalltalk_enabled", "smalltalk", True), "/smalltalk_off": ("smalltalk_enabled", "smalltalk", False),
+        "/history_on": ("history_enabled", "history", True), "/history_off": ("history_enabled", "history", False),
+        "/roles_on": ("roles_enabled", "premium_roles", True), "/roles_off": ("roles_enabled", "premium_roles", False),
+        "/groupimages_on": ("group_images_enabled", "group_images", True), "/groupimages_off": ("group_images_enabled", "group_images", False),
+    }
+    if head in toggle_commands:
         if not await is_group_admin(chat_id, uid):
-            return await message.reply("⛔ Выключать автоответы могут только администраторы.")
-        group["ai_enabled"] = False
+            return await message.reply("⛔ Включать и выключать функции могут только администраторы группы.")
+        field, feature, enabled = toggle_commands[head]
+        if not group_has_feature(group, feature):
+            return await message.reply(group_feature_denied_text(group, feature), parse_mode="HTML")
+        group[field] = enabled
         save_data()
-        return await message.reply("🔕 Автоответы ИИ выключены. Бот по-прежнему отвечает на /ai и упоминания.")
+        return await message.reply(f"✅ {group_feature_label(feature).capitalize()}: {'включено' if enabled else 'выключено'}.")
+
+    if head in ("/censor_add", "/censor_remove", "/censor_list"):
+        if not group_has_feature(group, "censor"):
+            return await message.reply(group_feature_denied_text(group, "censor"), parse_mode="HTML")
+        if not await is_group_admin(chat_id, uid):
+            return await message.reply("⛔ Список цензора могут менять только администраторы группы.")
+        words = group.setdefault("censor_words", [])
+        word = (message.text or "").partition(" ")[2].strip()[:60]
+        if head == "/censor_list":
+            listed = ", ".join(html.escape(str(item)) for item in words[:80]) or "Список пока пуст."
+            return await message.reply(f"🧹 <b>Слова цензора:</b> {listed}", parse_mode="HTML")
+        if not word:
+            return await message.reply(f"Формат: {head} слово")
+        existing = next((item for item in words if str(item).casefold() == word.casefold()), None)
+        if head == "/censor_add":
+            if existing is None:
+                words.append(word)
+                words[:] = words[-100:]
+            save_data()
+            return await message.reply("✅ Слово добавлено в фильтр.")
+        if existing is not None:
+            words.remove(existing)
+        save_data()
+        return await message.reply("✅ Слово удалено из фильтра.")
+
+    if head == "/nickname":
+        if not await is_group_admin(chat_id, uid):
+            return await message.reply("⛔ Менять имя агента могут только администраторы.")
+        nickname = (message.text or "").partition(" ")[2].strip()
+        if not nickname:
+            return await message.reply("Формат: /nickname новое имя")
+        group["nickname"] = nickname[:32]
+        save_data()
+        return await message.reply(f"✅ Теперь я буду представляться как <b>{html.escape(group['nickname'])}</b>.", parse_mode="HTML")
+
+    if head == "/topic":
+        import random
+        topics = [
+            "Какую игру вы бы хотели забыть и пройти заново?",
+            "Что важнее в хорошей игре: механики, музыка или история?",
+            "Какой навык вы хотели бы освоить в ближайший месяц?",
+            "Назовите одну вещь, которая моментально улучшает настроение.",
+            "Какая технология, по-вашему, сильнее всего изменит ближайшие годы?",
+        ]
+        return await message.reply("💬 " + random.choice(topics))
+
+    if head == "/joke":
+        import random
+        jokes = [
+            "Почему программист не спорит с нулём? Потому что тот всегда в корне.",
+            "Я хотел рассказать шутку про UDP, но не уверен, что вы её получите.",
+            "Баг спросил у разработчика: «Это фича?» Разработчик ответил: «Теперь да». ",
+            "Оптимист видит в логе предупреждение. Пессимист — начало отдельного проекта.",
+        ]
+        return await message.reply("😄 " + random.choice(jokes))
 
     if head in ("/roll", "/dice"):
         import random
         try:
             sides = max(2, min(100000, int(args[0]))) if args else 6
-        except ValueError:
+        except (ValueError, TypeError):
             sides = 6
         return await message.reply(f"🎲 Выпало: <b>{random.randint(1, sides)}</b> (из {sides})", parse_mode="HTML")
 
@@ -3920,28 +4706,223 @@ async def handle_group_message(message: Message, user: dict):
     if head == "/groupstats":
         active_warns = sum(len(v) if isinstance(v, list) else int(v or 0) for v in group.get("warnings", {}).values())
         return await message.reply(
-            f"📊 <b>Статистика группы</b>\nСообщений с момента запуска учёта: <code>{group['messages']}</code>\n"
-            f"Участников с предупреждениями: <code>{len(group.get('warnings', {}))}</code>\nПредупреждений всего: <code>{active_warns}</code>\n"
-            f"ИИ: {'🟢 включён' if group.get('ai_enabled') else '🔴 только по команде/упоминанию'}",
-            parse_mode="HTML"
+            f"📊 <b>Статистика группы</b>\nСообщений: <code>{int(group.get('messages', 0))}</code>\n"
+            f"Участников в учёте активности: <code>{len(group.get('user_stats', {}))}</code>\n"
+            f"Предупреждений: <code>{active_warns}</code>\n"
+            f"ИИ: {'🟢 автоответы' if group.get('ai_enabled') else '🔴 по запросу'}\n"
+            f"Тариф: <b>{html.escape(GROUP_PLAN_CONFIG[get_group_plan(group)]['title'])}</b>",
+            parse_mode="HTML",
         )
 
-    if head in ("/warn", "/warnings", "/unwarn", "/clearwarns", "/ban", "/unban", "/kick", "/tempban", "/mute", "/unmute"):
+    if head == "/usercard":
+        if not group_has_feature(group, "usercard"):
+            return await message.reply(group_feature_denied_text(group, "usercard"), parse_mode="HTML")
+        if not await group_has_permission(chat_id, group, uid, "viewusers"):
+            return await message.reply("⛔ Просматривать карточки участников могут администраторы и назначенные роли.")
+        target_id = group_target_id(message, args, head)
+        if target_id is None:
+            return await message.reply("Ответьте на сообщение пользователя командой /usercard или укажите числовой Telegram ID.")
+        stats = group.get("user_stats", {}).get(str(target_id), {})
+        warnings = int(group.get("warnings", {}).get(str(target_id), 0) or 0)
+        try:
+            member = await bot.get_chat_member(chat_id, target_id)
+            status = str(member.status)
+            username = getattr(member.user, "username", None)
+            full_name = getattr(member.user, "full_name", "Участник")
+        except Exception:
+            status, username, full_name = "неизвестно", stats.get("username"), stats.get("name", "Участник")
+        role = str(group.get("user_roles", {}).get(str(target_id), "member"))
+        await message.reply(
+            f"👤 <b>Карточка участника</b>\nИмя: {html.escape(str(full_name))}\n"
+            f"ID: <code>{target_id}</code>\nUsername: {('@' + html.escape(username)) if username else 'не указан'}\n"
+            f"Статус Telegram: <code>{html.escape(status)}</code>\nВнутренняя роль: <code>{html.escape(role)}</code>\n"
+            f"Сообщений учтено: <code>{int(stats.get('messages', 0) or 0)}</code>\n"
+            f"Предупреждений: <code>{warnings}</code>\nПервое появление в учёте: <code>{html.escape(str(stats.get('first_seen', 'не записано')))}</code>\n"
+            f"Последняя активность: <code>{html.escape(str(stats.get('last_seen', 'не записано')))}</code>\n\n"
+            "Отображаются только открытые сведения и активность в этой группе.",
+            parse_mode="HTML",
+        )
+        return
+
+    if head in ("/chathistory", "/userhistory", "/history_clear"):
+        if not group_has_feature(group, "history"):
+            return await message.reply(group_feature_denied_text(group, "history"), parse_mode="HTML")
+        if not group.get("history_enabled"):
+            return await message.reply("🔕 Архив выключен. Администратор может включить его командой /history_on.")
+        if not await group_has_permission(chat_id, group, uid, "viewhistory"):
+            return await message.reply("⛔ Историю могут смотреть администраторы и роли с правом viewhistory.")
+        archive = group.get("chat_archive", [])
+        if head == "/history_clear":
+            if not await is_group_admin(chat_id, uid):
+                return await message.reply("⛔ Очищать архив может только администратор группы.")
+            group["chat_archive"] = []
+            save_data()
+            return await message.reply("🧹 Архив группы очищен.")
+        if head == "/userhistory":
+            target_id = group_target_id(message, args, head)
+            if target_id is None:
+                return await message.reply("Ответьте на сообщение участника командой /userhistory или укажите его числовой ID.")
+            entries = [item for item in archive if int(item.get("user_id", 0) or 0) == target_id][-15:]
+            title = f"История участника {target_id}"
+        else:
+            try:
+                count = max(1, min(30, int(args[0]))) if args else 15
+            except (TypeError, ValueError):
+                count = 15
+            entries = archive[-count:]
+            title = f"Последние {len(entries)} сообщений группы"
+        if not entries:
+            return await message.reply("В архиве пока нет подходящих сообщений.")
+        lines = [f"🗂 <b>{html.escape(title)}</b>"]
+        for item in entries:
+            stamp = html.escape(str(item.get("timestamp", "")))
+            name = html.escape(str(item.get("name", "Участник"))[:50])
+            body = html.escape(str(item.get("text", ""))[:500])
+            lines.append(f"<code>{stamp}</code> <b>{name}</b>: {body}")
+        return await message.reply("\n".join(lines)[:3900], parse_mode="HTML")
+
+    # Премиальные внутренние роли не являются Telegram-администраторами.
+    if head == "/roles":
+        if not group_has_feature(group, "premium_roles"):
+            return await message.reply(group_feature_denied_text(group, "premium_roles"), parse_mode="HTML")
+        if not group.get("roles_enabled"):
+            return await message.reply("🔕 Система ролей выключена. Включить: /roles_on")
+        roles = group.get("roles", {})
+        lines = ["🎖 <b>Роли группы</b>"]
+        for name, data in sorted(roles.items(), key=lambda item: int(item[1].get("rank", 0))):
+            perms = ", ".join(data.get("permissions", [])) or "без дополнительных прав"
+            parent = data.get("inherits") or "нет"
+            lines.append(f"• <code>{html.escape(name)}</code> — ранг {int(data.get('rank', 0))}; права: {html.escape(perms)}; наследует: <code>{html.escape(parent)}</code>")
+        return await message.reply("\n".join(lines)[:3900], parse_mode="HTML")
+
+    if head == "/role_create":
+        if not group_has_feature(group, "premium_roles"):
+            return await message.reply(group_feature_denied_text(group, "premium_roles"), parse_mode="HTML")
+        if not group.get("roles_enabled"):
+            return await message.reply("🔕 Система ролей выключена. Включить: /roles_on")
         if not await is_group_admin(chat_id, uid):
-            return await message.reply("⛔ Эта команда доступна администраторам группы.")
-        target_id = None if head == "/clearwarns" else group_target_id(message, args, head)
+            return await message.reply("⛔ Создавать роли могут только Telegram-администраторы группы.")
+        parts = (message.text or "").split(maxsplit=3)
+        if len(parts) < 4:
+            return await message.reply("Формат: /role_create имя ранг права_через_запятую [наследует] — например /role_create helper2 15 warn,mute helper")
+        name = parts[1].lower()
+        if not re.fullmatch(r"[a-z0-9_]{2,20}", name) or name in ("member", "owner"):
+            return await message.reply("Имя роли: 2–20 символов a-z, 0-9 или _.")
+        try:
+            rank = max(1, min(90, int(parts[2])))
+        except ValueError:
+            return await message.reply("Ранг должен быть числом от 1 до 90.")
+        perm_text = parts[3].strip()
+        inherit = None
+        if " " in perm_text:
+            perm_text, inherit = perm_text.rsplit(" ", 1)
+        permissions = sorted({p.strip().lower() for p in perm_text.split(",") if p.strip()} & GROUP_ROLE_PERMISSIONS)
+        if inherit and inherit not in group.get("roles", {}):
+            return await message.reply("Указанной родительской роли нет. Сначала создайте её или уберите наследование.")
+        if inherit == name:
+            return await message.reply("Роль не может наследовать саму себя.")
+        group.setdefault("roles", {})[name] = {"rank": rank, "permissions": permissions, "inherits": inherit}
+        save_data()
+        return await message.reply(f"✅ Роль <code>{html.escape(name)}</code> создана. Права: {html.escape(', '.join(permissions) or 'нет')}.", parse_mode="HTML")
+
+    if head == "/role_set":
+        if not group_has_feature(group, "premium_roles"):
+            return await message.reply(group_feature_denied_text(group, "premium_roles"), parse_mode="HTML")
+        if not group.get("roles_enabled"):
+            return await message.reply("🔕 Система ролей выключена. Включить: /roles_on")
+        if not await is_group_admin(chat_id, uid):
+            return await message.reply("⛔ Назначать роли могут только Telegram-администраторы группы.")
+        target_id = message.reply_to_message.from_user.id if message.reply_to_message and message.reply_to_message.from_user else None
+        role_name = args[0] if target_id and args else (args[1] if len(args) >= 2 and args[0].isdigit() else None)
+        if target_id is None and len(args) >= 2 and args[0].isdigit():
+            target_id = int(args[0])
+            role_name = args[1]
+        if target_id is None or not role_name:
+            return await message.reply("Ответьте /role_set имя_роли на сообщение или используйте /role_set ID имя_роли.")
+        if role_name not in group.get("roles", {}):
+            return await message.reply("Такой роли нет. Используйте /roles.")
+        if await is_group_admin(chat_id, target_id):
+            return await message.reply("Telegram-администраторы не управляются внутренними ролями.")
+        group.setdefault("user_roles", {})[str(target_id)] = role_name
+        save_data()
+        return await message.reply(f"✅ Участнику <code>{target_id}</code> назначена роль <b>{html.escape(role_name)}</b>.", parse_mode="HTML")
+
+    if head == "/role_remove":
+        if not group_has_feature(group, "premium_roles"):
+            return await message.reply(group_feature_denied_text(group, "premium_roles"), parse_mode="HTML")
+        if not group.get("roles_enabled"):
+            return await message.reply("🔕 Система ролей выключена. Включить: /roles_on")
+        if not await is_group_admin(chat_id, uid):
+            return await message.reply("⛔ Снимать внутренние роли могут только Telegram-администраторы группы.")
+        target_id = group_target_id(message, args, head)
+        if target_id is None:
+            return await message.reply("Ответьте на сообщение командой /role_remove или укажите числовой ID.")
+        group.setdefault("user_roles", {}).pop(str(target_id), None)
+        save_data()
+        return await message.reply(f"✅ У участника <code>{target_id}</code> роль сброшена до member.", parse_mode="HTML")
+
+    if head in ("/groupmodels", "/groupmodel"):
+        if not group_has_feature(group, "group_model"):
+            return await message.reply(group_feature_denied_text(group, "group_model"), parse_mode="HTML")
+        if not await is_group_admin(chat_id, uid):
+            return await message.reply("⛔ Менять модель группы могут только администраторы.")
+        if head == "/groupmodels" or not args:
+            available = "\n".join(f"• <code>{html.escape(mid)}</code> — {html.escape(info.get('name', mid))}" for mid, info in models_db.items())
+            return await message.reply(f"🧠 <b>Модели</b>\nТекущая: <code>{html.escape(str(group.get('model') or 'модель автора запроса'))}</code>\n{available}\n\nФормат: /groupmodel ID", parse_mode="HTML")
+        model_id = args[0].lower()
+        if model_id in ("default", "auto", "user"):
+            group["model"] = None
+            save_data()
+            return await message.reply("✅ Группа снова использует модель автора запроса.")
+        if model_id not in models_db:
+            return await message.reply("Модель не найдена в models_db. Для сброса используйте /groupmodel default.")
+        group["model"] = model_id
+        save_data()
+        return await message.reply(f"✅ Для группы выбрана модель <b>{html.escape(models_db[model_id].get('name', model_id))}</b>.", parse_mode="HTML")
+
+    if head == "/gprompt":
+        if not group_has_feature(group, "group_prompt"):
+            return await message.reply(group_feature_denied_text(group, "group_prompt"), parse_mode="HTML")
+        if not await is_group_admin(chat_id, uid):
+            return await message.reply("⛔ Промпт группы могут менять только администраторы.")
+        prompt = (message.text or "").partition(" ")[2].strip()
+        if not prompt:
+            return await message.reply("Формат: /gprompt инструкции для группового агента. Для сброса: /gprompt reset")
+        group["custom_prompt"] = "" if prompt.lower() == "reset" else prompt[:2500]
+        save_data()
+        return await message.reply("✅ Системный промпт группы обновлён." if group["custom_prompt"] else "✅ Промпт группы сброшен.")
+
+    if head == "/groupimage":
+        if not group_has_feature(group, "group_images"):
+            return await message.reply(group_feature_denied_text(group, "group_images"), parse_mode="HTML")
+        if not group.get("group_images_enabled"):
+            return await message.reply("🔕 Генерация изображений в группе выключена. Включить: /groupimages_on")
+        prompt = (message.text or "").partition(" ")[2].strip()
+        if not prompt:
+            return await message.reply("Формат: /groupimage описание изображения")
+        return await run_group_image_generation(message, group, user, prompt[:1200])
+
+    if head in ("/warn", "/warnings", "/unwarn", "/clearwarns", "/ban", "/unban", "/kick", "/tempban", "/mute", "/unmute"):
+        permission = {
+            "/warn": "warn", "/warnings": "warn", "/unwarn": "warn", "/clearwarns": "warn",
+            "/ban": "ban", "/unban": "ban", "/tempban": "ban", "/kick": "kick",
+            "/mute": "mute", "/unmute": "mute",
+        }[head]
+        if not await group_has_permission(chat_id, group, uid, permission):
+            return await message.reply("⛔ Для этой команды нужна подходящая внутренняя роль или статус Telegram-администратора.")
         if head == "/clearwarns":
             group["warnings"] = {}
             save_data()
             return await message.reply("✅ Все предупреждения в этой группе очищены.")
+        target_id = group_target_id(message, args, head)
         if target_id is None:
             return await message.reply("Ответьте командой на сообщение участника или укажите его числовой Telegram ID. Для /mute укажите длительность после ID или ответьте на сообщение.")
-        if target_id == uid:
-            return await message.reply("Нельзя применять эту команду к самому себе.")
+        if not await can_group_manage_target(chat_id, group, uid, target_id):
+            return await message.reply("⛔ Нельзя применять это действие к себе или участнику с равной/более высокой ролью.")
         warnings = group.setdefault("warnings", {})
         wkey = str(target_id)
         if head == "/warn":
-            count = int(warnings.get(wkey, 0)) + 1
+            count = int(warnings.get(wkey, 0) or 0) + 1
             warnings[wkey] = count
             save_data()
             if count >= 3:
@@ -3949,14 +4930,14 @@ async def handle_group_message(message: Message, user: dict):
                     if not await bot_has_group_permission(chat_id, "can_restrict_members"):
                         raise PermissionError("Боту нужно право «Ограничивать участников».")
                     await bot.restrict_chat_member(chat_id, target_id, permissions=ChatPermissions(can_send_messages=False), until_date=datetime.now() + timedelta(minutes=30))
-                    return await message.reply(f"⚠️ Участник <code>{target_id}</code> получил предупреждение {count}/3 и ограничение на 30 минут.", parse_mode="HTML")
+                    return await message.reply(f"⚠️ Предупреждение {count}/3. Участник <code>{target_id}</code> ограничен на 30 минут.", parse_mode="HTML")
                 except Exception as exc:
-                    return await message.reply(f"⚠️ Предупреждение {count}/3 выдано, но автоограничение не сработало: {html.escape(str(exc)[:200])}", parse_mode="HTML")
+                    return await message.reply(f"⚠️ Предупреждение {count}/3 выдано, автоограничение не сработало: {html.escape(str(exc)[:180])}", parse_mode="HTML")
             return await message.reply(f"⚠️ Предупреждение {count}/3 для <code>{target_id}</code>.", parse_mode="HTML")
         if head == "/warnings":
-            return await message.reply(f"⚠️ У пользователя <code>{target_id}</code> предупреждений: <b>{int(warnings.get(wkey, 0))}</b>", parse_mode="HTML")
+            return await message.reply(f"⚠️ У пользователя <code>{target_id}</code> предупреждений: <b>{int(warnings.get(wkey, 0) or 0)}</b>", parse_mode="HTML")
         if head == "/unwarn":
-            current = max(0, int(warnings.get(wkey, 0)) - 1)
+            current = max(0, int(warnings.get(wkey, 0) or 0) - 1)
             if current:
                 warnings[wkey] = current
             else:
@@ -3971,8 +4952,7 @@ async def handle_group_message(message: Message, user: dict):
                 days = max(1, min(366, int(duration_arg)))
             except (TypeError, ValueError):
                 days = 1
-            until = datetime.now() + timedelta(days=days)
-            await bot.ban_chat_member(chat_id, target_id, until_date=until)
+            await bot.ban_chat_member(chat_id, target_id, until_date=datetime.now() + timedelta(days=days))
             return await message.reply(f"⏳ Участник <code>{target_id}</code> заблокирован на {days} дн.", parse_mode="HTML")
         if head == "/ban":
             if not await bot_has_group_permission(chat_id, "can_restrict_members"):
@@ -4013,8 +4993,8 @@ async def handle_group_message(message: Message, user: dict):
             return await message.reply(f"🔊 Ограничение пользователя <code>{target_id}</code> снято.", parse_mode="HTML")
 
     if head == "/purge":
-        if not await is_group_admin(chat_id, uid):
-            return await message.reply("⛔ Команда доступна только администраторам.")
+        if not await group_has_permission(chat_id, group, uid, "settings"):
+            return await message.reply("⛔ Команда доступна администраторам или роли с правом settings.")
         if not await bot_has_group_permission(chat_id, "can_delete_messages"):
             return await message.reply("⚠️ Боту нужно право «Удалять сообщения».")
         if not message.reply_to_message:
@@ -4032,7 +5012,38 @@ async def handle_group_message(message: Message, user: dict):
             return await message.reply(f"Не удалось удалить сообщения: {html.escape(str(exc)[:180])}", parse_mode="HTML")
         return
 
-    # Для группы используем общую историю чата, но расходы списываем с автора запроса.
+    # Автоматические фильтры действуют только по явному включению администраторами.
+    if (group_has_feature(group, "censor") and group.get("censor_enabled")
+            and not await is_group_admin(chat_id, uid)):
+        violation = group_censor_match(group, user_text)
+        if violation:
+            if await bot_has_group_permission(chat_id, "can_delete_messages"):
+                try:
+                    await message.delete()
+                except Exception:
+                    pass
+            warnings = group.setdefault("warnings", {})
+            warnings[str(uid)] = int(warnings.get(str(uid), 0) or 0) + 1
+            save_data()
+            try:
+                await bot.send_message(chat_id, f"🧹 Сообщение удалено фильтром. Предупреждение {warnings[str(uid)]}/3.")
+            except Exception:
+                pass
+            if warnings[str(uid)] >= 3 and await bot_has_group_permission(chat_id, "can_restrict_members"):
+                try:
+                    await bot.restrict_chat_member(chat_id, uid, permissions=ChatPermissions(can_send_messages=False), until_date=datetime.now() + timedelta(minutes=10))
+                    await bot.send_message(chat_id, "🔇 Повторные нарушения: ограничение на 10 минут.")
+                except Exception:
+                    pass
+            return
+
+    if not await is_group_admin(chat_id, uid):
+        flood_reason = detect_group_flood(message, group)
+        if flood_reason:
+            severe = flood_reason == "обнаружена массовая волна сообщений"
+            return await moderate_group_violation(message, group, flood_reason, severe=severe)
+
+    # ИИ отвечает на /ai, упоминание, ответ на своё сообщение или при включённом автоответе.
     try:
         bot_me = await bot.get_me()
     except Exception:
@@ -4048,12 +5059,13 @@ async def handle_group_message(message: Message, user: dict):
     if not explicit_ai and not group.get("ai_enabled"):
         save_data()
         return
+
     if head == "/ai":
         user_text = message.text.partition(" ")[2].strip() if message.text else ""
     elif mentioned and message.text and bot_username:
         user_text = re.sub(r"@" + re.escape(bot_username), "", message.text, flags=re.I).strip()
     if not user_text:
-        return await message.reply("Напишите вопрос после /ai или упомяните меня в сообщении.")
+        return await message.reply("Напишите запрос после /ai или упомяните меня в сообщении.")
     if user.get("banned") and uid != ADMIN_ID:
         return
     if not check_censorship_fast(user_text):
@@ -4064,35 +5076,39 @@ async def handle_group_message(message: Message, user: dict):
     if uid != ADMIN_ID and now_ts - anti_spam.get(uid, 0) < 0.8:
         return
     anti_spam[uid] = now_ts
+
     group_history = group.setdefault("history", [])
     plan = normalize_plan(user)
     user_token_limit = bot_config["free_limit"] if plan == "free" else bot_config["sub_limit"] * (2 if plan == "max" else 1)
     if uid != ADMIN_ID and int(user.get("tokens", 0)) >= user_token_limit:
         return await message.reply(f"⚠️ Лимит токенов исчерпан: {user.get('tokens', 0)}/{user_token_limit}.")
 
+    nickname = str(group.get("nickname", "ШколоAI"))[:32]
     group_prompt = (
-        "Ты ИИ-ассистент группового чата Telegram. Отвечай дружелюбно, не перегружай чат. "
-        "Учитывай, что ответ видят все участники. Не раскрывай личные данные участников.\n"
-        "Если участник отвечает на твой уточняющий вопрос, продолжай предыдущую задачу; "
-        "не добавляй к короткому тексту шаблонные фразы и лишние приветствия. Для кода сохраняй язык и формат исходной задачи.\n"
-        f"Название группы: {group.get('title', 'Группа')}.\nПравила группы: {group.get('rules', '')}"
+        f"Ты {nickname}, групповой ИИ-агент Telegram. Выполняй прямые просьбы, если они безопасны и понятны; "
+        "не утверждай, что изменил настройки или применил модерацию, если действие фактически не выполнено. "
+        "Не раскрывай личные данные, не делай выводов о личности участников. Помни, что ответ видит вся группа. "
+        "Отвечай дружелюбно, иногда уместно шути, но не спамь. При спорной просьбе уточняй детали.\n"
+        "Если участник отвечает на уточнение, продолжай контекст. Для кода сохраняй язык и формат запроса.\n"
+        f"Название группы: {group.get('title', 'Группа')}.\nПравила: {group.get('rules', '')}\n"
+        f"Настройки агента: цензор={'вкл' if group.get('censor_enabled') else 'выкл'}, "
+        f"антиспам={'вкл' if group.get('anti_spam_enabled') else 'выкл'}, автоответы={'вкл' if group.get('ai_enabled') else 'выкл'}.\n"
+        f"Дополнительный промпт администратора: {group.get('custom_prompt', '') if group_has_feature(group, 'group_prompt') else ''}"
     )
     messages = [{"role": "system", "content": group_prompt}]
     for item in group_history[-12:]:
         if item.get("role") in ("user", "assistant"):
             messages.append({"role": item["role"], "content": item.get("content", "")})
-    group_user_prompt = f"{message.from_user.full_name}: {user_text}"
+    group_user_prompt = f"Участник {message.from_user.full_name}: {user_text}"
     group_pending = consume_pending_followup(group, user_text)
     if group_pending:
-        group_user_prompt = (
-            build_followup_instruction(group_pending, user_text, speaker=message.from_user.full_name)
-        )
-        # Keep the speaker attribution, while making the original task and clarification explicit.
+        group_user_prompt = build_followup_instruction(group_pending, user_text, speaker=message.from_user.full_name)
         group_user_prompt = f"Участник {message.from_user.full_name} отвечает в групповом чате.\n{group_user_prompt}"
     messages.append({"role": "user", "content": group_user_prompt})
+
     if (not message.photo and not message.document
             and should_return_literal_text_followup(group_pending, user_text, user)):
-        literal_result = (user_text or "").strip()
+        literal_result = user_text
         group_history.extend([
             {"role": "user", "content": f"{message.from_user.full_name}: {user_text}"},
             {"role": "assistant", "content": literal_result},
@@ -4101,25 +5117,30 @@ async def handle_group_message(message: Message, user: dict):
         group["pending_followup"] = None
         save_data()
         return await send_smart_ai_response(message, literal_result)
+
     est_in, est_out = estimate_chunked_cost_tokens(messages, group_user_prompt)
     affordable, reason = can_afford_request(user, est_in, est_out)
     if not affordable and uid != ADMIN_ID:
         return await message.reply(f"⚠️ {html.escape(reason)}", parse_mode="HTML")
     group_reserved_cost = reserve_request_cost(user, est_in, est_out)
     save_data()
-    status = await message.reply("🤖 Думаю...")
+    status = await message.reply(f"{html.escape(nickname)} думает…")
     try:
-        response, _ = await create_chat_completion_with_chunking(
-            user.get("current_model", DEFAULT_MODEL), messages, group_user_prompt
-        )
+        selected_model = group.get("model") if group_has_feature(group, "group_model") else None
+        selected_model = selected_model if selected_model in models_db else user.get("current_model", DEFAULT_MODEL)
+        response, _ = await create_chat_completion_with_chunking(selected_model, messages, group_user_prompt)
         answer = (response.choices[0].message.content or "").strip()
         if not answer:
             answer = "Не получилось сформировать ответ. Попробуйте переформулировать запрос."
         group_history.extend([
             {"role": "user", "content": f"{message.from_user.full_name}: {user_text}"},
-            {"role": "assistant", "content": answer}
+            {"role": "assistant", "content": answer},
         ])
         group["history"] = group_history[-MAX_GROUP_HISTORY:]
+        if group_has_feature(group, "history") and group.get("history_enabled"):
+            archive = group.setdefault("chat_archive", [])
+            archive.append({"user_id": 0, "name": nickname, "text": answer[:1200], "timestamp": datetime.now().isoformat(timespec="seconds")})
+            del archive[:-MAX_GROUP_ARCHIVE]
         task_for_followup = group_pending.get("task", user_text) if group_pending else user_text
         update_pending_followup(group, task_for_followup, answer)
         usage = getattr(response, "usage", None)
@@ -4127,11 +5148,12 @@ async def handle_group_message(message: Message, user: dict):
         output_used = int(getattr(usage, "completion_tokens", 0) or estimate_request_tokens(answer))
         record_ai_usage(user, input_used, output_used, reserved_cost_rub=group_reserved_cost)
         save_data()
-        await status.delete()
+        try:
+            await status.delete()
+        except Exception:
+            pass
         await send_smart_ai_response(message, answer, programming=user.get("programming_mode") == "general")
     except Exception as exc:
-        # ВОЗВРАТ ЗАРЕЗЕРВИРОВАННЫХ СРЕДСТВ ПРИ ОШИБКЕ ИИ В ГРУППЕ.
-        record_ai_usage(user, 0, 0, 0.0, reserved_cost_rub=group_reserved_cost)
         try:
             await status.edit_text(f"❌ Ошибка ИИ: {html.escape(str(exc)[:300])}", parse_mode="HTML")
         except Exception:
@@ -4201,8 +5223,7 @@ async def handle_all_messages(message: Message):
                 if model_answer:
                     confirmation = model_answer
             except Exception as exc:
-                # ВОЗВРАТ ЗАРЕЗЕРВИРОВАННЫХ СРЕДСТВ ПРИ ОШИБКЕ ПОДТВЕРЖДЕНИЯ НАСТРОЙКИ.
-                record_ai_usage(u, 0, 0, 0.0, reserved_cost_rub=reserved)
+                # При сетевом таймауте оставляем резерв: провайдер мог принять запрос.
                 confirmation += f"\nИИ не подтвердил изменение: {str(exc)[:180]}"
         else:
             confirmation += f"\nЗапрос к ИИ пропущен из-за лимита расходов: {budget_error}"
@@ -4428,9 +5449,9 @@ async def handle_all_messages(message: Message):
             remember_spy_answer(message, ans)
             return await send_smart_ai_response(message, ans, programming=u.get("programming_mode") == "general")
         except Exception as e:
-            # ВОЗВРАТ ЗАРЕЗЕРВИРОВАННЫХ СРЕДСТВ ПРИ ОШИБКЕ АНАЛИЗА ИЗОБРАЖЕНИЯ.
+            # При ошибке провайдера сохраняем диагностику в лог. Квота и бюджет
+            # не возвращаются автоматически: неизвестно, принял ли API изображение.
             print(f"[VISION ERROR] uid={uid}: {type(e).__name__}: {e}")
-            record_ai_usage(u, 0, 0, 0.0, reserved_cost_rub=vision_reserved_cost)
             save_data()
             return await wait_msg.edit_text(f"❌ Не удалось проанализировать изображение: {html.escape(str(e)[:700])}")
 
@@ -4567,11 +5588,6 @@ async def handle_all_messages(message: Message):
         await send_smart_ai_response(message, clean_reply, programming=u.get("programming_mode") == "general")
 
     except Exception as e:
-        # ВОЗВРАТ ЗАРЕЗЕРВИРОВАННЫХ СРЕДСТВ ПРИ ОШИБКЕ ОСНОВНОГО AI-ЗАПРОСА.
-        # Это ключевое исправление: без него у Pro/Max-пользователя навсегда
-        # "замораживается" часть месячного бюджета при каждом сбое/таймауте API.
-        record_ai_usage(u, 0, 0, 0.0, reserved_cost_rub=text_reserved_cost)
-        save_data()
         try:
             await wait_msg.edit_text(f"❌ Ошибка при обращении к ИИ: {e}")
         except Exception:
@@ -4583,8 +5599,10 @@ async def handle_all_messages(message: Message):
 # =========================================================================
 async def main():
     mcp_runner = None
+    smalltalk_task = None
     try:
         load_data()
+        smalltalk_task = asyncio.create_task(group_smalltalk_loop())
         mcp_runner = await start_mcp_http_server()
 
         # Для polling удаляем webhook, но НЕ удаляем ожидающие обновления.
@@ -4595,6 +5613,12 @@ async def main():
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         print("⏳ Сохранение данных и остановка сервисов...")
+        if smalltalk_task is not None:
+            smalltalk_task.cancel()
+            try:
+                await smalltalk_task
+            except asyncio.CancelledError:
+                pass
         try:
             save_data()
         finally:

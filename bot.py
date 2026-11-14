@@ -1109,6 +1109,7 @@ ROBLOX_MCP_SYSTEM_PROMPT = """
 
 ДОСТУПНЫЕ ИНСТРУМЕНТЫ (MCP TOOLS):
 1. `get_explorer_tree` — посмотреть объекты в игре.
+
    Аргументы: `{"path": "game" | "Workspace" | "ServerScriptService" | ..., "depth": 2}`
 2. `read_script` — прочитать исходный код скрипта.
    Аргументы: `{"path": "ServerScriptService.MainScript"}`
@@ -1127,8 +1128,11 @@ ROBLOX_MCP_SYSTEM_PROMPT = """
 
 ПРАВИЛА РАБОТЫ В ROBLOX STUDIO:
 - Когда ты выводишь `<mcp_call>...</mcp_call>`, система выполнит эти команды в Roblox Studio игрока и вернет тебе результат выполнения.
+
 - После получения результата ты можешь вызвать следующие инструменты (если нужно) или написать финальный отчет пользователю о том, что ты создал/изменил на его плейсе.
+
 - Если при выполнении `run_luau_code` возникла ошибка, исправь код и вызови инструмент повторно.
+
 """
 
 MCP_CALL_RE = re.compile(r"<mcp_call>\s*(\{.*?\})\s*</mcp_call>", re.DOTALL)
@@ -2866,8 +2870,10 @@ async def run_image_generation(message: Message, uid: int, prompt: str):
         u["tokens"] = int(u.get("tokens", 0)) + 1000
         save_data()
     except Exception as e:
-        # Квота и резерв стоимости сохраняются: провайдер мог принять запрос,
-        # даже если соединение оборвалось до получения ответа.
+        # ВОЗВРАТ ЗАРЕЗЕРВИРОВАННЫХ СРЕДСТВ ПРИ ОШИБКЕ/ТАЙМАУТЕ ГЕНЕРАЦИИ.
+        # Деньги были отложены заранее (см. reserve_request_cost выше); если запрос
+        # не завершился успехом, списание отменяется, чтобы не морозить бюджет навсегда.
+        record_ai_usage(u, 0, 0, 0.0, reserved_cost_rub=_generation_reserved_cost)
         save_data()
         await wait_msg.edit_text(f"❌ Ошибка или таймаут генерации изображения ({bot_config['photo_model']}): {html.escape(str(e)[:400])}", parse_mode="HTML")
 
@@ -4124,6 +4130,8 @@ async def handle_group_message(message: Message, user: dict):
         await status.delete()
         await send_smart_ai_response(message, answer, programming=user.get("programming_mode") == "general")
     except Exception as exc:
+        # ВОЗВРАТ ЗАРЕЗЕРВИРОВАННЫХ СРЕДСТВ ПРИ ОШИБКЕ ИИ В ГРУППЕ.
+        record_ai_usage(user, 0, 0, 0.0, reserved_cost_rub=group_reserved_cost)
         try:
             await status.edit_text(f"❌ Ошибка ИИ: {html.escape(str(exc)[:300])}", parse_mode="HTML")
         except Exception:
@@ -4193,7 +4201,8 @@ async def handle_all_messages(message: Message):
                 if model_answer:
                     confirmation = model_answer
             except Exception as exc:
-                # При сетевом таймауте оставляем резерв: провайдер мог принять запрос.
+                # ВОЗВРАТ ЗАРЕЗЕРВИРОВАННЫХ СРЕДСТВ ПРИ ОШИБКЕ ПОДТВЕРЖДЕНИЯ НАСТРОЙКИ.
+                record_ai_usage(u, 0, 0, 0.0, reserved_cost_rub=reserved)
                 confirmation += f"\nИИ не подтвердил изменение: {str(exc)[:180]}"
         else:
             confirmation += f"\nЗапрос к ИИ пропущен из-за лимита расходов: {budget_error}"
@@ -4419,9 +4428,9 @@ async def handle_all_messages(message: Message):
             remember_spy_answer(message, ans)
             return await send_smart_ai_response(message, ans, programming=u.get("programming_mode") == "general")
         except Exception as e:
-            # При ошибке провайдера сохраняем диагностику в лог. Квота и бюджет
-            # не возвращаются автоматически: неизвестно, принял ли API изображение.
+            # ВОЗВРАТ ЗАРЕЗЕРВИРОВАННЫХ СРЕДСТВ ПРИ ОШИБКЕ АНАЛИЗА ИЗОБРАЖЕНИЯ.
             print(f"[VISION ERROR] uid={uid}: {type(e).__name__}: {e}")
+            record_ai_usage(u, 0, 0, 0.0, reserved_cost_rub=vision_reserved_cost)
             save_data()
             return await wait_msg.edit_text(f"❌ Не удалось проанализировать изображение: {html.escape(str(e)[:700])}")
 
@@ -4558,6 +4567,11 @@ async def handle_all_messages(message: Message):
         await send_smart_ai_response(message, clean_reply, programming=u.get("programming_mode") == "general")
 
     except Exception as e:
+        # ВОЗВРАТ ЗАРЕЗЕРВИРОВАННЫХ СРЕДСТВ ПРИ ОШИБКЕ ОСНОВНОГО AI-ЗАПРОСА.
+        # Это ключевое исправление: без него у Pro/Max-пользователя навсегда
+        # "замораживается" часть месячного бюджета при каждом сбое/таймауте API.
+        record_ai_usage(u, 0, 0, 0.0, reserved_cost_rub=text_reserved_cost)
+        save_data()
         try:
             await wait_msg.edit_text(f"❌ Ошибка при обращении к ИИ: {e}")
         except Exception:

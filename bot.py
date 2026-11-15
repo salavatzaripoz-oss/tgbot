@@ -21,7 +21,8 @@ from aiogram.enums import ChatAction
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton,
-    CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile, TelegramObject, ChatPermissions
+    CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile, TelegramObject, ChatPermissions,
+    ChatMemberUpdated
 )
 from types import SimpleNamespace
 from openai import AsyncOpenAI
@@ -1272,24 +1273,92 @@ dp.message.outer_middleware(SpyMessagesMiddleware())
 
 
 # --- ВЫЗОВ ТЕКСТОВОГО ИИ ---
+def _api_error_payload_text(exc: Exception) -> str:
+    """Извлекает ответ API без заголовков авторизации и секретов."""
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        try:
+            return json.dumps(body, ensure_ascii=False)[:1200]
+        except Exception:
+            return str(body)[:1200]
+    return str(exc)[:1200]
+
+
+def _is_ai_route_error(exc: Exception) -> bool:
+    if getattr(exc, "status_code", None) not in (404, 405):
+        return False
+    payload = _api_error_payload_text(exc).casefold()
+    model_markers = (
+        "model_not_found", "model not found", "unknown model", "invalid model",
+        "model does not exist", "no such model", "model is unavailable",
+    )
+    return not any(marker in payload for marker in model_markers)
+
+
+def _is_ai_model_error(exc: Exception) -> bool:
+    if getattr(exc, "status_code", None) not in (400, 404, 422):
+        return False
+    payload = _api_error_payload_text(exc).casefold()
+    return any(marker in payload for marker in (
+        "model_not_found", "model not found", "unknown model", "invalid model",
+        "model does not exist", "no such model", "model is unavailable",
+    ))
+
+
+def format_ai_api_error(exc: Exception, model_id: str | None = None) -> str:
+    status = getattr(exc, "status_code", None)
+    detail = _api_error_payload_text(exc)
+    if status in (404, 405) and _is_ai_route_error(exc):
+        attempted = ", ".join(AI_URL_VARIANTS)
+        model_part = f"\nМодель: {model_id}" if model_id else ""
+        return (
+            f"HTTP {status}: AI API не нашёл маршрут Chat Completions.\n"
+            f"AI_BASE_URL: {AI_BASE_URL}\nПроверенные base URL: {attempted}\n"
+            "Ожидаемый OpenAI-compatible путь: POST <base_url>/chat/completions."
+            f"{model_part}\nОтвет провайдера: {detail}\n\n"
+            "Проверьте в панели провайдера именно Base URL для OpenAI-compatible API. "
+            "Не добавляйте /chat/completions в AI_BASE_URL, если SDK сам формирует этот путь. "
+            "Адрес провайдера не заменён автоматически: без подтверждённой документации "
+            "нельзя безопасно подставить другой домен или маршрут."
+        )
+    prefix = f"HTTP {status}: " if status else ""
+    model_part = f" (модель {model_id})" if model_id else ""
+    return f"{prefix}ошибка AI API{model_part}: {detail}"
+
+
 async def create_chat_completion(**kwargs):
-    last_err = None
+    """Пробует настроенные base URL; модель переключает только при model error."""
+    errors = []
     for client in ai_clients:
         try:
             return await client.chat.completions.create(**kwargs)
-        except Exception as e:
-            last_err = e
+        except Exception as exc:
+            errors.append(exc)
 
-    req_model = kwargs.get("model")
-    if req_model and req_model != DEFAULT_MODEL:
-        kwargs["model"] = DEFAULT_MODEL
+    requested_model = kwargs.get("model")
+    if errors and all(_is_ai_route_error(exc) for exc in errors):
+        raise RuntimeError(format_ai_api_error(errors[-1], requested_model)) from errors[-1]
+
+    # Если хотя бы один маршрут дошёл до проверки модели и получил model error,
+    # пробуем резервную модель. Ошибки маршрута и авторизации не маскируются.
+    if (requested_model and requested_model != DEFAULT_MODEL
+            and any(_is_ai_model_error(exc) for exc in errors)):
+        fallback_kwargs = dict(kwargs)
+        fallback_kwargs["model"] = DEFAULT_MODEL
+        fallback_errors = []
         for client in ai_clients:
             try:
-                return await client.chat.completions.create(**kwargs)
-            except Exception as e:
-                last_err = e
+                return await client.chat.completions.create(**fallback_kwargs)
+            except Exception as exc:
+                fallback_errors.append(exc)
+        if fallback_errors and all(_is_ai_route_error(exc) for exc in fallback_errors):
+            raise RuntimeError(format_ai_api_error(fallback_errors[-1], DEFAULT_MODEL)) from fallback_errors[-1]
+        if fallback_errors:
+            errors = fallback_errors
 
-    raise last_err
+    if errors:
+        raise RuntimeError(format_ai_api_error(errors[-1], requested_model)) from errors[-1]
+    raise RuntimeError("AI API не вернул ответ и не предоставил описание ошибки.")
 
 
 # --- РАСПОЗНАВАНИЕ ИЗОБРАЖЕНИЙ (VISION) ---
@@ -4032,6 +4101,230 @@ async def bot_can_moderate(chat_id: int) -> bool:
         return False
 
 
+async def get_group_bot_rights(chat_id: int) -> dict:
+    """Проверяет реальные права бота в группе, не предполагая их наличие."""
+    result = {
+        "status": "unknown", "is_admin": False,
+        "can_delete_messages": False, "can_restrict_members": False,
+        "can_manage_chat": False,
+    }
+    try:
+        me = await bot.get_me()
+        member = await bot.get_chat_member(chat_id, me.id)
+        raw_status = getattr(member, "status", "unknown")
+        status = str(getattr(raw_status, "value", raw_status))
+        result["status"] = status
+        result["is_admin"] = status in ("administrator", "creator")
+        if status == "creator":
+            result["can_delete_messages"] = True
+            result["can_restrict_members"] = True
+            result["can_manage_chat"] = True
+        else:
+            for key in ("can_delete_messages", "can_restrict_members", "can_manage_chat"):
+                result[key] = bool(getattr(member, key, False))
+    except Exception as exc:
+        result["error"] = str(exc)[:180]
+    return result
+
+
+def get_group_menu_keyboard(chat_id: int, group: dict) -> InlineKeyboardMarkup:
+    """Интерактивные переключатели; права и тариф повторно проверяются в callback."""
+    controls = [
+        ("ai", "Автоответы", "ai_enabled", None),
+        ("agent", "Режим агента", "agent_enabled", None),
+        ("censor", "Цензор", "censor_enabled", "censor"),
+        ("activity", "Активность", "activity_enabled", "activity"),
+        ("antispam", "Антиспам", "anti_spam_enabled", "anti_spam"),
+        ("antiwave", "Анти-волна", "anti_wave_enabled", "anti_wave"),
+        ("smalltalk", "Авторазговоры", "smalltalk_enabled", "smalltalk"),
+        ("history", "Архив", "history_enabled", "history"),
+        ("roles", "Внутренние роли", "roles_enabled", "premium_roles"),
+        ("images", "Генерация фото", "group_images_enabled", "group_images"),
+    ]
+    rows = []
+    for index in range(0, len(controls), 2):
+        row = []
+        for action, label, field, feature in controls[index:index + 2]:
+            enabled = bool(group.get(field))
+            available = feature is None or group_has_feature(group, feature)
+            state = ("🟢" if enabled else "⚪") if available else "🔒"
+            row.append(InlineKeyboardButton(
+                text=f"{state} {label}",
+                callback_data=f"gmenu|{chat_id}|{action}",
+            ))
+        rows.append(row)
+    rows.extend([
+        [InlineKeyboardButton(text="🔄 Обновить статус", callback_data=f"gmenu|{chat_id}|refresh")],
+        [InlineKeyboardButton(text="📖 Инструкция", callback_data=f"gmenu|{chat_id}|help"),
+         InlineKeyboardButton(text="💳 Тарифы", callback_data=f"gmenu|{chat_id}|plans")],
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def render_group_menu_text(chat_id: int, group: dict) -> str:
+    rights = await get_group_bot_rights(chat_id)
+    if rights["is_admin"]:
+        visibility = "🟢 Бот — администратор; Telegram передаёт ему обычные сообщения группы."
+    else:
+        visibility = (
+            "🟠 Бот не администратор. При включённом Privacy Mode он обычно видит только команды, "
+            "упоминания и ответы на свои сообщения. Для полного наблюдения назначьте его администратором "
+            "или отключите Group Privacy Mode в BotFather."
+        )
+    delete_status = "🟢" if rights["can_delete_messages"] else "🔴"
+    restrict_status = "🟢" if rights["can_restrict_members"] else "🔴"
+    return (
+        f"⚙️ <b>Управление группой: {html.escape(str(group.get('title', 'Группа'))[:100])}</b>\n"
+        f"{group_plan_status_text(group)}\n\n"
+        f"<b>Доступ бота</b>\n{visibility}\n"
+        f"Удаление чужих сообщений: {delete_status}\n"
+        f"Ограничение/бан участников: {restrict_status}\n\n"
+        "Нажмите переключатель ниже. Менять настройки могут только Telegram-администраторы группы. "
+        "Платные функции отмечены замком, пока тариф их не включает."
+    )
+
+
+async def send_group_onboarding(chat_id: int, title: str = "Группа", added_by: int | None = None) -> None:
+    group = get_group(chat_id, title or "Группа")
+    if added_by and not group.get("owner_id") and await is_group_admin(chat_id, added_by):
+        group["owner_id"] = added_by
+        save_data()
+    rights = await get_group_bot_rights(chat_id)
+    if rights["is_admin"]:
+        intro = (
+            "🟢 Я назначен администратором. Теперь могу получать обычные сообщения группы; "
+            "для автоматического удаления и модерации проверьте права ниже."
+        )
+    else:
+        intro = (
+            "🟠 Сейчас я не администратор. Чтобы я мог полноценно следить за чатом и выполнять "
+            "модерацию, администратор группы должен вручную назначить меня администратором. "
+            "Самостоятельно выдать себе права я не могу."
+        )
+    delete_line = "✅ Удалять сообщения" if rights["can_delete_messages"] else "❌ Не выдано: удалять сообщения"
+    restrict_line = "✅ Ограничивать и блокировать участников" if rights["can_restrict_members"] else "❌ Не выдано: ограничивать/блокировать участников"
+    text_message = (
+        f"👋 <b>ШколоAI подключён к группе «{html.escape(str(title or 'Группа')[:100])}»!</b>\n\n"
+        f"{intro}\n\n"
+        "<b>Рекомендуемые права администратора:</b>\n"
+        "• Удаление сообщений — для цензора и антиспама.\n"
+        "• Ограничение участников — для mute, ban и автоматических санкций.\n\n"
+        f"<b>Текущие права:</b>\n{delete_line}\n{restrict_line}\n\n"
+        "Откройте меню, чтобы включить нужные функции. По умолчанию архив переписки выключен. "
+        "Помощь: /grouphelp или +кмд. Управление: /groupmenu."
+    )
+    await bot.send_message(
+        chat_id, text_message,
+        reply_markup=get_group_menu_keyboard(chat_id, group),
+        parse_mode="HTML",
+    )
+
+
+@dp.my_chat_member()
+async def handle_group_bot_membership(event: ChatMemberUpdated):
+    """Показывает onboarding при добавлении бота и повторно — после повышения прав."""
+    if event.chat.type not in ("group", "supergroup"):
+        return
+    raw_status = getattr(event.new_chat_member, "status", "")
+    status = str(getattr(raw_status, "value", raw_status))
+    if status not in ("member", "administrator", "restricted"):
+        return
+    group = get_group(event.chat.id, event.chat.title or "Группа")
+    actor_id = event.from_user.id if event.from_user else None
+    try:
+        await send_group_onboarding(event.chat.id, event.chat.title or "Группа", actor_id)
+    except Exception as exc:
+        print(f"[GROUP ONBOARDING] chat={event.chat.id}: {type(exc).__name__}: {exc}")
+
+
+@dp.callback_query(F.data.startswith("gmenu|"))
+async def cb_group_menu(callback: CallbackQuery):
+    try:
+        _, chat_text, action = callback.data.split("|", 2)
+        chat_id = int(chat_text)
+    except Exception:
+        return await callback.answer("Некорректная кнопка меню.", show_alert=True)
+    if not callback.message or callback.message.chat.id != chat_id:
+        return await callback.answer("Это меню относится к другой группе.", show_alert=True)
+    group = get_group(chat_id, callback.message.chat.title or "Группа")
+    if action == "help":
+        await callback.answer()
+        return await callback.message.reply(GROUP_HELP_TEXT, parse_mode="HTML")
+    if action == "plans":
+        if not await is_group_admin(chat_id, callback.from_user.id):
+            return await callback.answer("Тарифы группы может запрашивать её администратор.", show_alert=True)
+        await callback.answer()
+        return await send_group_plan_request(callback.message)
+    if action != "refresh":
+        if not await is_group_admin(chat_id, callback.from_user.id):
+            return await callback.answer("Изменять настройки может только администратор группы.", show_alert=True)
+        controls = {
+            "ai": ("ai_enabled", None), "agent": ("agent_enabled", None),
+            "censor": ("censor_enabled", "censor"), "activity": ("activity_enabled", "activity"),
+            "antispam": ("anti_spam_enabled", "anti_spam"), "antiwave": ("anti_wave_enabled", "anti_wave"),
+            "smalltalk": ("smalltalk_enabled", "smalltalk"), "history": ("history_enabled", "history"),
+            "roles": ("roles_enabled", "premium_roles"), "images": ("group_images_enabled", "group_images"),
+        }
+        if action not in controls:
+            return await callback.answer("Неизвестная настройка.", show_alert=True)
+        field, feature = controls[action]
+        new_value = not bool(group.get(field))
+        if new_value and feature and not group_has_feature(group, feature):
+            return await callback.answer("Функция доступна на платном тарифе. Откройте /groupsub.", show_alert=True)
+        group[field] = new_value
+        save_data()
+        await callback.answer("Включено." if new_value else "Выключено.")
+    else:
+        await callback.answer("Статус обновлён.")
+    try:
+        await callback.message.edit_text(
+            await render_group_menu_text(chat_id, group),
+            reply_markup=get_group_menu_keyboard(chat_id, group),
+            parse_mode="HTML",
+        )
+    except Exception:
+        await callback.message.answer(
+            await render_group_menu_text(chat_id, group),
+            reply_markup=get_group_menu_keyboard(chat_id, group),
+            parse_mode="HTML",
+        )
+
+
+GROUP_HELP_TEXT = (
+    "👥 <b>Команды группового агента ШколоAI</b>\n\n"
+    "<b>Начало работы</b>\n"
+    "/groupmenu — интерактивные переключатели.\n"
+    "/grouphelp, /help, +кмд, +help — инструкция.\n"
+    "/groupplan — текущий тариф и состояние функций.\n"
+    "/groupsub — тарифы и заявка на подключение.\n"
+    "/nickname имя — изменить кличку агента (администратор).\n"
+    "/agent_on/off — включить или выключить агент.\n"
+    "/ai_on/off — включить или выключить автоответы на сообщения группы.\n"
+    "/ai текст — задать вопрос ИИ; также можно ответить на сообщение бота или обратиться по его кличке.\n\n"
+    "<b>Фильтры и активность</b>\n"
+    "/censor_on/off, /censor_add слово, /censor_remove слово, /censor_list.\n"
+    "/activity_on/off, /antispam_on/off, /antiwave_on/off.\n"
+    "/smalltalk_on/off — автоматические темы при долгом затишье.\n"
+    "/topic, /joke, /roll [грани], /coin — команды для общения.\n\n"
+    "<b>Участники и история</b>\n"
+    "/usercard — карточка участника (ответом на его сообщение).\n"
+    "/groupstats — статистика; /rules — правила; /setrules текст — установить правила.\n"
+    "/history_on/off, /chathistory [количество], /userhistory, /history_clear.\n"
+    "/roles, /role_create, /role_set, /role_remove — внутренняя иерархия тарифа «Суд».\n\n"
+    "<b>Модерация</b>\n"
+    "/warn, /warnings, /unwarn, /clearwarns, /mute, /unmute, /ban, /unban, /kick, /tempban, /purge.\n"
+    "Можно ответить на сообщение фразой «предупреди», «замути на 10 минут», «забань» или «кикни». "
+    "Проверяются права Telegram и иерархия внутренних ролей; администраторов группы агент не наказывает.\n\n"
+    "<b>Функции тарифа «Суд»</b>\n"
+    "/groupmodels, /groupmodel ID — модель группы.\n"
+    "/gprompt текст — инструкции агенту; /gprompt reset — сбросить.\n"
+    "/groupimages_on/off, /groupimage описание — генерация изображения.\n\n"
+    "Команды можно писать и с префиксом <code>+</code>, например <code>+ai привет</code>, <code>+groupmenu</code>. "
+    "Настройки меняют администраторы группы. Внутренние роли не являются Telegram-админкой. "
+    "Архив чата выключен по умолчанию и доступен только на соответствующем тарифе."
+)
+
+
 def group_target_id(message: Message, args: list[str], command_name: str = "") -> int | None:
     if message.reply_to_message and message.reply_to_message.from_user:
         return message.reply_to_message.from_user.id
@@ -4251,7 +4544,9 @@ async def group_smalltalk_loop() -> None:
         now = time.time()
         for key, group in list(groups_db.items()):
             try:
-                if not group_has_feature(group, "smalltalk") or not group.get("smalltalk_enabled"):
+                if (not group.get("agent_enabled")
+                        or not group_has_feature(group, "smalltalk")
+                        or not group.get("smalltalk_enabled")):
                     continue
                 last_activity = float(group.get("last_message_ts", now) or now)
                 last_auto = float(group.get("last_smalltalk_ts", 0) or 0)
@@ -4402,13 +4697,17 @@ async def cmd_grant_group_plan(message: Message):
 
 
 async def handle_group_natural_setting(message: Message, group: dict, user_text: str) -> bool:
-    if not group.get("agent_enabled") or len(user_text) > 100 or not message.from_user:
+    if len(user_text) > 140 or not message.from_user:
         return False
 
-    text = re.sub(r"^школоai[,:! ]*", "", user_text.strip().lower())
+    nickname = str(group.get("nickname", "ШколоAI")).strip()
+    text = user_text.strip().casefold()
+    if nickname:
+        text = re.sub(r"^" + re.escape(nickname.casefold()) + r"(?:[,!: ]+|$)", "", text, count=1)
     match = re.fullmatch(
         r"(включи|включить|выключи|выключить)\s+"
-        r"(автоответы|ии|цензор|цензуру|активность|антиспам|анти-спам|антиволну|анти-волну|разговоры|авторазговоры)",
+        r"(автоответы|ии|агента|режим агента|цензор|цензуру|активность|антиспам|анти-спам|"
+        r"антиволну|анти-волну|разговоры|авторазговоры|архив|историю|роли|генерацию изображений)",
         text,
     )
     if match:
@@ -4419,11 +4718,15 @@ async def handle_group_natural_setting(message: Message, group: dict, user_text:
         target = match.group(2)
         mapping = {
             "автоответы": ("ai_enabled", None), "ии": ("ai_enabled", None),
+            "агента": ("agent_enabled", None), "режим агента": ("agent_enabled", None),
             "цензор": ("censor_enabled", "censor"), "цензуру": ("censor_enabled", "censor"),
             "активность": ("activity_enabled", "activity"),
             "антиспам": ("anti_spam_enabled", "anti_spam"), "анти-спам": ("anti_spam_enabled", "anti_spam"),
             "антиволну": ("anti_wave_enabled", "anti_wave"), "анти-волну": ("anti_wave_enabled", "anti_wave"),
             "разговоры": ("smalltalk_enabled", "smalltalk"), "авторазговоры": ("smalltalk_enabled", "smalltalk"),
+            "архив": ("history_enabled", "history"), "историю": ("history_enabled", "history"),
+            "роли": ("roles_enabled", "premium_roles"),
+            "генерацию изображений": ("group_images_enabled", "group_images"),
         }
         field, feature = mapping[target]
         if enable and feature and not group_has_feature(group, feature):
@@ -4434,11 +4737,14 @@ async def handle_group_natural_setting(message: Message, group: dict, user_text:
         await message.reply(f"✅ {target.capitalize()}: {'включено' if enable else 'выключено'}.")
         return True
 
+    if not group.get("agent_enabled"):
+        return False
+
     # Простые команды модерации естественным языком срабатывают только
     # как ответ на сообщение конкретного участника и после проверки роли.
     action_match = re.fullmatch(
-        r"(предупреди|замути|мут|размуть|размути|забань|бан|кикни|удали)"
-        r"(?:\s+на\s+(\d{1,3})\s*(?:м|мин|минут(?:у|ы)?|д|дн|дней)?)?",
+        r"(предупреди|замути|мут|размуть|размути|забань|бан|кикни)"
+        r"(?:\s+на\s+(\d{1,3})\s*(м|мин|минута|минуты|минут|д|дн|день|дня|дней)?)?",
         text,
     )
     if action_match:
@@ -4447,6 +4753,9 @@ async def handle_group_natural_setting(message: Message, group: dict, user_text:
             return True
         verb = action_match.group(1)
         amount = int(action_match.group(2) or 0)
+        duration_unit = (action_match.group(3) or "").casefold()
+        minute_units = {"м", "мин", "минута", "минуты", "минут"}
+        day_units = {"д", "дн", "день", "дня", "дней"}
         action = "warn" if verb == "предупреди" else "mute" if verb in ("замути", "мут", "размуть", "размути") else "ban" if verb in ("забань", "бан") else "kick"
         if verb in ("размуть", "размути"):
             action = "unmute"
@@ -4463,13 +4772,29 @@ async def handle_group_natural_setting(message: Message, group: dict, user_text:
             count = int(warnings.get(str(target_id), 0) or 0) + 1
             warnings[str(target_id)] = count
             save_data()
+            if count >= 3 and await bot_has_group_permission(message.chat.id, "can_restrict_members"):
+                try:
+                    await bot.restrict_chat_member(
+                        message.chat.id, target_id,
+                        permissions=ChatPermissions(can_send_messages=False),
+                        until_date=datetime.now() + timedelta(minutes=30),
+                    )
+                    await message.reply(f"⚠️ Предупреждение {count}/3. Участник временно ограничен на 30 минут.")
+                    return True
+                except Exception as exc:
+                    await message.reply(
+                        f"⚠️ Предупреждение {count}/3 выдано, но ограничение не удалось: {html.escape(str(exc)[:160])}",
+                        parse_mode="HTML",
+                    )
+                    return True
             await message.reply(f"⚠️ Предупреждение выдано: {count}/3.")
             return True
         if not await bot_has_group_permission(message.chat.id, "can_restrict_members"):
             await message.reply("⚠️ Для этого действия боту нужно право «Ограничивать участников» или «Блокировать участников».")
             return True
         if action == "mute":
-            minutes = max(1, min(10080, amount or 10))
+            minutes = (amount * 1440) if amount and duration_unit in day_units else (amount or 10)
+            minutes = max(1, min(10080, minutes))
             await bot.restrict_chat_member(
                 message.chat.id, target_id,
                 permissions=ChatPermissions(can_send_messages=False),
@@ -4491,6 +4816,9 @@ async def handle_group_natural_setting(message: Message, group: dict, user_text:
             await message.reply("⚠️ Боту нужно право «Блокировать участников».")
             return True
         if action == "ban":
+            if amount and duration_unit in minute_units:
+                await message.reply("Для временного бана укажите срок в днях: «забань на 3 дня». Для минут используйте мут.")
+                return True
             days = max(1, min(366, amount or 0)) if amount else None
             until = datetime.now() + timedelta(days=days) if days else None
             await bot.ban_chat_member(message.chat.id, target_id, until_date=until)
@@ -4553,35 +4881,67 @@ async def handle_group_message(message: Message, user: dict):
     user_text = (message.text or message.caption or "").strip()
 
     if message.new_chat_members:
-        names = ", ".join(html.escape(member.full_name) for member in message.new_chat_members[:8])
+        try:
+            current_bot = await bot.get_me()
+            welcomed_members = [member for member in message.new_chat_members if member.id != current_bot.id]
+        except Exception:
+            welcomed_members = list(message.new_chat_members)
+        if welcomed_members:
+            names = ", ".join(html.escape(member.full_name) for member in welcomed_members[:8])
+            save_data()
+            return await message.answer(
+                f"👋 Добро пожаловать, {names}! Я {html.escape(str(group.get('nickname', 'ШколоAI')))}. "
+                "Напишите /grouphelp или +кмд, чтобы увидеть команды."
+            )
         save_data()
-        return await message.answer(
-            f"👋 Добро пожаловать, {names}! Я {html.escape(str(group.get('nickname', 'ШколоAI')))}. "
-            "Напишите /grouphelp, чтобы увидеть команды."
-        )
+        return
 
-    command = (message.text or "").split(maxsplit=1)
+    raw_command_text = (message.text or "").strip()
+    command_text = raw_command_text
+    if raw_command_text.startswith("+"):
+        plus_head, separator, plus_tail = raw_command_text.partition(" ")
+        aliases = {
+            "+кмд": "grouphelp", "+помощь": "grouphelp", "+help": "grouphelp",
+            "+commands": "grouphelp", "+команды": "grouphelp", "+инструкция": "grouphelp",
+            "+menu": "groupmenu", "+меню": "groupmenu",
+        }
+        alias = aliases.get(plus_head.casefold(), plus_head[1:])
+        if alias:
+            command_text = "/" + alias + (separator + plus_tail if separator else "")
+    command = command_text.split(maxsplit=1)
     head = command[0].split("@")[0].lower() if command else ""
     args = command[1].split() if len(command) > 1 else []
 
-    # Простые просьбы администратора об изменении настроек исполняются без API-вызова.
+    help_probe = user_text.casefold().strip()
+    if help_probe:
+        nickname_probe = str(group.get("nickname", "ШколоAI")).strip().casefold()
+        if nickname_probe:
+            help_probe = re.sub(r"^" + re.escape(nickname_probe) + r"(?:[,!: ]+|$)", "", help_probe, count=1)
+        if re.fullmatch(
+            r"(помощь|help|команды|список команд|инструкция|как пользоваться|как тебя использовать|"
+            r"что умеешь|что ты умеешь|покажи команды|покажи инструкцию)[?! .]*",
+            help_probe,
+        ):
+            return await message.reply(
+                GROUP_HELP_TEXT,
+                reply_markup=get_group_menu_keyboard(chat_id, group),
+                parse_mode="HTML",
+            )
+
     if user_text and await handle_group_natural_setting(message, group, user_text):
         return
 
-    if head in ("/grouphelp", "/helpgroup"):
+    if head in ("/grouphelp", "/helpgroup", "/help", "/commands", "/инструкция", "/помощь", "/кмд"):
         return await message.reply(
-            "👥 <b>Команды группового агента</b>\n"
-            "/ai текст — спросить ИИ; /ai_on и /ai_off — автоответы.\n"
-            "/groupsub — тарифы; /groupplan — состояние подписки.\n"
-            "/censor_on/off — цензор; /censor_add слово, /censor_remove слово, /censor_list.\n"
-            "/activity_on/off — учёт активности; /antispam_on/off — базовая защита; /antiwave_on/off — защита от волн.\n"
-            "/smalltalk_on/off — авторазговоры; /topic и /joke — тема и шутка; /nickname — имя агента.\n"
-            "/usercard — публичная карточка участника. /history_on/off, /chathistory, /userhistory, /history_clear — архив тарифа Суд.\n"
-            "/roles_on/off — внутренняя иерархия; /groupimages_on/off — генерация изображений в группе.\n"
-            "/groupmodel ID, /groupmodels, /gprompt текст, /groupimage запрос — тариф Суд.\n"
-            "/roles, /role_set, /role_create, /role_remove — премиальные роли тарифа Суд.\n"
-            "/rules, /setrules, /groupstats; /warn, /warnings, /unwarn, /clearwarns, /mute, /unmute, /ban, /unban, /kick, /tempban, /purge.\n\n"
-            "Настройки и модерацию могут менять администраторы группы. Права внутренних ролей не дают Telegram-админку и не позволяют управлять администраторами.",
+            GROUP_HELP_TEXT,
+            reply_markup=get_group_menu_keyboard(chat_id, group),
+            parse_mode="HTML",
+        )
+
+    if head in ("/groupmenu", "/menu", "/меню", "/groupsetup"):
+        return await message.reply(
+            await render_group_menu_text(chat_id, group),
+            reply_markup=get_group_menu_keyboard(chat_id, group),
             parse_mode="HTML",
         )
 
@@ -4599,7 +4959,7 @@ async def handle_group_message(message: Message, user: dict):
     if head == "/setrules":
         if not await is_group_admin(chat_id, uid):
             return await message.reply("⛔ Устанавливать правила могут только администраторы группы.")
-        rules = (message.text or "").partition(" ")[2].strip()
+        rules = command_text.partition(" ")[2].strip()
         if not rules:
             return await message.reply("Формат: /setrules текст правил")
         group["rules"] = rules[:3000]
@@ -4642,7 +5002,7 @@ async def handle_group_message(message: Message, user: dict):
         if not await is_group_admin(chat_id, uid):
             return await message.reply("⛔ Список цензора могут менять только администраторы группы.")
         words = group.setdefault("censor_words", [])
-        word = (message.text or "").partition(" ")[2].strip()[:60]
+        word = command_text.partition(" ")[2].strip()[:60]
         if head == "/censor_list":
             listed = ", ".join(html.escape(str(item)) for item in words[:80]) or "Список пока пуст."
             return await message.reply(f"🧹 <b>Слова цензора:</b> {listed}", parse_mode="HTML")
@@ -4663,7 +5023,7 @@ async def handle_group_message(message: Message, user: dict):
     if head == "/nickname":
         if not await is_group_admin(chat_id, uid):
             return await message.reply("⛔ Менять имя агента могут только администраторы.")
-        nickname = (message.text or "").partition(" ")[2].strip()
+        nickname = command_text.partition(" ")[2].strip()
         if not nickname:
             return await message.reply("Формат: /nickname новое имя")
         group["nickname"] = nickname[:32]
@@ -4802,7 +5162,7 @@ async def handle_group_message(message: Message, user: dict):
             return await message.reply("🔕 Система ролей выключена. Включить: /roles_on")
         if not await is_group_admin(chat_id, uid):
             return await message.reply("⛔ Создавать роли могут только Telegram-администраторы группы.")
-        parts = (message.text or "").split(maxsplit=3)
+        parts = command_text.split(maxsplit=3)
         if len(parts) < 4:
             return await message.reply("Формат: /role_create имя ранг права_через_запятую [наследует] — например /role_create helper2 15 warn,mute helper")
         name = parts[1].lower()
@@ -4885,7 +5245,7 @@ async def handle_group_message(message: Message, user: dict):
             return await message.reply(group_feature_denied_text(group, "group_prompt"), parse_mode="HTML")
         if not await is_group_admin(chat_id, uid):
             return await message.reply("⛔ Промпт группы могут менять только администраторы.")
-        prompt = (message.text or "").partition(" ")[2].strip()
+        prompt = command_text.partition(" ")[2].strip()
         if not prompt:
             return await message.reply("Формат: /gprompt инструкции для группового агента. Для сброса: /gprompt reset")
         group["custom_prompt"] = "" if prompt.lower() == "reset" else prompt[:2500]
@@ -4897,7 +5257,7 @@ async def handle_group_message(message: Message, user: dict):
             return await message.reply(group_feature_denied_text(group, "group_images"), parse_mode="HTML")
         if not group.get("group_images_enabled"):
             return await message.reply("🔕 Генерация изображений в группе выключена. Включить: /groupimages_on")
-        prompt = (message.text or "").partition(" ")[2].strip()
+        prompt = command_text.partition(" ")[2].strip()
         if not prompt:
             return await message.reply("Формат: /groupimage описание изображения")
         return await run_group_image_generation(message, group, user, prompt[:1200])
@@ -4908,6 +5268,8 @@ async def handle_group_message(message: Message, user: dict):
             "/ban": "ban", "/unban": "ban", "/tempban": "ban", "/kick": "kick",
             "/mute": "mute", "/unmute": "mute",
         }[head]
+        if head == "/clearwarns" and not await is_group_admin(chat_id, uid):
+            return await message.reply("⛔ Очищать предупреждения всей группы может только Telegram-администратор.")
         if not await group_has_permission(chat_id, group, uid, permission):
             return await message.reply("⛔ Для этой команды нужна подходящая внутренняя роль или статус Telegram-администратора.")
         if head == "/clearwarns":
@@ -5043,7 +5405,8 @@ async def handle_group_message(message: Message, user: dict):
             severe = flood_reason == "обнаружена массовая волна сообщений"
             return await moderate_group_violation(message, group, flood_reason, severe=severe)
 
-    # ИИ отвечает на /ai, упоминание, ответ на своё сообщение или при включённом автоответе.
+    # Агент отвечает на /ai, упоминание, ответ на своё сообщение, обращение по кличке
+    # или на все сообщения при включённом автоответе.
     try:
         bot_me = await bot.get_me()
     except Exception:
@@ -5055,17 +5418,37 @@ async def handle_group_message(message: Message, user: dict):
         message.reply_to_message and message.reply_to_message.from_user and bot_id
         and message.reply_to_message.from_user.id == bot_id
     )
-    explicit_ai = head == "/ai" or mentioned or replied_to_bot
+    nickname = str(group.get("nickname", "ШколоAI")).strip()
+    nickname_match = re.match(
+        r"^" + re.escape(nickname) + r"(?:\s*[,!:]\s*|\s+)(.*)$",
+        user_text,
+        flags=re.IGNORECASE | re.DOTALL,
+    ) if nickname and user_text else None
+    addressed_by_nickname = nickname_match is not None
+    explicit_ai = head == "/ai" or mentioned or replied_to_bot or addressed_by_nickname
+
+    if not group.get("agent_enabled"):
+        save_data()
+        if explicit_ai or group.get("ai_enabled"):
+            return await message.reply(
+                "🔕 Режим агента выключен. Администратор может включить его командой /agent_on или через /groupmenu."
+            )
+        return
+
     if not explicit_ai and not group.get("ai_enabled"):
         save_data()
         return
 
     if head == "/ai":
-        user_text = message.text.partition(" ")[2].strip() if message.text else ""
+        user_text = command_text.partition(" ")[2].strip() if command_text else ""
     elif mentioned and message.text and bot_username:
         user_text = re.sub(r"@" + re.escape(bot_username), "", message.text, flags=re.I).strip()
+    elif addressed_by_nickname and nickname_match:
+        user_text = (nickname_match.group(1) or "").strip()
     if not user_text:
-        return await message.reply("Напишите запрос после /ai или упомяните меня в сообщении.")
+        return await message.reply(
+            "Напишите запрос после /ai, упомяните меня, ответьте на моё сообщение или обратитесь по кличке."
+        )
     if user.get("banned") and uid != ADMIN_ID:
         return
     if not check_censorship_fast(user_text):
@@ -5089,6 +5472,8 @@ async def handle_group_message(message: Message, user: dict):
         "не утверждай, что изменил настройки или применил модерацию, если действие фактически не выполнено. "
         "Не раскрывай личные данные, не делай выводов о личности участников. Помни, что ответ видит вся группа. "
         "Отвечай дружелюбно, иногда уместно шути, но не спамь. При спорной просьбе уточняй детали.\n"
+        "Не выдавай наказания по догадке: санкции выполняются только обработчиками команд и только после проверки роли, "
+        "иерархии и Telegram-прав. Если действие не поддерживается, прямо скажи об этом.\n"
         "Если участник отвечает на уточнение, продолжай контекст. Для кода сохраняй язык и формат запроса.\n"
         f"Название группы: {group.get('title', 'Группа')}.\nПравила: {group.get('rules', '')}\n"
         f"Настройки агента: цензор={'вкл' if group.get('censor_enabled') else 'выкл'}, "

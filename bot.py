@@ -7,6 +7,7 @@ import uuid
 import secrets
 import zipfile
 import base64
+import shutil
 import time
 import asyncio
 import urllib.parse
@@ -67,7 +68,25 @@ if not AI_API_KEY:
 MCP_PORT = int(clean_env("MCP_PORT", clean_env("PORT", "8080")))
 MCP_PUBLIC_URL = clean_env("MCP_PUBLIC_URL", f"http://127.0.0.1:{MCP_PORT}").rstrip("/")
 
-DATA_FILE = "bot_data.json"
+_SCRIPT_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
+_DATA_FILE_SETTING = clean_env("DATA_FILE", "bot_data.json")
+DATA_FILE = (
+    _DATA_FILE_SETTING if os.path.isabs(_DATA_FILE_SETTING)
+    else os.path.join(_SCRIPT_DIRECTORY, _DATA_FILE_SETTING)
+)
+# Если старая версия запускалась из другой рабочей директории, переносим
+# существующую базу в каталог скрипта вместо создания пустой базы.
+if not os.path.exists(DATA_FILE) and not os.path.isabs(_DATA_FILE_SETTING):
+    if os.path.exists(_DATA_FILE_SETTING):
+        try:
+            shutil.copy2(_DATA_FILE_SETTING, DATA_FILE)
+        except OSError as migration_exc:
+            print(f"[DB Recovery] Не удалось перенести старую базу: {migration_exc}")
+DATA_BACKUP_FILE = DATA_FILE + ".bak"
+DATA_SCHEMA_VERSION = 2
+AUTO_MODERATION_MODEL = clean_env("AUTO_MODERATION_MODEL", "gemini-3.5-flash-lite")
+if AUTO_MODERATION_MODEL not in {"gemini-3.5-flash-lite", "deepseek-flash"}:
+    AUTO_MODERATION_MODEL = "gemini-3.5-flash-lite"
 
 # Подписки и контроль расходов. Фактические ставки провайдера задаются через .env.
 PLAN_CONFIG = {
@@ -263,10 +282,18 @@ def save_data():
             "groups_db": groups_db,
             "spy_answers_db": spy_answers_db,
         }
+        payload["schema_version"] = DATA_SCHEMA_VERSION
         with open(temp_file, "w", encoding="utf-8") as file:
             json.dump(payload, file, ensure_ascii=False, indent=2)
             file.flush()
             os.fsync(file.fileno())
+        # Резервная копия предыдущей базы защищает тарифы, лимиты и настройки
+        # от случайной потери основного JSON при обновлении/сбое записи.
+        if os.path.exists(DATA_FILE):
+            try:
+                shutil.copy2(DATA_FILE, DATA_BACKUP_FILE)
+            except OSError as backup_exc:
+                print(f"[DB Warning] Не удалось обновить резервную копию: {backup_exc}")
         os.replace(temp_file, DATA_FILE)
     except Exception as exc:
         print(f"[DB Warning] Ошибка сохранения данных: {exc}")
@@ -290,12 +317,23 @@ def _parse_saved_datetime(value, fallback=None):
 
 def load_data():
     global reviews_db, groups_db, spy_answers_db
-    if not os.path.exists(DATA_FILE):
+    if not os.path.exists(DATA_FILE) and not os.path.exists(DATA_BACKUP_FILE):
         return
 
     try:
-        with open(DATA_FILE, "r", encoding="utf-8") as file:
-            payload = json.load(file)
+        source_path = DATA_FILE
+        if not os.path.exists(source_path) and os.path.exists(DATA_BACKUP_FILE):
+            source_path = DATA_BACKUP_FILE
+            print(f"[DB Recovery] Основная база отсутствует, загружаю резервную копию: {source_path}")
+        try:
+            with open(source_path, "r", encoding="utf-8") as file:
+                payload = json.load(file)
+        except (OSError, json.JSONDecodeError) as primary_exc:
+            if source_path == DATA_BACKUP_FILE or not os.path.exists(DATA_BACKUP_FILE):
+                raise
+            print(f"[DB Recovery] Основная база повреждена ({primary_exc}); пробую резервную копию.")
+            with open(DATA_BACKUP_FILE, "r", encoding="utf-8") as file:
+                payload = json.load(file)
         if not isinstance(payload, dict):
             raise ValueError("Корневой элемент базы должен быть JSON-объектом")
 
@@ -306,8 +344,14 @@ def load_data():
             bot_config["photo_model"] = PHOTO_MODEL
         bot_config.setdefault("spy_mode", False)
         bot_config.setdefault("mcp_public_url", MCP_PUBLIC_URL)
-        bot_config.setdefault("free_limit", 45000)
-        bot_config.setdefault("sub_limit", 1000000)
+        bot_config.setdefault("free_limit", int(clean_env("FREE_LIMIT", "45000")))
+        bot_config.setdefault("sub_limit", int(clean_env("SUB_LIMIT", "1000000")))
+        try:
+            bot_config["free_limit"] = max(0, int(bot_config.get("free_limit", 45000)))
+            bot_config["sub_limit"] = max(0, int(bot_config.get("sub_limit", 1000000)))
+        except (TypeError, ValueError):
+            bot_config["free_limit"] = int(clean_env("FREE_LIMIT", "45000"))
+            bot_config["sub_limit"] = int(clean_env("SUB_LIMIT", "1000000"))
 
         stored_models = payload.get("models_db")
         if isinstance(stored_models, dict):
@@ -378,6 +422,12 @@ def load_data():
                     # Миграция старых аккаунтов Premium в Pro.
                     if user.get("is_sub") and user.get("plan", "free") == "free":
                         user["plan"] = "pro"
+                    # Не теряем тип подписки при миграции старой базы: если старый
+                    # формат содержал is_sub=True, но не содержал plan, это Pro.
+                    saved_plan = str(saved_user.get("plan", "") or "").lower()
+                    if saved_plan not in PLAN_CONFIG and bool(saved_user.get("is_sub")):
+                        user["plan"] = "pro"
+                        user["is_sub"] = True
                     user.setdefault("plan", "pro" if user.get("is_sub") else "free")
                     user.setdefault("plan_cost_rub", 0.0)
                     user.setdefault("api_cost_month_rub", float(user.get("plan_cost_rub", 0.0) or 0.0))
@@ -431,6 +481,12 @@ def load_data():
                     print(f"[DB Warning] Не удалось загрузить пользователя {uid_text}: {user_exc}")
 
         rebuild_rbx_token_index()
+        # Если восстановились из .bak, сначала возвращаем её в основной файл,
+        # чтобы следующий save_data не затёр рабочую копию повреждённым JSON.
+        if source_path == DATA_BACKUP_FILE:
+            shutil.copy2(DATA_BACKUP_FILE, DATA_FILE)
+        # Пересохраняем нормализованную базу после миграции старого формата.
+        save_data()
     except Exception as exc:
         print(f"[DB Warning] Ошибка чтения данных: {exc}")
 
@@ -1916,6 +1972,11 @@ def get_group(chat_id: int, chat_title: str = "") -> dict:
             "owner_id": None,
             "censor_enabled": False,
             "censor_words": [],
+            "auto_moderation_enabled": False,
+            "auto_moderation_rules": "",
+            "auto_moderation_checked": 0,
+            "auto_moderation_removed": 0,
+            "role_wizards": {},
             "activity_enabled": False,
             "anti_spam_enabled": False,
             "anti_wave_enabled": False,
@@ -1955,6 +2016,11 @@ def get_group(chat_id: int, chat_title: str = "") -> dict:
         "owner_id": None,
         "censor_enabled": False,
         "censor_words": [],
+        "auto_moderation_enabled": False,
+        "auto_moderation_rules": "",
+        "auto_moderation_checked": 0,
+        "auto_moderation_removed": 0,
+        "role_wizards": {},
         "activity_enabled": False,
         "anti_spam_enabled": False,
         "anti_wave_enabled": False,
@@ -1987,6 +2053,8 @@ def get_group(chat_id: int, chat_title: str = "") -> dict:
         group["chat_archive"] = []
     if not isinstance(group.get("censor_words"), list):
         group["censor_words"] = []
+    if not isinstance(group.get("role_wizards"), dict):
+        group["role_wizards"] = {}
     if chat_title:
         group["title"] = chat_title
     if group.get("plan") not in GROUP_PLAN_CONFIG:
@@ -4133,6 +4201,7 @@ def get_group_menu_keyboard(chat_id: int, group: dict) -> InlineKeyboardMarkup:
         ("ai", "Автоответы", "ai_enabled", None),
         ("agent", "Режим агента", "agent_enabled", None),
         ("censor", "Цензор", "censor_enabled", "censor"),
+        ("automod", "ИИ-модератор", "auto_moderation_enabled", None),
         ("activity", "Активность", "activity_enabled", "activity"),
         ("antispam", "Антиспам", "anti_spam_enabled", "anti_spam"),
         ("antiwave", "Анти-волна", "anti_wave_enabled", "anti_wave"),
@@ -4175,7 +4244,9 @@ async def render_group_menu_text(chat_id: int, group: dict) -> str:
     restrict_status = "🟢" if rights["can_restrict_members"] else "🔴"
     return (
         f"⚙️ <b>Управление группой: {html.escape(str(group.get('title', 'Группа'))[:100])}</b>\n"
-        f"{group_plan_status_text(group)}\n\n"
+        f"{group_plan_status_text(group)}\n"
+        f"ИИ-модератор: {'🟢 включён' if group.get('auto_moderation_enabled') and group.get('auto_moderation_rules') else '⚪ выключен'}\n"
+        f"Правила ИИ-модератора: {'заданы' if str(group.get('auto_moderation_rules', '')).strip() else 'не заданы'}\n\n"
         f"<b>Доступ бота</b>\n{visibility}\n"
         f"Удаление чужих сообщений: {delete_status}\n"
         f"Ограничение/бан участников: {restrict_status}\n\n"
@@ -4264,11 +4335,14 @@ async def cb_group_menu(callback: CallbackQuery):
             "antispam": ("anti_spam_enabled", "anti_spam"), "antiwave": ("anti_wave_enabled", "anti_wave"),
             "smalltalk": ("smalltalk_enabled", "smalltalk"), "history": ("history_enabled", "history"),
             "roles": ("roles_enabled", "premium_roles"), "images": ("group_images_enabled", "group_images"),
+            "automod": ("auto_moderation_enabled", None),
         }
         if action not in controls:
             return await callback.answer("Неизвестная настройка.", show_alert=True)
         field, feature = controls[action]
         new_value = not bool(group.get(field))
+        if action == "automod" and new_value and not str(group.get("auto_moderation_rules", "")).strip():
+            return await callback.answer("Сначала задайте правила командой /automod_rules текст_правил.", show_alert=True)
         if new_value and feature and not group_has_feature(group, feature):
             return await callback.answer("Функция доступна на платном тарифе. Откройте /groupsub.", show_alert=True)
         group[field] = new_value
@@ -4300,7 +4374,10 @@ GROUP_HELP_TEXT = (
     "/nickname имя — изменить кличку агента (администратор).\n"
     "/agent_on/off — включить или выключить агент.\n"
     "/ai_on/off — включить или выключить автоответы на сообщения группы.\n"
-    "/ai текст — задать вопрос ИИ; также можно ответить на сообщение бота или обратиться по его кличке.\n\n"
+    "/ai текст — задать вопрос ИИ; также можно ответить на сообщение бота или обратиться по его кличке.\n"
+    "/automod_on/off — включить/выключить ИИ-модератора.\n"
+    "/automod_rules текст — задать строгие правила проверки; без правил он не работает.\n"
+    "/automod_status — статус и статистика ИИ-модератора.\n\n"
     "<b>Фильтры и активность</b>\n"
     "/censor_on/off, /censor_add слово, /censor_remove слово, /censor_list.\n"
     "/activity_on/off, /antispam_on/off, /antiwave_on/off.\n"
@@ -4310,7 +4387,7 @@ GROUP_HELP_TEXT = (
     "/usercard — карточка участника (ответом на его сообщение).\n"
     "/groupstats — статистика; /rules — правила; /setrules текст — установить правила.\n"
     "/history_on/off, /chathistory [количество], /userhistory, /history_clear.\n"
-    "/roles, /role_create, /role_set, /role_remove — внутренняя иерархия тарифа «Суд».\n\n"
+    "/roles, /role_create, /role_set, /role_remove — внутренняя иерархия тарифа «Суд». Создание роли проходит пошагово: имя, ранг, права (по умолчанию выключены).\n\n"
     "<b>Модерация</b>\n"
     "/warn, /warnings, /unwarn, /clearwarns, /mute, /unmute, /ban, /unban, /kick, /tempban, /purge.\n"
     "Можно ответить на сообщение фразой «предупреди», «замути на 10 минут», «забань» или «кикни». "
@@ -4339,10 +4416,13 @@ def group_target_id(message: Message, args: list[str], command_name: str = "") -
 
 async def get_group_role_rank(chat_id: int, group: dict, user_id: int) -> int:
     if await is_group_admin(chat_id, user_id):
-        return 1000
+        return 100000
     role_name = str(group.get("user_roles", {}).get(str(user_id), "member")) if group.get("roles_enabled") else "member"
     role = group.get("roles", {}).get(role_name, {})
-    return max(0, min(999, int(role.get("rank", 0) or 0)))
+    try:
+        return max(0, min(99999, int(role.get("rank", 0) or 0)))
+    except (TypeError, ValueError):
+        return 0
 
 
 def get_group_role_permissions(group: dict, role_name: str) -> set[str]:
@@ -4385,6 +4465,271 @@ async def can_group_manage_target(chat_id: int, group: dict, actor_id: int, targ
 
 def _safe_display_name(value: str, limit: int = 60) -> str:
     return html.escape((value or "Участник")[:limit])
+
+
+ROLE_PERMISSION_LABELS = {
+    "warn": "Предупреждать",
+    "mute": "Выдавать мут",
+    "kick": "Кикать",
+    "ban": "Банить",
+    "setrules": "Менять правила",
+    "settings": "Менять настройки",
+    "viewusers": "Смотреть карточки участников",
+    "viewhistory": "Смотреть историю",
+}
+
+
+def role_wizard_keyboard(chat_id: int, user_id: int, wizard: dict) -> InlineKeyboardMarkup:
+    permissions = set(wizard.get("permissions", []))
+    rows = []
+    for perm, label in ROLE_PERMISSION_LABELS.items():
+        mark = "✅" if perm in permissions else "▫️"
+        rows.append([InlineKeyboardButton(
+            text=f"{mark} {label}",
+            callback_data=f"grolewiz|{chat_id}|{user_id}|toggle|{perm}",
+        )])
+    rows.append([
+        InlineKeyboardButton(text="💾 Создать роль", callback_data=f"grolewiz|{chat_id}|{user_id}|save"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data=f"grolewiz|{chat_id}|{user_id}|cancel"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def run_group_auto_moderation(message: Message, group: dict) -> bool:
+    """Удаляет только сообщения, прямо нарушающие заранее заданное правило.
+
+    Модель работает fail-closed: неясный ответ, низкая уверенность или ошибка API
+    никогда не приводят к удалению. Используется только выделенная дешёвая модель,
+    без автоматического fallback на более дорогую модель.
+    """
+    if not group.get("auto_moderation_enabled"):
+        return False
+    rules_text = str(group.get("auto_moderation_rules", "")).strip()
+    message_text = (message.text or message.caption or "").strip()
+    if not rules_text or not message_text or message_text.startswith(("/", "+")):
+        return False
+    if not message.from_user or message.from_user.is_bot:
+        return False
+    # Администраторы группы не подвергаются автоматическому удалению.
+    if await is_group_admin(message.chat.id, message.from_user.id):
+        return False
+
+    rules = [line.strip(" •\t-") for line in rules_text.splitlines() if line.strip(" •\t-")]
+    if not rules:
+        return False
+    numbered_rules = "\n".join(f"{i}. {rule}" for i, rule in enumerate(rules, start=1))
+    system_prompt = (
+        "Ты — узкий классификатор модерации Telegram. Твоя задача — проверить одно сообщение ТОЛЬКО "
+        "по перечисленным администраторами правилам. Не применяй общие моральные, политические, "
+        "религиозные или собственные представления о правде. Не считай мнение, шутку, вопрос, "
+        "сарказм или спорное утверждение нарушением. Нарушение есть только тогда, когда сообщение "
+        "однозначно и прямо противоречит конкретному факту/запрету из заданного правила. Если для "
+        "проверки не хватает контекста или источника, верни violation=false. Не додумывай факты. "
+        "Верни только JSON: {\"violation\":true|false,\"rule_index\":integer|null,"
+        "\"reason\":\"краткое объяснение\",\"confidence\":0.0}. "
+        "Устанавливай violation=true только при confidence >= 0.96."
+    )
+    user_prompt = (
+        "ЗАДАННЫЕ ПРАВИЛА (единственный критерий проверки):\n" + numbered_rules +
+        "\n\nСООБЩЕНИЕ УЧАСТНИКА:\n" + message_text[:2500] +
+        "\n\nПроверь только прямое и однозначное нарушение одного из правил."
+    )
+    model_id = AUTO_MODERATION_MODEL
+    if model_id not in models_db:
+        # Не используем платные/премиальные модели в качестве скрытого fallback.
+        model_id = "gemini-3.5-flash-lite" if "gemini-3.5-flash-lite" in models_db else "deepseek-flash"
+    if not ai_clients or model_id not in models_db:
+        return False
+
+    group["auto_moderation_checked"] = int(group.get("auto_moderation_checked", 0) or 0) + 1
+    try:
+        response = await asyncio.wait_for(
+            ai_clients[0].chat.completions.create(
+                model=model_id,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0,
+                max_tokens=180,
+                stream=False,
+            ),
+            timeout=18.0,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE).strip()
+        match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if not match:
+            return False
+        verdict = json.loads(match.group(0))
+        if not isinstance(verdict, dict) or verdict.get("violation") is not True:
+            return False
+        try:
+            confidence = float(verdict.get("confidence", 0))
+            rule_index = int(verdict.get("rule_index"))
+        except (TypeError, ValueError):
+            return False
+        if confidence < 0.96 or not (1 <= rule_index <= len(rules)):
+            return False
+        matched_rule = rules[rule_index - 1]
+        reason = str(verdict.get("reason", "Нарушено заданное правило."))[:350]
+        chat_id = message.chat.id
+        deleted = False
+        if await bot_has_group_permission(chat_id, "can_delete_messages"):
+            try:
+                await message.delete()
+                deleted = True
+            except Exception as delete_exc:
+                print(f"[AUTO MOD DELETE] chat={chat_id}: {type(delete_exc).__name__}: {delete_exc}")
+        if deleted:
+            group["auto_moderation_removed"] = int(group.get("auto_moderation_removed", 0) or 0) + 1
+        save_data()
+
+        actor = message.from_user
+        name = html.escape(actor.full_name or "Участник")
+        username = f"@{html.escape(actor.username)}" if actor.username else "не указан"
+        original = html.escape(message_text[:1800])
+        action_text = "сообщение удалено" if deleted else "не удалено: у бота нет права удаления сообщений"
+        audit = (
+            "🛡 <b>ИИ-модератор обнаружил нарушение</b>\n"
+            f"👤 Участник: <b>{name}</b> ({username})\n"
+            f"🆔 ID: <code>{actor.id}</code>\n"
+            f"📌 Правило: {html.escape(matched_rule[:700])}\n"
+            f"🔎 Причина: {html.escape(reason)}\n"
+            f"🎯 Уверенность модели: <code>{confidence:.0%}</code>\n"
+            f"⚖️ Мера: <b>{action_text}</b>\n"
+            f"💬 Исходное сообщение:\n<blockquote>{original}</blockquote>"
+        )
+        try:
+            await bot.send_message(chat_id, audit, parse_mode="HTML")
+        except Exception as report_exc:
+            print(f"[AUTO MOD REPORT] chat={chat_id}: {type(report_exc).__name__}: {report_exc}")
+        # Если нарушение подтверждено, не передаём сообщение дальше автоответчику,
+        # даже когда Telegram не позволил удалить его из-за отсутствия прав.
+        return True
+    except Exception as exc:
+        # Ошибка/недоступность дешёвой модели не должна запускать наказание.
+        print(f"[AUTO MOD AI] chat={message.chat.id}: {type(exc).__name__}: {exc}")
+        return False
+
+
+def should_auto_reply_to_group_message(text: str) -> bool:
+    """Автоответы включаются преимущественно на вопросы, а не на каждую реплику."""
+    value = (text or "").strip().lower()
+    if not value or len(value) < 5:
+        return False
+    if "?" in value:
+        return True
+    question_markers = (
+        "кто ", "что ", "где ", "когда ", "почему ", "зачем ", "как ", "сколько ",
+        "какой ", "какая ", "какие ", "какое ", "можно ли", "подскажите", "помогите",
+        "кто-нибудь знает", "есть ли", "не знаете ли", "как думаете",
+    )
+    return any(marker in value for marker in question_markers)
+
+
+async def start_role_creation_wizard(message: Message, group: dict) -> None:
+    uid = message.from_user.id
+    group.setdefault("role_wizards", {})[str(uid)] = {
+        "step": "name", "permissions": [], "created_at": time.time()
+    }
+    save_data()
+    await message.reply(
+        "🎖 <b>Создание роли — шаг 1/3</b>\n"
+        "Отправьте следующим сообщением название роли (2–20 символов: латиница, цифры и _).\n"
+        "Отмена: /cancel.",
+        parse_mode="HTML",
+    )
+
+
+@dp.callback_query(F.data.startswith("grolewiz|"))
+async def cb_group_role_wizard(callback: CallbackQuery):
+    try:
+        parts = callback.data.split("|")
+        chat_id, owner_id = int(parts[1]), int(parts[2])
+        action = parts[3]
+        permission = parts[4] if len(parts) > 4 else None
+    except Exception:
+        return await callback.answer("Некорректная кнопка.", show_alert=True)
+    if not callback.message or callback.message.chat.id != chat_id:
+        return await callback.answer("Это меню относится к другой группе.", show_alert=True)
+    if callback.from_user.id != owner_id:
+        return await callback.answer("Эту роль создаёт другой администратор.", show_alert=True)
+    if not await is_group_admin(chat_id, owner_id):
+        return await callback.answer("Нужны права администратора группы.", show_alert=True)
+    group = get_group(chat_id, callback.message.chat.title or "Группа")
+    if not group_has_feature(group, "premium_roles") or not group.get("roles_enabled"):
+        group.get("role_wizards", {}).pop(str(owner_id), None)
+        return await callback.answer("Система ролей недоступна или выключена.", show_alert=True)
+    wizard = group.setdefault("role_wizards", {}).get(str(owner_id))
+    if not wizard:
+        return await callback.answer("Сессия создания роли истекла. Запустите /role_create заново.", show_alert=True)
+    if action == "cancel":
+        group["role_wizards"].pop(str(owner_id), None)
+        save_data()
+        await callback.answer("Создание отменено.")
+        return await callback.message.edit_text("❌ Создание роли отменено.")
+    if action == "toggle":
+        if permission not in GROUP_ROLE_PERMISSIONS:
+            return await callback.answer("Неизвестное право.", show_alert=True)
+        selected = set(wizard.get("permissions", []))
+        if permission in selected:
+            selected.remove(permission)
+        else:
+            selected.add(permission)
+        wizard["permissions"] = sorted(selected)
+        save_data()
+        await callback.answer("Право переключено.")
+        return await callback.message.edit_reply_markup(reply_markup=role_wizard_keyboard(chat_id, owner_id, wizard))
+    if action == "save":
+        name = str(wizard.get("name", ""))
+        rank = int(wizard.get("rank", 0) or 0)
+        if not name or not (1 <= rank <= 99999):
+            return await callback.answer("Не заполнено название или ранг.", show_alert=True)
+        if name in group.setdefault("roles", {}):
+            return await callback.answer("Роль с таким названием уже существует.", show_alert=True)
+        permissions = sorted(set(wizard.get("permissions", [])) & GROUP_ROLE_PERMISSIONS)
+        group["roles"][name] = {"rank": rank, "permissions": permissions, "inherits": None}
+        group["role_wizards"].pop(str(owner_id), None)
+        save_data()
+        await callback.answer("Роль создана.")
+        perms_text = ", ".join(ROLE_PERMISSION_LABELS.get(x, x) for x in permissions) or "нет — все команды выключены"
+        return await callback.message.edit_text(
+            f"✅ Роль <code>{html.escape(name)}</code> создана.\n"
+            f"Ранг: <b>{rank}</b>\nПрава: {html.escape(perms_text)}",
+            parse_mode="HTML",
+        )
+    return await callback.answer("Неизвестное действие.", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("grole_rank|"))
+async def cb_group_role_rank_choice(callback: CallbackQuery):
+    try:
+        _, chat_text, owner_text, rank_text = callback.data.split("|", 3)
+        chat_id, owner_id, rank = int(chat_text), int(owner_text), int(rank_text)
+    except Exception:
+        return await callback.answer("Некорректный ранг.", show_alert=True)
+    if not callback.message or callback.message.chat.id != chat_id or callback.from_user.id != owner_id:
+        return await callback.answer("Эта настройка принадлежит другому администратору.", show_alert=True)
+    if not await is_group_admin(chat_id, owner_id):
+        return await callback.answer("Нужны права администратора.", show_alert=True)
+    group = get_group(chat_id, callback.message.chat.title or "Группа")
+    wizard = group.setdefault("role_wizards", {}).get(str(owner_id))
+    if not wizard or wizard.get("step") != "rank":
+        return await callback.answer("Сессия истекла. Начните заново.", show_alert=True)
+    if rank not in (1, 10, 25, 50, 100, 500, 99999):
+        return await callback.answer("Недопустимый ранг.", show_alert=True)
+    wizard["rank"] = rank
+    wizard["step"] = "permissions"
+    save_data()
+    await callback.answer(f"Выбран ранг {rank}.")
+    return await callback.message.edit_text(
+        f"🎖 <b>Создание роли — шаг 3/3</b>\n"
+        f"Название: <code>{html.escape(str(wizard['name']))}</code>\nРанг: <b>{rank}</b>\n\n"
+        "Выберите разрешённые команды. По умолчанию ВСЕ права выключены. Затем нажмите «Создать роль».",
+        reply_markup=role_wizard_keyboard(chat_id, owner_id, wizard),
+        parse_mode="HTML",
+    )
 
 
 def record_group_activity(message: Message, group: dict) -> None:
@@ -4706,7 +5051,7 @@ async def handle_group_natural_setting(message: Message, group: dict, user_text:
         text = re.sub(r"^" + re.escape(nickname.casefold()) + r"(?:[,!: ]+|$)", "", text, count=1)
     match = re.fullmatch(
         r"(включи|включить|выключи|выключить)\s+"
-        r"(автоответы|ии|агента|режим агента|цензор|цензуру|активность|антиспам|анти-спам|"
+        r"(автоответы|ии|агента|режим агента|цензор|цензуру|ии-модератор|автомодератор|активность|антиспам|анти-спам|"
         r"антиволну|анти-волну|разговоры|авторазговоры|архив|историю|роли|генерацию изображений)",
         text,
     )
@@ -4720,6 +5065,7 @@ async def handle_group_natural_setting(message: Message, group: dict, user_text:
             "автоответы": ("ai_enabled", None), "ии": ("ai_enabled", None),
             "агента": ("agent_enabled", None), "режим агента": ("agent_enabled", None),
             "цензор": ("censor_enabled", "censor"), "цензуру": ("censor_enabled", "censor"),
+            "ии-модератор": ("auto_moderation_enabled", None), "автомодератор": ("auto_moderation_enabled", None),
             "активность": ("activity_enabled", "activity"),
             "антиспам": ("anti_spam_enabled", "anti_spam"), "анти-спам": ("anti_spam_enabled", "anti_spam"),
             "антиволну": ("anti_wave_enabled", "anti_wave"), "анти-волну": ("anti_wave_enabled", "anti_wave"),
@@ -4729,6 +5075,9 @@ async def handle_group_natural_setting(message: Message, group: dict, user_text:
             "генерацию изображений": ("group_images_enabled", "group_images"),
         }
         field, feature = mapping[target]
+        if target in ("ии-модератор", "автомодератор") and enable and not str(group.get("auto_moderation_rules", "")).strip():
+            await message.reply("Сначала задайте правила командой /automod_rules текст правил.")
+            return True
         if enable and feature and not group_has_feature(group, feature):
             await message.reply(group_feature_denied_text(group, feature), parse_mode="HTML")
             return True
@@ -4911,6 +5260,94 @@ async def handle_group_message(message: Message, user: dict):
     command = command_text.split(maxsplit=1)
     head = command[0].split("@")[0].lower() if command else ""
     args = command[1].split() if len(command) > 1 else []
+
+    # Пошаговый ввод названия роли: следующий текстовый ответ администратора
+    # перехватывается только пока активен его собственный мастер создания роли.
+    wizard = group.setdefault("role_wizards", {}).get(str(uid))
+    if wizard and time.time() - float(wizard.get("created_at", time.time())) > 600:
+        group["role_wizards"].pop(str(uid), None)
+        wizard = None
+        save_data()
+    if wizard and wizard.get("step") == "name" and user_text and not head.startswith("/"):
+        if not await is_group_admin(chat_id, uid):
+            group["role_wizards"].pop(str(uid), None)
+            save_data()
+            return await message.reply("Создание роли отменено: нужны права администратора группы.")
+        role_name = user_text.strip().lower()
+        if not re.fullmatch(r"[a-z0-9_]{2,20}", role_name) or role_name in ("member", "owner"):
+            return await message.reply("Название должно содержать 2–20 символов: латиница, цифры или _. Попробуйте ещё раз или /cancel.")
+        if role_name in group.get("roles", {}):
+            return await message.reply("Такая роль уже существует. Отправьте другое название или /cancel.")
+        wizard["name"] = role_name
+        wizard["step"] = "rank"
+        save_data()
+        rank_rows = [
+            [InlineKeyboardButton(text="1 — базовый", callback_data=f"grole_rank|{chat_id}|{uid}|1"),
+             InlineKeyboardButton(text="10 — помощник", callback_data=f"grole_rank|{chat_id}|{uid}|10")],
+            [InlineKeyboardButton(text="25", callback_data=f"grole_rank|{chat_id}|{uid}|25"),
+             InlineKeyboardButton(text="50", callback_data=f"grole_rank|{chat_id}|{uid}|50")],
+            [InlineKeyboardButton(text="100", callback_data=f"grole_rank|{chat_id}|{uid}|100"),
+             InlineKeyboardButton(text="500", callback_data=f"grole_rank|{chat_id}|{uid}|500")],
+            [InlineKeyboardButton(text="99999 — высший", callback_data=f"grole_rank|{chat_id}|{uid}|99999")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"grolewiz|{chat_id}|{uid}|cancel")],
+        ]
+        return await message.reply(
+            f"🎖 <b>Шаг 2/3</b>\nРоль: <code>{html.escape(role_name)}</code>\nВыберите ранг. Участник с меньшим рангом не сможет модерировать участника с равным или большим рангом.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rank_rows), parse_mode="HTML",
+        )
+    if wizard and head in ("/cancel", "/отмена"):
+        group["role_wizards"].pop(str(uid), None)
+        save_data()
+        return await message.reply("❌ Создание роли отменено.")
+
+    # Авто-модератор запускается только после явного включения и задания правил.
+    if head in ("/automod_on", "/automod_off"):
+        if not await is_group_admin(chat_id, uid):
+            return await message.reply("⛔ Включать ИИ-модератор может только администратор группы.")
+        enabled = head == "/automod_on"
+        if enabled and not str(group.get("auto_moderation_rules", "")).strip():
+            return await message.reply("Сначала задайте правила: /automod_rules текст правил. Без заданных правил ИИ-модератор не работает.")
+        group["auto_moderation_enabled"] = enabled
+        save_data()
+        return await message.reply(f"🛡 ИИ-модератор {'включён' if enabled else 'выключен'}.")
+    if head == "/automod_rules":
+        if not await is_group_admin(chat_id, uid):
+            return await message.reply("⛔ Менять правила ИИ-модератора может только администратор группы.")
+        rules = command_text.partition(" ")[2].strip()
+        if not rules:
+            current = str(group.get("auto_moderation_rules", "")).strip()
+            return await message.reply(
+                "📋 <b>Правила ИИ-модератора</b>\n" + (html.escape(current[:3000]) if current else "Не заданы.") +
+                "\n\nЗадать: /automod_rules каждое правило с новой строки.\n"
+                "Пример: /automod_rules Не выдавать выдуманные официальные объявления от имени администрации.",
+                parse_mode="HTML",
+            )
+        if rules.lower() in ("clear", "reset", "сброс", "очистить"):
+            group["auto_moderation_rules"] = ""
+            group["auto_moderation_enabled"] = False
+            save_data()
+            return await message.reply("Правила очищены. ИИ-модератор автоматически выключен.")
+        group["auto_moderation_rules"] = rules[:5000]
+        save_data()
+        return await message.reply("✅ Правила сохранены. Чтобы начать проверку сообщений, включите /automod_on. До включения ничего не проверяется.")
+    if head == "/automod_status":
+        rules_set = bool(str(group.get("auto_moderation_rules", "")).strip())
+        return await message.reply(
+            "🛡 <b>ИИ-модератор</b>\n"
+            f"Состояние: {'🟢 включён' if group.get('auto_moderation_enabled') else '⚪ выключен'}\n"
+            f"Правила: {'заданы' if rules_set else 'не заданы'}\n"
+            f"Модель: <code>{html.escape(AUTO_MODERATION_MODEL)}</code>\n"
+            f"Проверено сообщений: <code>{int(group.get('auto_moderation_checked', 0) or 0)}</code>\n"
+            f"Удалено: <code>{int(group.get('auto_moderation_removed', 0) or 0)}</code>",
+            parse_mode="HTML",
+        )
+
+    # AI-модерация идёт по обычным сообщениям до автоответчика. Команды и
+    # сообщения администраторов пропускаются; отсутствие уверенного совпадения
+    # с заданным правилом не приводит к удалению.
+    if user_text and not head.startswith("/") and group.get("auto_moderation_enabled"):
+        if await run_group_auto_moderation(message, group):
+            return
 
     help_probe = user_text.casefold().strip()
     if help_probe:
@@ -5162,28 +5599,40 @@ async def handle_group_message(message: Message, user: dict):
             return await message.reply("🔕 Система ролей выключена. Включить: /roles_on")
         if not await is_group_admin(chat_id, uid):
             return await message.reply("⛔ Создавать роли могут только Telegram-администраторы группы.")
+        # Старый компактный формат оставлен для совместимости. Без аргументов
+        # запускается мастер с выбором имени, ранга и отдельных прав.
         parts = command_text.split(maxsplit=3)
-        if len(parts) < 4:
-            return await message.reply("Формат: /role_create имя ранг права_через_запятую [наследует] — например /role_create helper2 15 warn,mute helper")
+        if len(parts) == 1:
+            return await start_role_creation_wizard(message, group)
+        if len(parts) < 3:
+            return await message.reply("Формат: /role_create имя ранг [права_через_запятую]. Для пошагового создания используйте /role_create без аргументов.")
         name = parts[1].lower()
         if not re.fullmatch(r"[a-z0-9_]{2,20}", name) or name in ("member", "owner"):
             return await message.reply("Имя роли: 2–20 символов a-z, 0-9 или _.")
+        if name in group.get("roles", {}):
+            return await message.reply("Роль с таким названием уже существует.")
         try:
-            rank = max(1, min(90, int(parts[2])))
+            rank = max(1, min(99999, int(parts[2])))
         except ValueError:
-            return await message.reply("Ранг должен быть числом от 1 до 90.")
-        perm_text = parts[3].strip()
+            return await message.reply("Ранг должен быть числом от 1 до 99999.")
+        permissions = []
         inherit = None
-        if " " in perm_text:
-            perm_text, inherit = perm_text.rsplit(" ", 1)
-        permissions = sorted({p.strip().lower() for p in perm_text.split(",") if p.strip()} & GROUP_ROLE_PERMISSIONS)
+        if len(parts) >= 4:
+            permission_text = parts[3].strip()
+            if " " in permission_text:
+                permission_text, inherit = permission_text.rsplit(" ", 1)
+            permissions = sorted({p.strip().lower() for p in permission_text.split(",") if p.strip()} & GROUP_ROLE_PERMISSIONS)
         if inherit and inherit not in group.get("roles", {}):
             return await message.reply("Указанной родительской роли нет. Сначала создайте её или уберите наследование.")
         if inherit == name:
             return await message.reply("Роль не может наследовать саму себя.")
         group.setdefault("roles", {})[name] = {"rank": rank, "permissions": permissions, "inherits": inherit}
         save_data()
-        return await message.reply(f"✅ Роль <code>{html.escape(name)}</code> создана. Права: {html.escape(', '.join(permissions) or 'нет')}.", parse_mode="HTML")
+        return await message.reply(
+            f"✅ Роль <code>{html.escape(name)}</code> создана. Ранг: <b>{rank}</b>. "
+            f"Права: {html.escape(', '.join(permissions) or 'нет — все команды выключены')}.",
+            parse_mode="HTML",
+        )
 
     if head == "/role_set":
         if not group_has_feature(group, "premium_roles"):
@@ -5436,6 +5885,11 @@ async def handle_group_message(message: Message, user: dict):
         return
 
     if not explicit_ai and not group.get("ai_enabled"):
+        save_data()
+        return
+    if not explicit_ai and group.get("ai_enabled") and not should_auto_reply_to_group_message(user_text):
+        # В режиме автоответов ИИ в первую очередь отвечает на вопросы и просьбы,
+        # а не комментирует каждую реплику подряд.
         save_data()
         return
 

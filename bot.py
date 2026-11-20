@@ -2682,8 +2682,8 @@ def get_admin_main_kb():
 # =========================================================================
 # --- ОБРАБОТЧИКИ МЕНЮ ROBLOX STUDIO MCP ---
 # =========================================================================
-@dp.message(F.text.startswith("🎮 Roblox Studio"))
-@dp.message(Command("roblox"))
+@dp.message(F.chat.type == "private", F.text.startswith("🎮 Roblox Studio"))
+@dp.message(F.chat.type == "private", Command("roblox"))
 async def menu_roblox_studio(message: Message):
     uid = message.from_user.id
     u = get_user(uid)
@@ -2800,8 +2800,8 @@ async def cb_rbx_help(callback: CallbackQuery):
 # =========================================================================
 # --- СИСТЕМА ОЦЕНОК (?/10) И ОТЗЫВОВ ---
 # =========================================================================
-@dp.message(F.text == "⭐ Оценить бота")
-@dp.message(Command("rate"))
+@dp.message(F.chat.type == "private", F.text == "⭐ Оценить бота")
+@dp.message(F.chat.type == "private", Command("rate"))
 async def menu_rate_bot(message: Message):
     u = get_user(message.from_user.id)
     if u["banned"]:
@@ -2919,8 +2919,8 @@ def render_reviews_view(page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-@dp.message(F.text == "⭐ Отзывы")
-@dp.message(Command("reviews"))
+@dp.message(F.chat.type == "private", F.text == "⭐ Отзывы")
+@dp.message(F.chat.type == "private", Command("reviews"))
 async def admin_show_reviews_cmd(message: Message):
     if message.from_user.id != ADMIN_ID:
         return
@@ -3225,7 +3225,7 @@ def check_censorship_fast(text: str) -> bool:
 
 
 # --- ПРОГРАММИРОВАНИЕ: ОБЩИЙ РЕЖИМ / ROBLOX STUDIO ---
-@dp.message(F.text == "💻 Программирование")
+@dp.message(F.chat.type == "private", F.text == "💻 Программирование")
 async def menu_programming(message: Message):
     u = get_user(message.from_user.id)
     current = u.get("programming_mode", "off")
@@ -3302,7 +3302,7 @@ def remember_spy_answer(message: Message, answer: str):
 
 
 # --- БАЗОВЫЕ КОМАНДЫ ---
-@dp.message(CommandStart())
+@dp.message(F.chat.type == "private", CommandStart())
 async def start_cmd(message: Message):
     u = get_user(message.from_user.id)
     if u["banned"]:
@@ -3322,7 +3322,7 @@ async def start_cmd(message: Message):
     )
 
 
-@dp.message(F.text == "🧹 Очистить память")
+@dp.message(F.chat.type == "private", F.text == "🧹 Очистить память")
 async def clear_memory(message: Message):
     uid = message.from_user.id
     u = get_user(uid)
@@ -3334,8 +3334,8 @@ async def clear_memory(message: Message):
     await message.answer("🧹 <b>Контекст и память о фото очищены!</b> ИИ готов к новому диалогу.", parse_mode="HTML")
 
 
-@dp.message(F.text == "👤 Профиль")
-@dp.message(Command("stats"))
+@dp.message(F.chat.type == "private", F.text == "👤 Профиль")
+@dp.message(F.chat.type == "private", Command("stats"))
 async def show_profile(message: Message):
     uid = message.from_user.id
     u = get_user(uid)
@@ -3426,8 +3426,8 @@ async def run_image_generation(message: Message, uid: int, prompt: str):
         await wait_msg.edit_text(f"❌ Ошибка или таймаут генерации изображения ({bot_config['photo_model']}): {html.escape(str(e)[:400])}", parse_mode="HTML")
 
 
-@dp.message(F.text == "🎨 Генерация фото")
-@dp.message(Command("imagine"))
+@dp.message(F.chat.type == "private", F.text == "🎨 Генерация фото")
+@dp.message(F.chat.type == "private", Command("imagine"))
 async def menu_generate_photo(message: Message):
     uid = message.from_user.id
     u = get_user(uid)
@@ -3491,7 +3491,7 @@ async def cb_new_photo_prompt(callback: CallbackQuery):
 
 
 # --- МЕНЮ МОДЕЛЕЙ ---
-@dp.message(F.text == "🧠 Модели ИИ")
+@dp.message(F.chat.type == "private", F.text == "🧠 Модели ИИ")
 async def menu_models(message: Message):
     u = get_user(message.from_user.id)
     buttons = []
@@ -3531,7 +3531,7 @@ async def cb_set_model(callback: CallbackQuery):
 
 
 # --- СВОЙ ПРОМПТ ---
-@dp.message(F.text == "⚙️ Свой промпт")
+@dp.message(F.chat.type == "private", F.text == "⚙️ Свой промпт")
 async def menu_custom_prompt(message: Message):
     u = get_user(message.from_user.id)
     u["state"] = "wait_prompt"
@@ -3570,7 +3570,7 @@ async def cb_cancel_state(callback: CallbackQuery):
 
 
 # --- ПОДПИСКА И СВЯЗЬ ---
-@dp.message(F.text == "💎 Подписка / Связь")
+@dp.message(F.chat.type == "private", F.text == "💎 Подписка / Связь")
 async def menu_subscription(message: Message):
     u = get_user(message.from_user.id)
     plan = normalize_plan(u)
@@ -3920,7 +3920,7 @@ def _host_deployment_keyboard(deployment: dict) -> InlineKeyboardMarkup:
     ])
 
 
-@dp.message(Command("owner"))
+@dp.message(F.chat.type == "private", Command("owner"))
 async def owner_command(message: Message):
     if not owner_private_message(message):
         return
@@ -4513,8 +4513,8 @@ async def provider_model_monitor_loop():
 # =========================================================================
 # --- АДМИН-ПАНЕЛЬ ---
 # =========================================================================
-@dp.message(F.text == "👑 Админ-панель")
-@dp.message(Command("admin"))
+@dp.message(F.chat.type == "private", F.text == "👑 Админ-панель")
+@dp.message(F.chat.type == "private", Command("admin"))
 async def admin_panel_cmd(message: Message):
     if not owner_private_message(message):
         return
@@ -6643,6 +6643,40 @@ async def handle_group_message(message: Message, user: dict):
     command = command_text.split(maxsplit=1)
     head = command[0].split("@")[0].lower() if command else ""
     args = command[1].split() if len(command) > 1 else []
+
+    # Личные команды и кнопки никогда не должны запускать личный клиентский
+    # интерфейс внутри группы. Они перехватываются здесь после того, как
+    # личные message-handler'ы ограничены F.chat.type == "private".
+    personal_commands = {
+        "/start", "/stats", "/imagine", "/roblox", "/rate", "/reviews",
+        "/owner", "/admin",
+    }
+    personal_menu_buttons = {
+        "🧠 модели ии", "🎨 генерация фото", "🎮 roblox studio",
+        "🎮 roblox studio (🟢)", "👤 профиль", "💻 программирование",
+        "⚙️ свой промпт", "🧹 очистить память", "💎 подписка / связь",
+        "⭐ оценить бота", "⭐ отзывы", "👑 админ-панель",
+        "🎓 режим школы", "🎓 школа (активна)",
+    }
+    is_personal_menu_action = (
+        user_text.casefold() in personal_menu_buttons
+        or user_text.startswith("🎮 Roblox Studio")
+        or user_text.startswith("🌐 Поиск:")
+    )
+    if head in personal_commands or is_personal_menu_action:
+        try:
+            me = await bot.get_me()
+            bot_link = f"https://t.me/{me.username}" if me.username else None
+        except Exception:
+            bot_link = None
+        text = (
+            "🔒 Эта функция работает только в личном чате с AgentGPT.\n"
+            "Откройте личный чат с ботом и повторите команду там."
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💬 Открыть личный чат", url=bot_link)]
+        ]) if bot_link else None
+        return await message.reply(text, reply_markup=kb, disable_web_page_preview=True)
 
     # Пошаговый ввод названия роли: следующий текстовый ответ администратора
     # перехватывается только пока активен его собственный мастер создания роли.

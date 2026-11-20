@@ -10,7 +10,9 @@ import base64
 import shutil
 import time
 import asyncio
+import socket
 import urllib.parse
+from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Callable, Dict, Any, Awaitable
 
@@ -29,8 +31,9 @@ from types import SimpleNamespace
 from openai import AsyncOpenAI
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-# Подгружаем переменные из .env
+# Подгружаем переменные из .env (сначала стандартный путь запуска, затем .env рядом со скриптом)
 load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), override=False)
 
 # Поддержка поиска в интернете
 try:
@@ -50,7 +53,7 @@ BOT_TOKEN = clean_env("BOT_TOKEN", "")
 ADMIN_ID = int(clean_env("ADMIN_ID", "0"))
 
 AI_API_KEY = clean_env("AI_API_KEY", "")
-AI_BASE_URL = clean_env("AI_BASE_URL", "https://anymodel.ghostly.su/v1")
+AI_BASE_URL = clean_env("AI_BASE_URL", "https://ai.ghostly.su/v1")
 
 # Отдельный ключ, URL и модель GPT Image 2.5 для генерации изображений
 PHOTO_GENERATIONAL_KEY = clean_env("PHOTO_GENERATIONAL_KEY", AI_API_KEY)
@@ -83,7 +86,11 @@ if not os.path.exists(DATA_FILE) and not os.path.isabs(_DATA_FILE_SETTING):
         except OSError as migration_exc:
             print(f"[DB Recovery] Не удалось перенести старую базу: {migration_exc}")
 DATA_BACKUP_FILE = DATA_FILE + ".bak"
-DATA_SCHEMA_VERSION = 2
+USAGE_JOURNAL_FILE = DATA_FILE + ".usage.json"
+DOTENV_FILE = os.path.join(_SCRIPT_DIRECTORY, ".env")
+BOT_HOST_API_BASE = "https://bot-hosting.net/api/v1"
+BOT_HOSTING_API_KEY = clean_env("BOT_HOSTING_API_KEY", "")
+DATA_SCHEMA_VERSION = 3
 AUTO_MODERATION_MODEL = clean_env("AUTO_MODERATION_MODEL", "gemini-3.5-flash-lite")
 if AUTO_MODERATION_MODEL not in {"gemini-3.5-flash-lite", "deepseek-flash"}:
     AUTO_MODERATION_MODEL = "gemini-3.5-flash-lite"
@@ -155,7 +162,22 @@ bot_config = {
     "sub_limit": int(clean_env("SUB_LIMIT", "1000000")),
     "photo_model": PHOTO_MODEL,
     "spy_mode": False,
-    "mcp_public_url": MCP_PUBLIC_URL
+    "mcp_public_url": MCP_PUBLIC_URL,
+    "global_token_budget": int(clean_env("GLOBAL_TOKEN_BUDGET", "0")),
+    "global_token_alert_threshold": int(clean_env("GLOBAL_TOKEN_ALERT_THRESHOLD", "0")),
+    "global_token_alert_month": "",
+    "global_usage": {
+        "all_time_tokens": 0,
+        "month_tokens": 0,
+        "month_key": datetime.now().strftime("%Y-%m"),
+        "models_all_time": {},
+        "models_month": {},
+    },
+    "provider_model_ids": [],
+    "provider_models_checked_at": "",
+    "provider_models_check_ok": False,
+    "provider_models_last_error": "",
+    "bot_hosting_deployment_id": "",
 }
 
 BASE_SYSTEM_PROMPT = os.getenv(
@@ -167,6 +189,23 @@ BASE_SYSTEM_PROMPT = os.getenv(
     "```python\nкод\n```\n"
     "3. Если пользователь прислал изображение с задачей, тестом или вопросом — внимательно прочитай всё содержимое на фото и дай полное решение."
 )
+
+HOMEWORK_SOLVER_PROMPT = r"""
+[УЛЬТРА-РЕЖИМ РЕШЕНИЯ УЧЕБНЫХ ЗАДАНИЙ]
+Когда запрос содержит домашнее задание, школьное/учебное упражнение, задачу, пример, уравнение, анализ текста, вопрос по предмету или фото задания, работай как точный и терпеливый преподаватель.
+1. Сначала определи предмет, тему, что требуется найти/доказать/написать, все данные, ограничения и единицы измерения. Не пропускай условия из фотографии и подписи.
+2. Если условие читается не полностью, прямо укажи, какая часть неразборчива; не выдумывай значения. При достаточных данных сразу решай, не задавая лишних вопросов.
+3. Подбирай метод под указанный класс и уровень ученика. Не используй темы, формулы и сокращённые методы, которые явно выходят за текущую программу, когда есть доступный школьный способ.
+4. Для математики и физики: запиши «Дано» и «Найти» при уместности; назови формулу/правило; подставь числа; показывай преобразования по шагам; следи за знаками, скобками, округлением и размерностями; укажи ответ с единицами. После решения сделай независимую проверку подстановкой, обратным действием, оценкой порядка величины или проверкой условий.
+5. Для химии: проверь формулы веществ, индексы, коэффициенты, сохранение атомов и зарядов; показывай расчёты и единицы. Не меняй формулы веществ ради удобства.
+6. Для языков и литературы: учитывай грамматическое правило, контекст, жанр и требования задания; объясняй спорные места; цитируй только короткие фрагменты, необходимые для анализа. Не сочиняй цитаты из произведения.
+7. Для истории, географии, биологии и обществознания: отделяй факты от выводов; указывай причинно-следственные связи; не выдавай догадки за факты; соблюдай терминологию и формат ответа из условия.
+8. Для сочинений и развёрнутых ответов: сначала выдели требования и критерии, затем подготовь логичный текст подходящего объёма и уровня. Не добавляй несуществующие источники и вымышленные факты.
+9. Если просят только ответ, дай краткий ответ; если просят решение, объясни основные проверяемые шаги. Не раскрывай скрытые внутренние рассуждения: показывай понятное обоснование, вычисления и проверку.
+10. В конце сверь ответ с каждым пунктом задания. Если есть несколько допустимых трактовок, обозначь их и выбери наиболее обоснованную.
+11. При программных учебных задачах объясни алгоритм, затем дай полный рабочий пример кода на указанном языке и отметь, как его проверить.
+12. Не подменяй решение общими советами и не ограничивайся фразой «вот ответ», когда пользователь явно просит объяснить.
+"""
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -191,6 +230,24 @@ ai_clients = [
     for u in AI_URL_VARIANTS
 ]
 photo_clients = [AsyncOpenAI(api_key=PHOTO_GENERATIONAL_KEY, base_url=u, timeout=120.0) for u in PHOTO_URL_VARIANTS]
+
+
+def rebuild_ai_clients():
+    global ai_clients, AI_URL_VARIANTS
+    AI_URL_VARIANTS = get_url_variants(AI_BASE_URL)
+    ai_clients = [
+        AsyncOpenAI(api_key=AI_API_KEY, base_url=url, timeout=90.0, max_retries=0)
+        for url in AI_URL_VARIANTS
+    ]
+
+
+def rebuild_photo_clients():
+    global photo_clients, PHOTO_URL_VARIANTS
+    PHOTO_URL_VARIANTS = get_url_variants(PHOTO_BASE_URL)
+    photo_clients = [
+        AsyncOpenAI(api_key=PHOTO_GENERATIONAL_KEY, base_url=url, timeout=120.0, max_retries=0)
+        for url in PHOTO_URL_VARIANTS
+    ]
 
 
 DEFAULT_MODEL = "gpt-6-luna"
@@ -263,8 +320,118 @@ def rebuild_rbx_token_index():
             rbx_endpoint_to_uid[roblox["endpoint_id"]] = uid
 
 
+def save_usage_journal():
+    """Отдельный атомарный checkpoint счётчиков. Не заменяет основную базу."""
+    temp_path = USAGE_JOURNAL_FILE + ".tmp"
+    try:
+        snapshot = {
+            "schema": 1,
+            "updated_at": datetime.now().isoformat(),
+            "global_usage": bot_config.get("global_usage", {}),
+            "users": {
+                str(uid): {
+                    "tokens": max(0, int(user.get("tokens", 0) or 0)),
+                    "reset_date": user.get("reset_date").isoformat() if isinstance(user.get("reset_date"), datetime) else user.get("reset_date"),
+                }
+                for uid, user in users_db.items() if isinstance(user, dict)
+            },
+        }
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, ensure_ascii=False, separators=(",", ":"))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, USAGE_JOURNAL_FILE)
+        try:
+            os.chmod(USAGE_JOURNAL_FILE, 0o600)
+        except OSError:
+            pass
+    except Exception as exc:
+        print(f"[Usage Journal] Не удалось сохранить checkpoint: {exc}")
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
+
+
+def load_usage_journal():
+    """Восстанавливает только usage-счётчики; не перезаписывает более новый период."""
+    if not os.path.exists(USAGE_JOURNAL_FILE):
+        return
+    try:
+        with open(USAGE_JOURNAL_FILE, "r", encoding="utf-8") as f:
+            snapshot = json.load(f)
+        if not isinstance(snapshot, dict):
+            return
+        saved_global = snapshot.get("global_usage")
+        if isinstance(saved_global, dict):
+            current = bot_config.get("global_usage")
+            if not isinstance(current, dict):
+                current = {}
+            saved_month = str(saved_global.get("month_key", ""))
+            current_month = str(current.get("month_key", ""))
+            current["all_time_tokens"] = max(int(current.get("all_time_tokens", 0) or 0), int(saved_global.get("all_time_tokens", 0) or 0))
+            if saved_month > current_month:
+                current["month_key"] = saved_month
+                current["month_tokens"] = int(saved_global.get("month_tokens", 0) or 0)
+                current["models_month"] = dict(saved_global.get("models_month", {}) or {})
+            elif saved_month == current_month:
+                current["month_tokens"] = max(int(current.get("month_tokens", 0) or 0), int(saved_global.get("month_tokens", 0) or 0))
+                merged_month = dict(current.get("models_month", {}) or {})
+                for key, value in (saved_global.get("models_month", {}) or {}).items():
+                    merged_month[str(key)] = max(int(merged_month.get(str(key), 0) or 0), int(value or 0))
+                current["models_month"] = merged_month
+            merged_total = dict(current.get("models_all_time", {}) or {})
+            for key, value in (saved_global.get("models_all_time", {}) or {}).items():
+                merged_total[str(key)] = max(int(merged_total.get(str(key), 0) or 0), int(value or 0))
+            current["models_all_time"] = merged_total
+            bot_config["global_usage"] = current
+        journal_users = snapshot.get("users", {})
+        if isinstance(journal_users, dict):
+            for uid_text, saved in journal_users.items():
+                try:
+                    uid = int(uid_text)
+                    if not isinstance(saved, dict):
+                        continue
+                    journal_reset = _parse_saved_datetime(saved.get("reset_date"))
+                    journal_tokens = max(0, int(saved.get("tokens", 0) or 0))
+                    if uid not in users_db:
+                        # Основная база могла быть заменена при релизе; восстанавливаем
+                        # минимальный профиль, чтобы личный расход не начинался с нуля.
+                        users_db[uid] = {
+                            "is_sub": False, "plan": "free", "plan_cost_rub": 0.0,
+                            "api_cost_month_rub": 0.0, "api_cost_total_rub": 0.0,
+                            "plan_month": datetime.now().strftime("%Y-%m"),
+                            "sub_end": None, "tokens": journal_tokens,
+                            "reset_date": journal_reset or (datetime.now() + timedelta(days=30)),
+                            "current_model": DEFAULT_MODEL, "custom_prompt": "", "web_search": False,
+                            "banned": False, "strikes": 0, "history": [], "pending_followup": None,
+                            "state": None, "temp_score": 10, "programming_mode": "off",
+                            "requested_plan": "pro", "image_usage_date": "",
+                            "image_analysis_count": 0, "image_generation_count": 0,
+                            "school": {"active": False, "grade": "9 класс", "quarter": "1 четверть",
+                                       "level": "Средний", "hw_type": "Письменное", "topic": "Общая",
+                                       "training_mode": False, "training_samples": []},
+                            "roblox": {"active": False, "token": generate_rbx_token(uid),
+                                       "endpoint_id": generate_rbx_endpoint_id()},
+                        }
+                    user = users_db[uid]
+                    db_reset = _parse_saved_datetime(user.get("reset_date"))
+                    db_tokens = max(0, int(user.get("tokens", 0) or 0))
+                    if journal_reset and (not db_reset or journal_reset > db_reset):
+                        user["reset_date"] = journal_reset
+                        user["tokens"] = journal_tokens
+                    elif journal_reset and db_reset and journal_reset == db_reset:
+                        user["tokens"] = max(db_tokens, journal_tokens)
+                except (TypeError, ValueError):
+                    continue
+        print("[Usage Journal] Счётчики токенов проверены и синхронизированы.")
+    except Exception as exc:
+        print(f"[Usage Journal] Ошибка чтения checkpoint: {exc}")
+
+
 def save_data():
-    """Сохраняет базу атомарно, чтобы аварийное завершение не испортило JSON."""
+    """Сохраняет базу атомарно и обновляет независимый checkpoint usage."""
     temp_file = f"{DATA_FILE}.tmp"
     try:
         serializable_users = {}
@@ -295,6 +462,7 @@ def save_data():
             except OSError as backup_exc:
                 print(f"[DB Warning] Не удалось обновить резервную копию: {backup_exc}")
         os.replace(temp_file, DATA_FILE)
+        save_usage_journal()
     except Exception as exc:
         print(f"[DB Warning] Ошибка сохранения данных: {exc}")
         try:
@@ -317,7 +485,7 @@ def _parse_saved_datetime(value, fallback=None):
 
 def load_data():
     global reviews_db, groups_db, spy_answers_db
-    if not os.path.exists(DATA_FILE) and not os.path.exists(DATA_BACKUP_FILE):
+    if not os.path.exists(DATA_FILE) and not os.path.exists(DATA_BACKUP_FILE) and not os.path.exists(USAGE_JOURNAL_FILE):
         return
 
     try:
@@ -325,15 +493,18 @@ def load_data():
         if not os.path.exists(source_path) and os.path.exists(DATA_BACKUP_FILE):
             source_path = DATA_BACKUP_FILE
             print(f"[DB Recovery] Основная база отсутствует, загружаю резервную копию: {source_path}")
-        try:
-            with open(source_path, "r", encoding="utf-8") as file:
-                payload = json.load(file)
-        except (OSError, json.JSONDecodeError) as primary_exc:
-            if source_path == DATA_BACKUP_FILE or not os.path.exists(DATA_BACKUP_FILE):
-                raise
-            print(f"[DB Recovery] Основная база повреждена ({primary_exc}); пробую резервную копию.")
-            with open(DATA_BACKUP_FILE, "r", encoding="utf-8") as file:
-                payload = json.load(file)
+        if not os.path.exists(source_path):
+            payload = {"users_db": {}, "groups_db": {}, "models_db": {}, "bot_config": {}}
+        else:
+            try:
+                with open(source_path, "r", encoding="utf-8") as file:
+                    payload = json.load(file)
+            except (OSError, json.JSONDecodeError) as primary_exc:
+                if source_path == DATA_BACKUP_FILE or not os.path.exists(DATA_BACKUP_FILE):
+                    raise
+                print(f"[DB Recovery] Основная база повреждена ({primary_exc}); пробую резервную копию.")
+                with open(DATA_BACKUP_FILE, "r", encoding="utf-8") as file:
+                    payload = json.load(file)
         if not isinstance(payload, dict):
             raise ValueError("Корневой элемент базы должен быть JSON-объектом")
 
@@ -352,6 +523,23 @@ def load_data():
         except (TypeError, ValueError):
             bot_config["free_limit"] = int(clean_env("FREE_LIMIT", "45000"))
             bot_config["sub_limit"] = int(clean_env("SUB_LIMIT", "1000000"))
+        bot_config.setdefault("global_token_budget", int(clean_env("GLOBAL_TOKEN_BUDGET", "0")))
+        bot_config.setdefault("global_token_alert_threshold", int(clean_env("GLOBAL_TOKEN_ALERT_THRESHOLD", "0")))
+        bot_config.setdefault("global_token_alert_month", "")
+        bot_config.setdefault("provider_model_ids", [])
+        bot_config.setdefault("provider_models_checked_at", "")
+        bot_config.setdefault("provider_models_check_ok", False)
+        bot_config.setdefault("provider_models_last_error", "")
+        bot_config.setdefault("bot_hosting_deployment_id", "")
+        usage_defaults = {
+            "all_time_tokens": 0, "month_tokens": 0,
+            "month_key": datetime.now().strftime("%Y-%m"),
+            "models_all_time": {}, "models_month": {},
+        }
+        loaded_usage = bot_config.get("global_usage")
+        if isinstance(loaded_usage, dict):
+            usage_defaults.update(loaded_usage)
+        bot_config["global_usage"] = usage_defaults
 
         stored_models = payload.get("models_db")
         if isinstance(stored_models, dict):
@@ -472,9 +660,9 @@ def load_data():
                     user["strikes"] = max(0, int(user.get("strikes", 0) or 0))
 
                     model_id = user.get("current_model")
-                    model_info = models_db.get(model_id)
-                    if not model_info or (model_info.get("premium") and normalize_plan(user) == "free" and uid != ADMIN_ID):
-                        user["current_model"] = DEFAULT_MODEL if DEFAULT_MODEL in models_db else next(iter(models_db))
+                    valid_for_user = available_model_ids_for_user(user, uid)
+                    if model_id not in valid_for_user:
+                        user["current_model"] = valid_for_user[0]
 
                     users_db[uid] = user
                 except Exception as user_exc:
@@ -485,6 +673,8 @@ def load_data():
         # чтобы следующий save_data не затёр рабочую копию повреждённым JSON.
         if source_path == DATA_BACKUP_FILE:
             shutil.copy2(DATA_BACKUP_FILE, DATA_FILE)
+        # Сначала объединяем отдельный checkpoint, затем сохраняем уже восстановленное состояние.
+        load_usage_journal()
         # Пересохраняем нормализованную базу после миграции старого формата.
         save_data()
     except Exception as exc:
@@ -495,7 +685,7 @@ def load_data():
 # --- КОД ПЛАГИНА ROBLOX STUDIO (ШАБЛОН LUAU ДЛЯ .rbxm) ---
 # =========================================================================
 ROBLOX_PLUGIN_LUA_TEMPLATE = r'''--[[
-    ШколоAI — Roblox Studio MCP Plugin (.rbxm)
+    AgentGPT — Roblox Studio MCP Plugin (.rbxm)
     Управляет плейсом по запросам из Telegram-бота и поддерживает отмену через Ctrl + Z.
 ]]
 
@@ -507,10 +697,10 @@ local ScriptEditorService = game:GetService("ScriptEditorService")
 local DEFAULT_SERVER_URL = "__SERVER_URL__"
 local DEFAULT_TOKEN = "__USER_TOKEN__"
 
-local toolbar = plugin:CreateToolbar("🤖 ШколоAI MCP")
+local toolbar = plugin:CreateToolbar("🤖 AgentGPT MCP")
 local toggleBtn = toolbar:CreateButton(
-    "ШколоAI MCP",
-    "Открыть панель подключения к Telegram-боту ШколоAI",
+    "AgentGPT MCP",
+    "Открыть панель подключения к Telegram-боту AgentGPT",
     "rbxassetid://6031075938"
 )
 
@@ -525,7 +715,7 @@ local widgetInfo = DockWidgetPluginGuiInfo.new(
 )
 
 local widget = plugin:CreateDockWidgetPluginGui("ShkoloAI_MCP_Widget_v1", widgetInfo)
-widget.Title = "🤖 ШколоAI — Roblox MCP"
+widget.Title = "🤖 AgentGPT — Roblox MCP"
 
 local bg = Instance.new("Frame")
 bg.Size = UDim2.new(1, 0, 1, 0)
@@ -775,7 +965,7 @@ tools.read_script = function(args)
 end
 
 tools.write_script = function(args)
-    ChangeHistoryService:SetWaypoint("Before ShkoloAI write_script")
+    ChangeHistoryService:SetWaypoint("Before AgentGPT write_script")
     local parent = resolveInstance(args.parent_path or "ServerScriptService")
     if not parent then
         error("Родительский объект не найден: " .. tostring(args.parent_path))
@@ -815,12 +1005,12 @@ tools.write_script = function(args)
         scr.Parent = parent
     end
     Selection:Set({scr})
-    ChangeHistoryService:SetWaypoint("After ShkoloAI write_script")
+    ChangeHistoryService:SetWaypoint("After AgentGPT write_script")
     return "Скрипт успешно сохранен: " .. scr:GetFullName()
 end
 
 tools.create_instance = function(args)
-    ChangeHistoryService:SetWaypoint("Before ShkoloAI create_instance")
+    ChangeHistoryService:SetWaypoint("Before AgentGPT create_instance")
     local className = args.class_name or "Part"
     local parent = resolveInstance(args.parent_path or "Workspace")
     if not parent then
@@ -844,25 +1034,25 @@ tools.create_instance = function(args)
     end
     obj.Parent = parent
     Selection:Set({obj})
-    ChangeHistoryService:SetWaypoint("After ShkoloAI create_instance")
+    ChangeHistoryService:SetWaypoint("After AgentGPT create_instance")
     return "Создан объект: " .. obj:GetFullName() .. " (" .. obj.ClassName .. ")"
 end
 
 tools.delete_instance = function(args)
-    ChangeHistoryService:SetWaypoint("Before ShkoloAI delete_instance")
+    ChangeHistoryService:SetWaypoint("Before AgentGPT delete_instance")
     local target = resolveInstance(args.path)
     if not target or target == game or target == workspace then
         error("Невозможно удалить объект: " .. tostring(args.path))
     end
     local fullName = target:GetFullName()
     target:Destroy()
-    ChangeHistoryService:SetWaypoint("After ShkoloAI delete_instance")
+    ChangeHistoryService:SetWaypoint("After AgentGPT delete_instance")
     return "Удален объект: " .. fullName
 end
 
 tools.run_luau_code = function(args)
     local code = args.code or ""
-    ChangeHistoryService:SetWaypoint("Before ShkoloAI run_luau_code")
+    ChangeHistoryService:SetWaypoint("Before AgentGPT run_luau_code")
 
     local fn, compileErr = loadstring(code)
     if not fn then
@@ -891,7 +1081,7 @@ tools.run_luau_code = function(args)
     setfenv(fn, env)
 
     local ok, result = pcall(fn)
-    ChangeHistoryService:SetWaypoint("After ShkoloAI run_luau_code")
+    ChangeHistoryService:SetWaypoint("After AgentGPT run_luau_code")
 
     if not ok then
         error("Ошибка выполнения Luau: " .. tostring(result))
@@ -935,7 +1125,7 @@ local function startConnection()
     loopId += 1
     local myLoop = loopId
 
-    statusLabel.Text = "🟢 Статус: Подключено к ШколоAI"
+    statusLabel.Text = "🟢 Статус: Подключено к AgentGPT"
     statusLabel.TextColor3 = Color3.fromRGB(80, 230, 120)
     connectBtn.Text = "⏹ ОТКЛЮЧИТЬСЯ"
     connectBtn.BackgroundColor3 = Color3.fromRGB(200, 55, 55)
@@ -1028,7 +1218,7 @@ connectBtn.MouseButton1Click:Connect(function()
     end
 end)
 
-addLog("👋 Плагин ШколоAI готов! Нажмите «Подключиться к боту».", Color3.fromRGB(160, 220, 255))
+addLog("👋 Плагин AgentGPT готов! Нажмите «Подключиться к боту».", Color3.fromRGB(160, 220, 255))
 '''
 
 
@@ -1120,7 +1310,7 @@ async def execute_roblox_mcp_tool(uid: int, tool_name: str, args: dict, timeout:
 
 
 async def handle_mcp_health(request: web.Request) -> web.Response:
-    return web.json_response({"status": "ok", "service": "ShkoloAI Roblox Studio MCP Server"})
+    return web.json_response({"status": "ok", "service": "AgentGPT Roblox Studio MCP Server"})
 
 
 async def handle_mcp_poll(request: web.Request) -> web.Response:
@@ -1372,10 +1562,15 @@ def format_ai_api_error(exc: Exception, model_id: str | None = None) -> str:
             f"AI_BASE_URL: {AI_BASE_URL}\nПроверенные base URL: {attempted}\n"
             "Ожидаемый OpenAI-compatible путь: POST <base_url>/chat/completions."
             f"{model_part}\nОтвет провайдера: {detail}\n\n"
-            "Проверьте в панели провайдера именно Base URL для OpenAI-compatible API. "
-            "Не добавляйте /chat/completions в AI_BASE_URL, если SDK сам формирует этот путь. "
-            "Адрес провайдера не заменён автоматически: без подтверждённой документации "
-            "нельзя безопасно подставить другой домен или маршрут."
+            "Документация Anymodel для этого провайдера подтверждает Base URL "
+            "https://ai.ghostly.su/v1 и маршруты GET /v1/models и POST /v1/chat/completions. "
+            "Поэтому https://ai.ghostly.su/v1 не заменяется автоматически на другой домен. "
+            "Проверьте GET https://ai.ghostly.su/v1/models: если он отвечает, но POST "
+            "/v1/chat/completions возвращает nginx 404, это указывает на проблему маршрутизации "
+            "Chat Completions на стороне шлюза/провайдера. Если оба запроса дают 404, "
+            "проверьте, не переопределён ли AI_BASE_URL переменными окружения хостинга, "
+            "и обратитесь к провайдеру с HTTP-методом, путём и временем ошибки. "
+            "Не добавляйте /chat/completions в AI_BASE_URL: SDK формирует этот путь сам."
         )
     prefix = f"HTTP {status}: " if status else ""
     model_part = f" (модель {model_id})" if model_id else ""
@@ -1400,7 +1595,10 @@ async def create_chat_completion(**kwargs):
     if (requested_model and requested_model != DEFAULT_MODEL
             and any(_is_ai_model_error(exc) for exc in errors)):
         fallback_kwargs = dict(kwargs)
-        fallback_kwargs["model"] = DEFAULT_MODEL
+        available_ids = [str(x) for x in (bot_config.get("provider_model_ids") or []) if str(x) in models_db]
+        fallback_pool = [mid for mid in available_ids if not models_db.get(mid, {}).get("premium")]
+        fallback_model = DEFAULT_MODEL if (not available_ids or DEFAULT_MODEL in available_ids) else (fallback_pool[0] if fallback_pool else (available_ids[0] if available_ids else DEFAULT_MODEL))
+        fallback_kwargs["model"] = fallback_model
         fallback_errors = []
         for client in ai_clients:
             try:
@@ -1408,7 +1606,7 @@ async def create_chat_completion(**kwargs):
             except Exception as exc:
                 fallback_errors.append(exc)
         if fallback_errors and all(_is_ai_route_error(exc) for exc in fallback_errors):
-            raise RuntimeError(format_ai_api_error(fallback_errors[-1], DEFAULT_MODEL)) from fallback_errors[-1]
+            raise RuntimeError(format_ai_api_error(fallback_errors[-1], fallback_model)) from fallback_errors[-1]
         if fallback_errors:
             errors = fallback_errors
 
@@ -1428,7 +1626,9 @@ VISION_REFUSAL_MARKERS = (
 
 def get_vision_fallback_models(preferred_model: str) -> list[str]:
     candidates = []
-    if preferred_model:
+    provider_ids = [str(x) for x in (bot_config.get("provider_model_ids") or [])] if bot_config.get("provider_models_check_ok") else []
+    permitted = set(provider_ids) if provider_ids else set(models_db.keys())
+    if preferred_model and preferred_model in permitted:
         candidates.append(preferred_model)
 
     priority_vision = [
@@ -1437,11 +1637,11 @@ def get_vision_fallback_models(preferred_model: str) -> list[str]:
         "opus-5.5", "sonnet-5.5", "grok-4.7"
     ]
     for m in priority_vision:
-        if m in models_db and m not in candidates:
+        if m in permitted and m in models_db and m not in candidates:
             candidates.append(m)
 
     for m, info in models_db.items():
-        if info.get("vision") and m not in candidates:
+        if m in permitted and info.get("vision") and m not in candidates:
             candidates.append(m)
 
     return candidates or [DEFAULT_MODEL]
@@ -1771,6 +1971,17 @@ def normalize_plan(user: dict) -> str:
     return plan
 
 
+def available_model_ids_for_user(user: dict, user_id: int) -> list[str]:
+    provider_ids = [str(x) for x in (bot_config.get("provider_model_ids") or []) if str(x) in models_db]
+    if bot_config.get("provider_models_check_ok") and provider_ids:
+        candidates = provider_ids
+    else:
+        candidates = list(models_db.keys())
+    plan = normalize_plan(user)
+    unlocked = [mid for mid in candidates if not models_db.get(mid, {}).get("premium") or plan != "free" or user_id == ADMIN_ID]
+    return unlocked or candidates or [DEFAULT_MODEL]
+
+
 def plan_image_limits(plan: str) -> tuple[int, int]:
     # (analysis/day, generation/day)
     return {"free": (0, 0), "pro": (4, 2), "max": (12, 6)}.get(plan, (0, 0))
@@ -1833,19 +2044,95 @@ def reserve_request_cost(user: dict, input_tokens: int, output_tokens: int, extr
     return reserve
 
 
+def _ensure_global_usage_period() -> dict:
+    usage = bot_config.get("global_usage")
+    if not isinstance(usage, dict):
+        usage = {}
+        bot_config["global_usage"] = usage
+    usage.setdefault("all_time_tokens", 0)
+    usage.setdefault("month_tokens", 0)
+    usage.setdefault("month_key", datetime.now().strftime("%Y-%m"))
+    usage.setdefault("models_all_time", {})
+    usage.setdefault("models_month", {})
+    for key in ("all_time_tokens", "month_tokens"):
+        try:
+            usage[key] = max(0, int(usage.get(key, 0) or 0))
+        except (TypeError, ValueError):
+            usage[key] = 0
+    for key in ("models_all_time", "models_month"):
+        source = usage.get(key)
+        usage[key] = {str(name): max(0, int(value or 0)) for name, value in source.items()} if isinstance(source, dict) else {}
+    today_key = datetime.now().strftime("%Y-%m")
+    if str(usage.get("month_key")) != today_key:
+        usage["month_key"] = today_key
+        usage["month_tokens"] = 0
+        usage["models_month"] = {}
+        bot_config["global_token_alert_month"] = ""
+    return usage
+
+
+def _schedule_owner_low_token_alert() -> None:
+    budget = max(0, int(bot_config.get("global_token_budget", 0) or 0))
+    threshold = max(0, int(bot_config.get("global_token_alert_threshold", 0) or 0))
+    if budget <= 0 or threshold <= 0:
+        return
+    usage = _ensure_global_usage_period()
+    month_key = str(usage.get("month_key") or datetime.now().strftime("%Y-%m"))
+    remaining = max(0, budget - int(usage.get("month_tokens", 0) or 0))
+    if remaining > threshold or bot_config.get("global_token_alert_month") == month_key:
+        return
+    bot_config["global_token_alert_month"] = month_key
+    save_usage_journal()
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_send_owner_low_token_alert(remaining, budget, month_key))
+    except RuntimeError:
+        pass
+
+
+async def _send_owner_low_token_alert(remaining: int, budget: int, month_key: str) -> None:
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            "⚠️ <b>AgentGPT: заканчивается общий лимит токенов</b>\n\n"
+            f"Остаток по установленному месячному бюджету: <code>{remaining:,}</code> из <code>{budget:,}</code>.\n"
+            f"Период: <code>{html.escape(month_key)}</code>.\n"
+            "Это расчётный лимит, установленный владельцем, а не подтверждённый баланс провайдера.",
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        print(f"[Owner Alert] Не удалось отправить уведомление о токенах: {exc}")
+
+
 def record_ai_usage(
     user: dict,
     input_tokens: int,
     output_tokens: int,
     extra_cost_rub: float = 0.0,
     reserved_cost_rub: float = 0.0,
+    model_id: str | None = None,
 ) -> float:
     plan = normalize_plan(user)
-    used_tokens = max(0, int(input_tokens)) + max(0, int(output_tokens))
+    input_tokens = max(0, int(input_tokens))
+    output_tokens = max(0, int(output_tokens))
+    used_tokens = input_tokens + output_tokens
     user["tokens"] = int(user.get("tokens", 0) or 0) + used_tokens
+
+    # Единый счётчик всего AgentGPT — отдельно от индивидуальных месячных лимитов.
+    if used_tokens:
+        usage = _ensure_global_usage_period()
+        usage["all_time_tokens"] = int(usage.get("all_time_tokens", 0) or 0) + used_tokens
+        usage["month_tokens"] = int(usage.get("month_tokens", 0) or 0) + used_tokens
+        model_key = str(model_id or "unknown")[:120]
+        all_models = usage.setdefault("models_all_time", {})
+        month_models = usage.setdefault("models_month", {})
+        all_models[model_key] = int(all_models.get(model_key, 0) or 0) + used_tokens
+        month_models[model_key] = int(month_models.get(model_key, 0) or 0) + used_tokens
+        save_usage_journal()
+        _schedule_owner_low_token_alert()
+
     cost = estimate_ai_cost_rub(input_tokens, output_tokens) + max(0.0, extra_cost_rub)
     reserve = max(0.0, float(reserved_cost_rub))
-    # В общей статистике расходы считаются для Free, Pro, Max и администратора.
     month_current = max(0.0, float(user.get("api_cost_month_rub", 0.0) or 0.0) - reserve)
     total_current = max(0.0, float(user.get("api_cost_total_rub", 0.0) or 0.0) - reserve)
     user["api_cost_month_rub"] = round(month_current + cost, 4)
@@ -1947,8 +2234,9 @@ def get_user(user_id: int) -> dict:
         save_data()
 
     curr = user.get("current_model", DEFAULT_MODEL)
-    if curr not in models_db or (models_db[curr]["premium"] and plan == "free" and user_id != ADMIN_ID):
-        user["current_model"] = DEFAULT_MODEL if DEFAULT_MODEL in models_db else next(iter(models_db))
+    valid_for_user = available_model_ids_for_user(user, user_id)
+    if curr not in valid_for_user:
+        user["current_model"] = valid_for_user[0]
     return user
 
 
@@ -1959,7 +2247,7 @@ def get_group(chat_id: int, chat_title: str = "") -> dict:
             "title": chat_title or "Группа",
             "ai_enabled": False,
             "agent_enabled": True,
-            "nickname": "ШколоAI",
+            "nickname": "AgentGPT",
             "history": [],
             "pending_followup": None,
             "warnings": {},
@@ -2004,7 +2292,7 @@ def get_group(chat_id: int, chat_title: str = "") -> dict:
         "title": chat_title or "Группа",
         "ai_enabled": False,
         "agent_enabled": True,
-        "nickname": "ШколоAI",
+        "nickname": "AgentGPT",
         "history": [],
         "pending_followup": None,
         "warnings": {},
@@ -2386,7 +2674,8 @@ def get_admin_main_kb():
             InlineKeyboardButton(text="🎨 Модель фото", callback_data="adm_panel_photomod"),
             InlineKeyboardButton(text="🌐 URL Roblox MCP", callback_data="adm_panel_mcpurl")
         ],
-        [InlineKeyboardButton(text="📢 Рассылка всем", callback_data="adm_panel_broadcast")]
+        [InlineKeyboardButton(text="📢 Рассылка всем", callback_data="adm_panel_broadcast")],
+        [InlineKeyboardButton(text="🧰 AgentGPT: владелец / API / хостинг", callback_data="adm_owner_tools")]
     ])
 
 
@@ -2473,16 +2762,16 @@ async def cb_rbx_download_plugin(callback: CallbackQuery):
     srv_url = user_mcp_url(uid)
 
     rbxm_bytes = build_rbxm_plugin_bytes(srv_url, tok)
-    plugin_file = BufferedInputFile(rbxm_bytes, filename="ShkoloAI_Roblox_MCP.rbxm")
+    plugin_file = BufferedInputFile(rbxm_bytes, filename="AgentGPT_Roblox_MCP.rbxm")
 
     caption = (
         "📥 <b>Ваш персональный плагин для Roblox Studio (.rbxm)!</b>\n\n"
         "В него уже вшит ваш токен и адрес сервера.\n\n"
         "<b>Как установить за 30 секунд:</b>\n"
         "1️⃣ В Roblox Studio откройте вкладку <b>Plugins</b> сверху и нажмите <b>Plugins Folder</b> (откроется папка плагинов на ПК).\n"
-        "2️⃣ Перетащите скачанный файл <code>ShkoloAI_Roblox_MCP.rbxm</code> в эту папку (или перетащите прямо в окно Studio -> ПКМ по скрипту -> <i>Save as Local Plugin</i>).\n"
+        "2️⃣ Перетащите скачанный файл <code>AgentGPT_Roblox_MCP.rbxm</code> в эту папку (или перетащите прямо в окно Studio -> ПКМ по скрипту -> <i>Save as Local Plugin</i>).\n"
         "3️⃣ В настройках игры (<b>Home -> Game Settings -> Security</b>) включите <b>Allow HTTP Requests</b>.\n"
-        "4️⃣ Нажмите кнопку <b>ШколоAI MCP</b> на верхней панели плагинов и нажмите <b>«ПОДКЛЮЧИТЬСЯ К БОТУ»</b>. При первом обращении Roblox Studio может показать запрос разрешения плагину связаться с доменом сервера — разрешите его."
+        "4️⃣ Нажмите кнопку <b>AgentGPT MCP</b> на верхней панели плагинов и нажмите <b>«ПОДКЛЮЧИТЬСЯ К БОТУ»</b>. При первом обращении Roblox Studio может показать запрос разрешения плагину связаться с доменом сервера — разрешите его."
     )
     await callback.message.answer_document(document=plugin_file, caption=caption, parse_mode="HTML")
     await callback.answer("📥 Отправляю файл плагина .rbxm...")
@@ -2493,12 +2782,12 @@ async def cb_rbx_help(callback: CallbackQuery):
     help_text = (
         "📖 <b>Инструкция по подключению Roblox Studio к боту:</b>\n\n"
         "1. Нажмите <b>«📥 Скачать плагин (.rbxm)»</b>.\n"
-        "2. Поместите файл <code>ShkoloAI_Roblox_MCP.rbxm</code> в папку плагинов Roblox Studio:\n"
+        "2. Поместите файл <code>AgentGPT_Roblox_MCP.rbxm</code> в папку плагинов Roblox Studio:\n"
         "   • Путь на Windows: <code>%LOCALAPPDATA%\\Roblox\\Plugins</code>\n"
         "   • Либо в самой Studio: вкладка <b>Plugins -> Plugins Folder</b>.\n"
         "3. Откройте ваш плейс в Roblox Studio.\n"
         "4. Включите HTTP-запросы: <b>File / Home -> Game Settings -> Security -> Allow HTTP Requests (ON)</b> (если плейс еще не опубликован в Roblox, сначала сохраните его).\n"
-        "5. На вкладке <b>Plugins</b> нажмите на иконку <b>ШколоAI MCP</b> и в открывшемся окошке нажмите зеленую кнопку <b>«ПОДКЛЮЧИТЬСЯ К БОТУ»</b>.\n"
+        "5. На вкладке <b>Plugins</b> нажмите на иконку <b>AgentGPT MCP</b> и в открывшемся окошке нажмите зеленую кнопку <b>«ПОДКЛЮЧИТЬСЯ К БОТУ»</b>.\n"
         "6. Разрешите плагину доступ к HTTP и Script Injection, если Studio спросит.\n"
         "7. Включите <b>Режим ИИ для Roblox: 🟢 ВКЛЮЧЕН</b> и пишите боту любые команды!"
     )
@@ -3021,7 +3310,7 @@ async def start_cmd(message: Message):
     u["state"] = None
     u["pending_followup"] = None
     await message.answer(
-        "👋 <b>Добро пожаловать в ШколоAI!</b>\n\n"
+        "👋 <b>Добро пожаловать в AgentGPT!</b>\n\n"
         "• 🧠 Задавайте любые вопросы и пишите код\n"
         "• 🎮 Подключайте <b>Roblox Studio (MCP)</b> — ИИ сам будет строить карты и писать скрипты на вашем плейсе!\n"
         "• 🖼 Анализ изображений доступен на Pro и Max с дневными лимитами\n"
@@ -3207,14 +3496,17 @@ async def menu_models(message: Message):
     u = get_user(message.from_user.id)
     buttons = []
 
-    for m_id, data in models_db.items():
+    provider_ids = bot_config.get("provider_model_ids") or []
+    model_items = [(m_id, data) for m_id, data in models_db.items() if not bot_config.get("provider_models_check_ok") or not provider_ids or m_id in provider_ids]
+    for m_id, data in model_items:
         prefix = "✅ " if u["current_model"] == m_id else ""
         lock = " 🔒" if data["premium"] and normalize_plan(u) == "free" and message.from_user.id != ADMIN_ID else ""
         vis = " 🖼" if data["vision"] else ""
         buttons.append([InlineKeyboardButton(text=f"{prefix}{data['name']}{vis}{lock}", callback_data=f"setmod_{m_id}")])
 
     await message.answer(
-        "🧠 <b>Выберите нейросеть:</b>\n<i>(🖼 — понимает фото, 🔒 — нужна подписка Pro или Max)</i>",
+        "🧠 <b>Выберите нейросеть:</b>\n<i>(🖼 — понимает фото, 🔒 — нужна подписка Pro или Max)</i>\n"
+        + (f"Проверка API: ✅ {len(provider_ids)} моделей" if bot_config.get("provider_models_check_ok") and provider_ids else "Список моделей провайдера ещё не подтверждён."),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         parse_mode="HTML"
     )
@@ -3225,6 +3517,9 @@ async def cb_set_model(callback: CallbackQuery):
     m_id = callback.data.replace("setmod_", "")
     if m_id not in models_db:
         return await callback.answer("Модель не найдена!", show_alert=True)
+    active_provider_ids = bot_config.get("provider_model_ids") or []
+    if bot_config.get("provider_models_check_ok") and active_provider_ids and m_id not in active_provider_ids:
+        return await callback.answer("Этой модели сейчас нет в списке провайдера. Обновите список моделей.", show_alert=True)
 
     u = get_user(callback.from_user.id)
     if models_db[m_id]["premium"] and normalize_plan(u) == "free" and callback.from_user.id != ADMIN_ID:
@@ -3285,7 +3580,7 @@ async def menu_subscription(message: Message):
         [InlineKeyboardButton(text="✉️ Написать в поддержку", callback_data="buy_sub_prompt")]
     ])
     await message.answer(
-        f"💳 <b>Тарифы ШколоAI</b>\n\n"
+        f"💳 <b>Тарифы AgentGPT</b>\n\n"
         f"<b>Pro — 49 ₽/мес.</b>\n• Увеличенные лимиты\n• Vision и генерация изображений: 4 анализа и 2 генерации в день\n"
         f"• Доступ к Pro-моделям\n\n"
         f"<b>Max — 99 ₽/мес.</b>\n• Повышенные лимиты\n• До 12 анализов и 6 генераций изображений в день\n"
@@ -3325,17 +3620,908 @@ async def cb_buy_sub_prompt(callback: CallbackQuery):
 
 
 # =========================================================================
+# --- OWNER CONTROL: API, MODEL MONITOR, TOKEN MONITOR, BOT-HOSTING ---
+# =========================================================================
+def owner_private_message(message: Message) -> bool:
+    return bool(message.from_user and message.from_user.id == ADMIN_ID and message.chat.type == "private")
+
+
+def _mask_secret(value: str) -> str:
+    value = str(value or "")
+    if not value:
+        return "не задан"
+    return (value[:4] + "••••••" + value[-3:]) if len(value) > 10 else "••••••••"
+
+
+def _write_dotenv_value(key: str, value: str) -> None:
+    if not re.fullmatch(r"[A-Z][A-Z0-9_]{1,63}", key):
+        raise ValueError("Недопустимое имя переменной окружения.")
+    if "\n" in value or "\r" in value:
+        raise ValueError("Значение должно быть одной строкой.")
+    try:
+        existing = Path(DOTENV_FILE).read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        existing = []
+    new_line = f"{key}={json.dumps(value, ensure_ascii=False)}"
+    output = []
+    replaced = False
+    pattern = re.compile(rf"^\s*{re.escape(key)}\s*=")
+    for line in existing:
+        if pattern.match(line):
+            if not replaced:
+                output.append(new_line)
+                replaced = True
+        else:
+            output.append(line)
+    if not replaced:
+        output.append(new_line)
+    temp = DOTENV_FILE + ".tmp"
+    Path(temp).write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
+    try:
+        os.chmod(temp, 0o600)
+    except OSError:
+        pass
+    os.replace(temp, DOTENV_FILE)
+    try:
+        os.chmod(DOTENV_FILE, 0o600)
+    except OSError:
+        pass
+    os.environ[key] = value
+
+
+def _validate_https_base_url(value: str) -> str:
+    value = value.strip().rstrip("/")
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
+        raise ValueError("Нужен корректный HTTPS Base URL без логина и пароля.")
+    if "/chat/completions" in parsed.path:
+        raise ValueError("Укажите Base URL, а не полный путь /chat/completions.")
+    return value
+
+
+async def apply_owner_setting(key: str, value: str) -> str:
+    global AI_API_KEY, AI_BASE_URL, PHOTO_GENERATIONAL_KEY, PHOTO_BASE_URL, BOT_HOSTING_API_KEY
+    if key == "AI_API_KEY":
+        old_key = AI_API_KEY
+        _write_dotenv_value(key, value)
+        AI_API_KEY = value
+        if not os.getenv("PHOTO_GENERATIONAL_KEY") and PHOTO_GENERATIONAL_KEY == old_key:
+            PHOTO_GENERATIONAL_KEY = value
+            os.environ["PHOTO_GENERATIONAL_KEY"] = value
+            _write_dotenv_value("PHOTO_GENERATIONAL_KEY", value)
+            await _close_openai_clients(photo_clients)
+            rebuild_photo_clients()
+        await _close_openai_clients(ai_clients)
+        rebuild_ai_clients()
+    elif key == "AI_BASE_URL":
+        value = _validate_https_base_url(value)
+        await _close_openai_clients(ai_clients)
+        _write_dotenv_value(key, value)
+        AI_BASE_URL = value
+        rebuild_ai_clients()
+    elif key == "PHOTO_GENERATIONAL_KEY":
+        _write_dotenv_value(key, value)
+        PHOTO_GENERATIONAL_KEY = value
+        await _close_openai_clients(photo_clients)
+        rebuild_photo_clients()
+    elif key == "PHOTO_BASE_URL":
+        value = _validate_https_base_url(value)
+        _write_dotenv_value(key, value)
+        PHOTO_BASE_URL = value
+        await _close_openai_clients(photo_clients)
+        rebuild_photo_clients()
+    elif key == "BOT_HOSTING_API_KEY":
+        if len(value) < 12:
+            raise ValueError("Ключ Bot-Hosting слишком короткий.")
+        _write_dotenv_value(key, value)
+        BOT_HOSTING_API_KEY = value
+    else:
+        raise ValueError("Неизвестная настройка.")
+
+    # If the owner chose a deployment, synchronize API settings to its environment.
+    # Bot-Hosting environment variables take precedence over the local .env after restart.
+    sync_result = ""
+    if key in {"AI_API_KEY", "AI_BASE_URL", "PHOTO_GENERATIONAL_KEY", "PHOTO_BASE_URL"}:
+        selected_deployment = str(bot_config.get("bot_hosting_deployment_id", "") or "")
+        if selected_deployment and BOT_HOSTING_API_KEY:
+            try:
+                selected_deployment = _safe_deployment_id(selected_deployment)
+                await _get_owned_deployment(selected_deployment)
+                secret_flag = "KEY" in key
+                await bot_host_api_request(
+                    "POST", f"/deployments/{selected_deployment}/env",
+                    payload={"key": key, "value": value, "secret": secret_flag},
+                )
+                sync_result = (
+                    f"\n✅ Также отправлено в переменные основного деплоя <code>{html.escape(selected_deployment)}</code>. "
+                    "Для применения нужен перезапуск деплоя."
+                )
+            except Exception as sync_exc:
+                sync_result = (
+                    "\n⚠️ Значение сохранено в текущем процессе и локальном .env, но синхронизация с Bot-Hosting не прошла: "
+                    f"<code>{html.escape(str(sync_exc)[:300])}</code>. Проверьте scopes deployments:read и env:write."
+                )
+        elif selected_deployment:
+            sync_result = "\n⚠️ Основной деплой выбран, но Bot-Hosting API key не настроен; удалённая переменная не обновлена."
+        else:
+            sync_result = "\nℹ️ Значение сохранено локально. Выберите основной деплой в панели Bot-Hosting, чтобы синхронизировать его переменные."
+
+    # После изменения AI-ключа или Base URL сразу проверяем GET /models,
+    # не заставляя владельца ждать следующего шестичасового цикла.
+    if key in {"AI_API_KEY", "AI_BASE_URL"}:
+        try:
+            model_check = await refresh_provider_models(notify=False)
+            prefix = "\n✅ " if model_check.get("ok") else "\n⚠️ "
+            sync_result += prefix + "Проверка моделей: " + html.escape(str(model_check.get("message", "нет ответа"))[:700])
+        except Exception as model_exc:
+            sync_result += "\n⚠️ Проверка моделей завершилась ошибкой: " + html.escape(str(model_exc)[:400])
+    return sync_result
+
+
+async def _close_openai_clients(clients: list) -> None:
+    for client in list(clients or []):
+        try:
+            await client.close()
+        except Exception:
+            pass
+
+
+def render_owner_tools_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Общий расход токенов", callback_data="owner_tokens")],
+        [InlineKeyboardButton(text="🔎 Полная проверка лимитов пользователей", callback_data="owner_limit_audit")],
+        [InlineKeyboardButton(text="🔔 Настроить бюджет / предупреждение", callback_data="owner_budget")],
+        [InlineKeyboardButton(text="🔑 API-ключи и Base URL", callback_data="owner_api_settings")],
+        [InlineKeyboardButton(text="🧠 Проверить / обновить модели", callback_data="owner_models_sync")],
+        [InlineKeyboardButton(text="🖥 Bot-Hosting: управление", callback_data="host_menu")],
+        [InlineKeyboardButton(text="🔙 Назад в админ-панель", callback_data="adm_back_main")],
+    ])
+
+
+def owner_tokens_text() -> str:
+    usage = _ensure_global_usage_period()
+    this_month = datetime.now().strftime("%Y-%m")
+    budget = max(0, int(bot_config.get("global_token_budget", 0) or 0))
+    threshold = max(0, int(bot_config.get("global_token_alert_threshold", 0) or 0))
+    month_used = int(usage.get("month_tokens", 0) or 0) if usage.get("month_key") == this_month else 0
+    remaining = max(0, budget - month_used) if budget else None
+    rows = sorted((usage.get("models_month", {}) or {}).items(), key=lambda x: int(x[1] or 0), reverse=True)
+    model_text = "\n".join(f"• <code>{html.escape(str(k))}</code>: <code>{int(v):,}</code>" for k, v in rows[:10]) or "• Пока нет данных по моделям"
+    budget_text = (f"\n📦 Бюджет: <code>{budget:,}</code>\nОстаток расчётного бюджета: <code>{remaining:,}</code>\nПорог уведомления: <code>{threshold:,}</code>") if budget else "\n📦 Бюджет не задан — уведомления о малом остатке отключены."
+    return (
+        "📊 <b>Общий расход токенов AgentGPT</b>\n\n"
+        f"За всё время: <code>{int(usage.get('all_time_tokens', 0) or 0):,}</code>\n"
+        f"За текущий месяц ({this_month}): <code>{month_used:,}</code>"
+        f"{budget_text}\n\n"
+        "<b>Расход по моделям за месяц:</b>\n" + model_text + "\n\n"
+        "Счётчик суммирует input + output usage из ответов AI API. Это не баланс аккаунта у провайдера."
+    )
+
+
+async def bot_host_api_request(method: str, path: str, *, params: dict | None = None, payload: dict | None = None):
+    if not BOT_HOSTING_API_KEY:
+        raise RuntimeError("Не задан Bot-Hosting API key. Добавьте его в разделе API-ключи.")
+    if not path.startswith("/") or ".." in path:
+        raise ValueError("Недопустимый путь API.")
+    timeout = aiohttp.ClientTimeout(total=35)
+    headers = {"Authorization": f"Bearer {BOT_HOSTING_API_KEY}", "Accept": "application/json"}
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        async with session.request(method.upper(), BOT_HOST_API_BASE + path, params=params, json=payload) as response:
+            body = await response.text()
+            try:
+                data = json.loads(body) if body else {}
+            except json.JSONDecodeError:
+                data = {"raw": body[:1500]}
+            if response.status >= 400:
+                if isinstance(data, dict):
+                    message = data.get("message") or data.get("error") or data.get("detail") or body[:500]
+                else:
+                    message = body[:500]
+                raise RuntimeError(f"Bot-Hosting API HTTP {response.status}: {str(message)[:500]}")
+            return data
+
+
+def _safe_deployment_id(value: str) -> str:
+    value = str(value or "")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{3,64}", value):
+        raise ValueError("Некорректный ID деплоя.")
+    return value
+
+
+async def _get_owned_deployment(deployment_id: str) -> dict:
+    deployment_id = _safe_deployment_id(deployment_id)
+    data = await bot_host_api_request("GET", f"/deployments/{deployment_id}")
+    if not isinstance(data, dict) or data.get("owned") is not True:
+        raise PermissionError("Управление доступно только собственными деплоями Bot-Hosting.")
+    return data
+
+
+async def upload_telegram_document_to_hosting(message: Message, deployment_id: str, folder_path: str) -> dict:
+    """Загружает документ из Telegram через одноразовый upload URL Bot-Hosting."""
+    doc = message.document
+    if not doc:
+        raise ValueError("Отправьте файл именно как документ.")
+    if not doc.file_name:
+        raise ValueError("У файла отсутствует имя.")
+    max_bytes = 20 * 1024 * 1024
+    if int(doc.file_size or 0) > max_bytes:
+        raise ValueError("Telegram Bot API позволяет боту скачать файл не более 20 МБ за раз.")
+    safe_folder = str(folder_path or "/").strip()
+    if not safe_folder.startswith("/") or ".." in safe_folder or len(safe_folder) > 240:
+        raise ValueError("Папка назначения должна быть абсолютным безопасным путём внутри деплоя.")
+    safe_folder = safe_folder.rstrip("/") or "/"
+    await _get_owned_deployment(deployment_id)
+
+    telegram_file = await bot.get_file(doc.file_id)
+    if not telegram_file.file_path:
+        raise RuntimeError("Telegram не вернул путь файла для скачивания.")
+    buffer = io.BytesIO()
+    await bot.download_file(telegram_file.file_path, destination=buffer)
+    raw = buffer.getvalue()
+    if not raw:
+        raise ValueError("Получен пустой файл.")
+    if len(raw) > max_bytes:
+        raise ValueError("Размер загруженного файла превышает 20 МБ.")
+
+    upload_info = await bot_host_api_request(
+        "POST", f"/deployments/{deployment_id}/files/upload-url",
+        payload={"path": safe_folder},
+    )
+    if not isinstance(upload_info, dict):
+        raise RuntimeError("Bot-Hosting не вернул данные одноразовой ссылки для загрузки.")
+    upload_url = str(upload_info.get("url", ""))
+    field_name = str(upload_info.get("field", "files") or "files")
+    parsed = urllib.parse.urlparse(upload_url)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise RuntimeError("Bot-Hosting вернул некорректную или небезопасную ссылку загрузки.")
+    filename = os.path.basename(str(doc.file_name).replace("\\", "/")).strip()
+    filename = re.sub(r"[\x00-\x1f\x7f]", "_", filename)[:180] or "upload.bin"
+    form = aiohttp.FormData()
+    form.add_field(
+        field_name, raw, filename=filename,
+        content_type=doc.mime_type or "application/octet-stream",
+    )
+    timeout = aiohttp.ClientTimeout(total=180)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(upload_url, data=form) as response:
+            response_body = await response.text()
+            if response.status >= 400:
+                raise RuntimeError(f"Ошибка прямой загрузки HTTP {response.status}: {response_body[:400]}")
+            try:
+                upload_result = json.loads(response_body) if response_body else {}
+            except json.JSONDecodeError:
+                upload_result = {"response": response_body[:500]}
+    return {
+        "filename": filename,
+        "folder": safe_folder,
+        "bytes": len(raw),
+        "expires_at": upload_info.get("expiresAt", ""),
+        "result": upload_result,
+    }
+
+
+def _host_deployment_keyboard(deployment: dict) -> InlineKeyboardMarkup:
+    dep_id = str(deployment.get("id", ""))
+    state = str(deployment.get("state", "unknown"))
+    power_action = "stop" if state == "running" else "start"
+    power_label = "⏹ Остановить" if power_action == "stop" else "▶️ Запустить"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Перезапустить", callback_data=f"host_power|{dep_id}|restart"),
+         InlineKeyboardButton(text=power_label, callback_data=f"host_power|{dep_id}|{power_action}")],
+        [InlineKeyboardButton(text="🩺 Диагностика и логи", callback_data=f"host_diag|{dep_id}")],
+        [InlineKeyboardButton(text="⭐ Сделать основным деплоем", callback_data=f"host_select|{dep_id}")],
+        [InlineKeyboardButton(text="📁 Файлы проекта", callback_data=f"host_files|{dep_id}")],
+        [InlineKeyboardButton(text="📖 Прочитать файл", callback_data=f"host_read|{dep_id}"),
+         InlineKeyboardButton(text="🔎 Поиск в файлах", callback_data=f"host_search|{dep_id}")],
+        [InlineKeyboardButton(text="👁 Переменные", callback_data=f"host_env_list|{dep_id}"),
+         InlineKeyboardButton(text="✏️ Изменить ключ/URL", callback_data=f"host_env|{dep_id}")],
+        [InlineKeyboardButton(text="🧪 Проверить настройки", callback_data=f"host_env_audit|{dep_id}")],
+        [InlineKeyboardButton(text="🔙 Список деплоев", callback_data="host_list")],
+    ])
+
+
+@dp.message(Command("owner"))
+async def owner_command(message: Message):
+    if not owner_private_message(message):
+        return
+    await message.answer("🧰 <b>AgentGPT — панель владельца</b>", reply_markup=render_owner_tools_keyboard(), parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "adm_owner_tools")
+async def cb_owner_tools(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID or callback.message.chat.type != "private":
+        return await callback.answer("Недостаточно прав.", show_alert=True)
+    await callback.message.edit_text("🧰 <b>AgentGPT — панель владельца</b>", reply_markup=render_owner_tools_keyboard(), parse_mode="HTML")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "owner_tokens")
+async def cb_owner_tokens(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID or callback.message.chat.type != "private":
+        return await callback.answer("Недостаточно прав.", show_alert=True)
+    await callback.message.edit_text(owner_tokens_text(), reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="owner_tokens")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_owner_tools")],
+    ]), parse_mode="HTML")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "owner_limit_audit")
+async def cb_owner_limit_audit(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID or callback.message.chat.type != "private":
+        return await callback.answer("Недостаточно прав.", show_alert=True)
+    now = datetime.now()
+    total = over = expired = invalid = missing_reset = 0
+    plan_counts = {"free": 0, "pro": 0, "max": 0}
+    over_samples = []
+    for uid, user in users_db.items():
+        if not isinstance(user, dict):
+            invalid += 1
+            continue
+        total += 1
+        try:
+            tokens = int(user.get("tokens", 0) or 0)
+            if tokens < 0:
+                invalid += 1
+                tokens = 0
+        except (TypeError, ValueError):
+            invalid += 1
+            tokens = 0
+        plan = normalize_plan(user)
+        plan_counts[plan] = plan_counts.get(plan, 0) + 1
+        base_limit = max(0, int(bot_config.get("free_limit", 45000) or 0)) if plan == "free" else max(0, int(bot_config.get("sub_limit", 1000000) or 0)) * (2 if plan == "max" else 1)
+        if tokens > base_limit:
+            over += 1
+            if len(over_samples) < 12:
+                over_samples.append(f"<code>{uid}</code>: {tokens:,}/{base_limit:,} ({plan.upper()})")
+        raw_reset = user.get("reset_date")
+        reset_at = _parse_saved_datetime(raw_reset)
+        if reset_at is None:
+            missing_reset += 1
+        elif now >= reset_at:
+            expired += 1
+    save_data()
+    sample_text = "\n".join(over_samples) if over_samples else "Нет пользователей выше лимита."
+    report = (
+        "🔎 <b>Аудит пользовательских лимитов AgentGPT</b>\n\n"
+        f"Пользователей проверено: <code>{total:,}</code>\n"
+        f"Free / Pro / Max: <code>{plan_counts.get('free', 0)}</code> / <code>{plan_counts.get('pro', 0)}</code> / <code>{plan_counts.get('max', 0)}</code>\n"
+        f"Выше текущего лимита: <code>{over}</code>\n"
+        f"Срок сброса уже наступил: <code>{expired}</code>\n"
+        f"Нет корректной даты сброса: <code>{missing_reset}</code>\n"
+        f"Некорректные значения счётчиков/записей: <code>{invalid}</code>\n\n"
+        "<b>Первые записи выше лимита:</b>\n" + sample_text + "\n\n"
+        "Аудит ничего не сбрасывает. Истёкшие 30-дневные периоды будут обновлены штатной логикой при следующем обращении пользователя."
+    )
+    await callback.message.edit_text(report, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Проверить снова", callback_data="owner_limit_audit")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_owner_tools")],
+    ]), parse_mode="HTML")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "owner_budget")
+async def cb_owner_budget(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID or callback.message.chat.type != "private":
+        return await callback.answer("Недостаточно прав.", show_alert=True)
+    admin_state[ADMIN_ID] = {"action": "owner_set_budget"}
+    await callback.message.edit_text(
+        "🔔 <b>Бюджет токенов</b>\nВведите два целых числа через |: <code>месячный_бюджет|порог_уведомления</code>\n"
+        "Например: <code>1000000|100000</code>. Ноль в бюджете отключает предупреждения.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="adm_owner_tools")]]),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "owner_api_settings")
+async def cb_owner_api_settings(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID or callback.message.chat.type != "private":
+        return await callback.answer("Недостаточно прав.", show_alert=True)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="AI API key", callback_data="owner_set|AI_API_KEY")],
+        [InlineKeyboardButton(text="AI Base URL", callback_data="owner_set|AI_BASE_URL")],
+        [InlineKeyboardButton(text="Photo API key", callback_data="owner_set|PHOTO_GENERATIONAL_KEY")],
+        [InlineKeyboardButton(text="Photo Base URL", callback_data="owner_set|PHOTO_BASE_URL")],
+        [InlineKeyboardButton(text="Bot-Hosting API key", callback_data="owner_set|BOT_HOSTING_API_KEY")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_owner_tools")],
+    ])
+    await callback.message.edit_text(
+        "🔑 <b>Настройки подключений</b>\n"
+        f"AI key: <code>{_mask_secret(AI_API_KEY)}</code>\n"
+        f"AI URL: <code>{html.escape(AI_BASE_URL)}</code>\n"
+        f"Photo key: <code>{_mask_secret(PHOTO_GENERATIONAL_KEY)}</code>\n"
+        f"Photo URL: <code>{html.escape(PHOTO_BASE_URL)}</code>\n"
+        f"Bot-Hosting key: <code>{_mask_secret(BOT_HOSTING_API_KEY)}</code>\n\n"
+        "Ключи вводи только в личном чате. Сообщение с секретом бот попробует удалить после сохранения.",
+        reply_markup=kb, parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("owner_set|"))
+async def cb_owner_set_setting(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID or callback.message.chat.type != "private":
+        return await callback.answer("Недостаточно прав.", show_alert=True)
+    key = callback.data.split("|", 1)[1]
+    allowed = {"AI_API_KEY", "AI_BASE_URL", "PHOTO_GENERATIONAL_KEY", "PHOTO_BASE_URL", "BOT_HOSTING_API_KEY"}
+    if key not in allowed:
+        return await callback.answer("Неизвестная настройка.", show_alert=True)
+    admin_state[ADMIN_ID] = {"action": "owner_set_env", "key": key}
+    label = "новый секретный ключ" if "KEY" in key else "новый HTTPS Base URL"
+    await callback.message.answer(f"Введите {label} для <code>{key}</code> одним сообщением:", parse_mode="HTML")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "owner_models_sync")
+async def cb_owner_models_sync(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID or callback.message.chat.type != "private":
+        return await callback.answer("Недостаточно прав.", show_alert=True)
+    await callback.answer("Проверяю /models у провайдера…")
+    result = await refresh_provider_models(notify=False)
+    ok = result.get("ok")
+    msg = result.get("message", "Проверка не завершилась.")
+    await callback.message.answer(("✅ " if ok else "⚠️ ") + html.escape(msg), reply_markup=render_owner_tools_keyboard(), parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "host_menu")
+async def cb_host_menu(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID or callback.message.chat.type != "private":
+        return await callback.answer("Недостаточно прав.", show_alert=True)
+    if not BOT_HOSTING_API_KEY:
+        admin_state[ADMIN_ID] = {"action": "owner_set_env", "key": "BOT_HOSTING_API_KEY"}
+        await callback.message.answer("Для подключения введите Bot-Hosting API key из Developer settings. Не отправляйте его в групповой чат.")
+        return await callback.answer()
+    await callback.message.edit_text("🖥 <b>Bot-Hosting</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Мои деплои", callback_data="host_list")],
+        [InlineKeyboardButton(text="🔑 Изменить API key", callback_data="owner_set|BOT_HOSTING_API_KEY")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_owner_tools")],
+    ]), parse_mode="HTML")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "host_list")
+async def cb_host_list(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID or callback.message.chat.type != "private":
+        return await callback.answer("Недостаточно прав.", show_alert=True)
+    await callback.answer("Получаю список деплоев…")
+    try:
+        data = await bot_host_api_request("GET", "/deployments")
+        deployments = data.get("deployments", []) if isinstance(data, dict) else []
+        if not isinstance(deployments, list):
+            deployments = []
+        owned = []
+        for item in deployments[:40]:
+            try:
+                if isinstance(item, dict) and item.get("owned") is True and item.get("id"):
+                    owned.append(item)
+                elif isinstance(item, str):
+                    dep = await _get_owned_deployment(item)
+                    owned.append(dep)
+            except Exception:
+                continue
+        rows = [[InlineKeyboardButton(
+            text=f"{str(d.get('name') or d.get('id'))[:30]} · {d.get('state', 'unknown')}",
+            callback_data=f"host_open|{_safe_deployment_id(d.get('id'))}"
+        )] for d in owned[:25]]
+        rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="host_menu")])
+        text = f"📋 <b>Собственные деплои:</b> <code>{len(owned)}</code>"
+        if not owned:
+            text += "\nНе найдено собственных деплоев. Проверь scope deployments:read и доступ аккаунта."
+        await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
+    except Exception as exc:
+        await callback.message.answer(f"❌ Bot-Hosting: {html.escape(str(exc)[:700])}", reply_markup=render_owner_tools_keyboard(), parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("host_open|"))
+async def cb_host_open(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID or callback.message.chat.type != "private":
+        return await callback.answer("Недостаточно прав.", show_alert=True)
+    try:
+        dep_id = _safe_deployment_id(callback.data.split("|", 1)[1])
+        dep = await _get_owned_deployment(dep_id)
+        node = dep.get("node") or {}
+        conn = dep.get("connection") or {}
+        resources = dep.get("resources") or {}
+        addr = conn.get("host") or node.get("fqdn") or "не опубликован"
+        port = conn.get("port") or dep.get("port") or "—"
+        resolved_ips = []
+        if addr and addr != "не опубликован":
+            try:
+                infos = await asyncio.wait_for(
+                    asyncio.get_running_loop().getaddrinfo(str(addr), int(port) if str(port).isdigit() else None, type=socket.SOCK_STREAM),
+                    timeout=3.0,
+                )
+                resolved_ips = sorted({str(info[4][0]) for info in infos if info and info[4]})
+            except Exception:
+                resolved_ips = []
+        ip_text = ", ".join(resolved_ips[:6]) if resolved_ips else "DNS IP не получен (используйте FQDN)"
+        ram = resources.get("ramMB", "—")
+        cpu = resources.get("cpuPercent", "—")
+        disk = resources.get("storageMB", "—")
+        body = (
+            f"🖥 <b>{html.escape(str(dep.get('name') or dep_id))}</b>\n"
+            f"ID: <code>{html.escape(dep_id)}</code>\n"
+            f"Состояние: <b>{html.escape(str(dep.get('state', 'unknown')))}</b>\n"
+            f"Используется для синхронизации API-настроек: <b>{'да' if bot_config.get('bot_hosting_deployment_id') == dep_id else 'нет'}</b>\n"
+            f"Runtime: <code>{html.escape(str(dep.get('runtime', '—')))}</code>\n"
+            f"Узел / адрес: <code>{html.escape(str(addr))}</code>\n"
+            f"IP (DNS): <code>{html.escape(ip_text)}</code>\n"
+            f"Порт: <code>{html.escape(str(port))}</code>\n"
+            f"Регион: <code>{html.escape(str(node.get('region', '—')))}</code>\n"
+            f"Ресурсы: RAM <code>{ram} MB</code>, CPU <code>{cpu}%</code>, диск <code>{disk} MB</code>\n"
+            f"Домен: <code>{html.escape(str((dep.get('domains') or {}).get('custom') or (dep.get('domains') or {}).get('subdomain') or '—'))}</code>"
+        )
+        await callback.message.edit_text(body, reply_markup=_host_deployment_keyboard(dep), parse_mode="HTML")
+        await callback.answer()
+    except Exception as exc:
+        await callback.answer(str(exc)[:180], show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("host_select|"))
+async def cb_host_select_deployment(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID or callback.message.chat.type != "private":
+        return await callback.answer("Недостаточно прав.", show_alert=True)
+    try:
+        dep_id = _safe_deployment_id(callback.data.split("|", 1)[1])
+        await _get_owned_deployment(dep_id)
+        bot_config["bot_hosting_deployment_id"] = dep_id
+        save_data()
+        await callback.message.edit_text(
+            f"⭐ Основной деплой для синхронизации API-настроек: <code>{html.escape(dep_id)}</code>.\n"
+            "Теперь изменения AI_API_KEY, AI_BASE_URL, PHOTO_GENERATIONAL_KEY и PHOTO_BASE_URL будут отправляться и в переменные этого деплоя.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Открыть деплой", callback_data=f"host_open|{dep_id}")],
+                [InlineKeyboardButton(text="К списку деплоев", callback_data="host_list")],
+            ]), parse_mode="HTML",
+        )
+        await callback.answer("Основной деплой выбран.")
+    except Exception as exc:
+        await callback.answer(str(exc)[:180], show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("host_power|"))
+async def cb_host_power(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID or callback.message.chat.type != "private":
+        return await callback.answer("Недостаточно прав.", show_alert=True)
+    try:
+        _, dep_id, action = callback.data.split("|", 2)
+        dep_id = _safe_deployment_id(dep_id)
+        if action not in {"start", "stop", "restart"}:
+            raise ValueError("Недопустимое действие питания.")
+        await _get_owned_deployment(dep_id)
+        if action == "stop":
+            return await callback.message.edit_text(
+                "⚠️ <b>Подтверди остановку деплоя.</b> Сервис станет недоступен до повторного запуска.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="⏹ Подтвердить остановку", callback_data=f"host_confirmstop|{dep_id}")],
+                    [InlineKeyboardButton(text="Отмена", callback_data=f"host_open|{dep_id}")],
+                ]), parse_mode="HTML"
+            )
+        await callback.answer("Отправляю команду…")
+        result = await bot_host_api_request("POST", f"/deployments/{dep_id}/power", payload={"action": action, "waitSeconds": 20})
+        log_excerpt = "\n".join(result.get("logs", [])[-12:]) if isinstance(result.get("logs"), list) else ""
+        await callback.message.answer(
+            f"Команда: <b>{html.escape(action)}</b>\nСостояние после операции: <b>{html.escape(str(result.get('state', 'unknown')))}</b>\n"
+            f"Подтверждение API: <code>{bool(result.get('ok'))}</code>\n\n<pre>{html.escape(log_excerpt[:2500])}</pre>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Открыть деплой", callback_data=f"host_open|{dep_id}")]]),
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        await callback.message.answer(f"❌ {html.escape(str(exc)[:700])}", parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("host_confirmstop|"))
+async def cb_host_confirm_stop(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID or callback.message.chat.type != "private":
+        return await callback.answer("Недостаточно прав.", show_alert=True)
+    try:
+        dep_id = _safe_deployment_id(callback.data.split("|", 1)[1])
+        await _get_owned_deployment(dep_id)
+        await bot_host_api_request("POST", f"/deployments/{dep_id}/power", payload={"action": "stop", "waitSeconds": 0})
+        await callback.message.edit_text("⏹ Запрос на остановку отправлен.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Открыть деплой", callback_data=f"host_open|{dep_id}")]
+        ]))
+        await callback.answer()
+    except Exception as exc:
+        await callback.answer(str(exc)[:180], show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("host_diag|"))
+async def cb_host_diag(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID or callback.message.chat.type != "private":
+        return await callback.answer("Недостаточно прав.", show_alert=True)
+    try:
+        dep_id = _safe_deployment_id(callback.data.split("|", 1)[1])
+        await _get_owned_deployment(dep_id)
+        await callback.answer("Собираю диагностику…")
+        data = await bot_host_api_request("GET", f"/deployments/{dep_id}/diagnose", params={"waitSeconds": 1})
+        logs = data.get("logs", [])
+        if isinstance(logs, list):
+            logs_text = "\n".join(str(x) for x in logs[-25:])
+        else:
+            logs_text = str(logs or "")
+        http_info = data.get("http") or {}
+        body = (
+            f"🩺 <b>Диагностика</b>\nСостояние: <code>{html.escape(str(data.get('state', 'unknown')))}</code>\n"
+            f"RAM: <code>{html.escape(str((data.get('resources') or {}).get('ramMB', '—')))}</code> MB\n"
+            f"HTTP check: <code>{html.escape(str(http_info.get('status', '—')))}</code>\n"
+            f"URL: <code>{html.escape(str(http_info.get('url', '—')))}</code>\n"
+            f"Подсказка: {html.escape(str(data.get('hint', '—'))[:500])}\n\n"
+            f"<pre>{html.escape(logs_text[:3000] or 'Логи пусты')}</pre>"
+        )
+        await callback.message.answer(body, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Обновить диагностику", callback_data=f"host_diag|{dep_id}")],
+            [InlineKeyboardButton(text="К деплою", callback_data=f"host_open|{dep_id}")],
+        ]), parse_mode="HTML")
+    except Exception as exc:
+        await callback.message.answer(f"❌ {html.escape(str(exc)[:700])}", parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("host_files|"))
+async def cb_host_files(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID or callback.message.chat.type != "private":
+        return await callback.answer("Недостаточно прав.", show_alert=True)
+    try:
+        dep_id = _safe_deployment_id(callback.data.split("|", 1)[1])
+        await _get_owned_deployment(dep_id)
+        data = await bot_host_api_request("GET", f"/deployments/{dep_id}/files/tree", params={"depth": 3, "maxEntries": 100})
+        tree = str(data.get("tree", "Файлы не возвращены"))
+        await callback.message.answer(
+            f"📁 <b>Файлы деплоя</b> <code>{html.escape(dep_id)}</code>\n<pre>{html.escape(tree[:3300])}</pre>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📤 Загрузить файл из Telegram", callback_data=f"host_upload|{dep_id}")],
+                [InlineKeyboardButton(text="✏️ Записать текстовый файл", callback_data=f"host_edit|{dep_id}")],
+                [InlineKeyboardButton(text="Применить / перезапустить", callback_data=f"host_apply|{dep_id}")],
+                [InlineKeyboardButton(text="К деплою", callback_data=f"host_open|{dep_id}")],
+            ]), parse_mode="HTML",
+        )
+        await callback.answer()
+    except Exception as exc:
+        await callback.answer(str(exc)[:180], show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("host_upload|"))
+async def cb_host_upload_file(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID or callback.message.chat.type != "private":
+        return await callback.answer("Недостаточно прав.", show_alert=True)
+    try:
+        dep_id = _safe_deployment_id(callback.data.split("|", 1)[1])
+        await _get_owned_deployment(dep_id)
+        admin_state[ADMIN_ID] = {"action": "host_upload_dir", "deployment_id": dep_id}
+        await callback.message.answer(
+            "📤 Введите папку назначения (например <code>/</code> или <code>/src</code>). "
+            "Следующим сообщением отправьте сам файл документом.",
+            parse_mode="HTML",
+        )
+        await callback.answer()
+    except Exception as exc:
+        await callback.answer(str(exc)[:180], show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("host_read|"))
+async def cb_host_read_file(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID or callback.message.chat.type != "private":
+        return await callback.answer("Недостаточно прав.", show_alert=True)
+    dep_id = _safe_deployment_id(callback.data.split("|", 1)[1])
+    await _get_owned_deployment(dep_id)
+    admin_state[ADMIN_ID] = {"action": "host_read_path", "deployment_id": dep_id}
+    await callback.message.answer("Введите путь файла для чтения, например <code>/main.py</code>:", parse_mode="HTML")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("host_search|"))
+async def cb_host_search_files(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID or callback.message.chat.type != "private":
+        return await callback.answer("Недостаточно прав.", show_alert=True)
+    dep_id = _safe_deployment_id(callback.data.split("|", 1)[1])
+    await _get_owned_deployment(dep_id)
+    admin_state[ADMIN_ID] = {"action": "host_search_query", "deployment_id": dep_id}
+    await callback.message.answer("Введите текст для поиска в файлах деплоя:")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("host_edit|"))
+async def cb_host_edit_file(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID or callback.message.chat.type != "private":
+        return await callback.answer("Недостаточно прав.", show_alert=True)
+    dep_id = _safe_deployment_id(callback.data.split("|", 1)[1])
+    admin_state[ADMIN_ID] = {"action": "host_edit_path", "deployment_id": dep_id}
+    await callback.message.answer("Введите путь файла от корня деплоя, например <code>/main.py</code>:", parse_mode="HTML")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("host_apply|"))
+async def cb_host_apply(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID or callback.message.chat.type != "private":
+        return await callback.answer("Недостаточно прав.", show_alert=True)
+    dep_id = _safe_deployment_id(callback.data.split("|", 1)[1])
+    await _get_owned_deployment(dep_id)
+    await callback.answer("Применяю изменения, это может перезапустить процесс…")
+    try:
+        result = await bot_host_api_request("POST", f"/deployments/{dep_id}/apply", payload={"restart": True, "waitSeconds": 20})
+        await callback.message.answer(
+            f"✅ Apply завершён. Состояние: <code>{html.escape(str(result.get('state', 'unknown')))}</code>\n"
+            f"Подсказка: {html.escape(str(result.get('hint', '—'))[:500])}",
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        await callback.message.answer(f"❌ Apply не выполнен: {html.escape(str(exc)[:700])}", parse_mode="HTML")
+
+
+
+
+@dp.callback_query(F.data.startswith("host_env_list|"))
+async def cb_host_env_list(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID or callback.message.chat.type != "private":
+        return await callback.answer("Недостаточно прав.", show_alert=True)
+    try:
+        dep_id = _safe_deployment_id(callback.data.split("|", 1)[1])
+        await _get_owned_deployment(dep_id)
+        data = await bot_host_api_request("GET", f"/deployments/{dep_id}/env")
+        variables = data.get("variables", []) if isinstance(data, dict) else []
+        lines = []
+        for item in variables[:60] if isinstance(variables, list) else []:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("key", ""))[:80]
+            if not key:
+                continue
+            value = str(item.get("value", ""))
+            secret = bool(item.get("secret")) or any(word in key.upper() for word in ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASS"))
+            shown = "••••••••" if secret else (value[:90] if value else "(пусто)")
+            lines.append(f"• <code>{html.escape(key)}</code> = <code>{html.escape(shown)}</code>")
+        text_body = "\n".join(lines) if lines else "Переменные не найдены или API не вернул список."
+        await callback.message.answer(
+            f"🔐 <b>Переменные Bot-Hosting</b> <code>{html.escape(dep_id)}</code>\n\n{text_body}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✏️ Изменить / добавить", callback_data=f"host_env|{dep_id}")],
+                [InlineKeyboardButton(text="🔙 К деплою", callback_data=f"host_open|{dep_id}")],
+            ]), parse_mode="HTML",
+        )
+        await callback.answer()
+    except Exception as exc:
+        await callback.answer(str(exc)[:180], show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("host_env_audit|"))
+async def cb_host_env_audit(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID or callback.message.chat.type != "private":
+        return await callback.answer("Недостаточно прав.", show_alert=True)
+    try:
+        dep_id = _safe_deployment_id(callback.data.split("|", 1)[1])
+        await _get_owned_deployment(dep_id)
+        data = await bot_host_api_request("GET", f"/deployments/{dep_id}/env/audit")
+        def show_keys(label, values):
+            if not isinstance(values, list) or not values:
+                return f"{label}: нет"
+            return f"{label}:\n" + "\n".join(f"• <code>{html.escape(str(x)[:100])}</code>" for x in values[:20])
+        body = (
+            "🧪 <b>Проверка переменных окружения</b>\n\n"
+            + show_keys("❌ Не заданы", data.get("missing", [])) + "\n\n"
+            + show_keys("ℹ️ Не используются кодом", data.get("unused", [])) + "\n\n"
+            + show_keys("⚠️ Возможные заглушки", data.get("placeholders", [])) + "\n\n"
+            + html.escape(str(data.get("note", ""))[:500])
+        )
+        await callback.message.answer(body, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="К деплою", callback_data=f"host_open|{dep_id}")
+        ]]), parse_mode="HTML")
+        await callback.answer()
+    except Exception as exc:
+        await callback.answer(str(exc)[:180], show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("host_env|"))
+async def cb_host_env(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID or callback.message.chat.type != "private":
+        return await callback.answer("Недостаточно прав.", show_alert=True)
+    dep_id = _safe_deployment_id(callback.data.split("|", 1)[1])
+    await _get_owned_deployment(dep_id)
+    admin_state[ADMIN_ID] = {"action": "host_set_env", "deployment_id": dep_id}
+    await callback.message.answer(
+        "🔐 Введите <code>ИМЯ_ПЕРЕМЕННОЙ|ЗНАЧЕНИЕ</code>. Например: <code>AI_BASE_URL|https://example.com/v1</code>.\n"
+        "Для секретов сообщение будет удалено после попытки сохранения.", parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+async def refresh_provider_models(notify: bool = False) -> dict:
+    """Читает OpenAI-compatible GET /models; новые модели добавляются закрытыми по умолчанию."""
+    old_ids = set(str(x) for x in (bot_config.get("provider_model_ids") or []))
+    had_previous_success = bool(bot_config.get("provider_models_check_ok"))
+    headers = {"Authorization": f"Bearer {AI_API_KEY}", "Accept": "application/json"}
+    errors = []
+    for base_url in get_url_variants(AI_BASE_URL):
+        url = base_url.rstrip("/") + "/models"
+        try:
+            timeout = aiohttp.ClientTimeout(total=20)
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.get(url) as response:
+                    raw = await response.text()
+                    if response.status >= 400:
+                        errors.append(f"{url}: HTTP {response.status} {raw[:250]}")
+                        continue
+                    data = json.loads(raw)
+                    entries = data.get("data", []) if isinstance(data, dict) else []
+                    raw_ids = {str(item.get("id", "")).strip() for item in entries if isinstance(item, dict) and item.get("id")}
+                    # IDs are embedded in Telegram callback_data (64-byte limit).
+                    ids = sorted(x for x in raw_ids if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,55}", x))
+                    if not ids:
+                        errors.append(f"{url}: ответ /models не содержит data[].id")
+                        continue
+                    for model_id in ids:
+                        if model_id not in models_db:
+                            models_db[model_id] = {"name": model_id, "premium": True, "vision": False}
+                    bot_config["provider_model_ids"] = ids
+                    bot_config["provider_models_checked_at"] = datetime.now().isoformat(timespec="seconds")
+                    bot_config["provider_models_check_ok"] = True
+                    bot_config["provider_models_last_error"] = ""
+                    for account in users_db.values():
+                        current_model = str(account.get("current_model", ""))
+                        if current_model not in ids and ids:
+                            plan = normalize_plan(account)
+                            fallback = next((mid for mid in ids if not models_db.get(mid, {}).get("premium") or plan != "free"), ids[0])
+                            account["current_model"] = fallback
+                    added = sorted(set(ids) - old_ids)
+                    removed = sorted(old_ids - set(ids))
+                    save_data()
+                    if notify and had_previous_success and (added or removed):
+                        changes = []
+                        if added:
+                            changes.append("добавлены: " + ", ".join(added[:15]))
+                        if removed:
+                            changes.append("не возвращаются API: " + ", ".join(removed[:15]))
+                        try:
+                            await bot.send_message(ADMIN_ID, "🧠 AgentGPT: обновился список моделей.\n" + html.escape("; ".join(changes)), parse_mode="HTML")
+                        except Exception:
+                            pass
+                    return {"ok": True, "message": f"Проверено моделей: {len(ids)}. Новых: {len(added)}. Не вернулись в выдаче: {len(removed)}. Base URL: {AI_BASE_URL}"}
+        except Exception as exc:
+            errors.append(f"{url}: {type(exc).__name__}: {str(exc)[:250]}")
+    bot_config["provider_models_checked_at"] = datetime.now().isoformat(timespec="seconds")
+    # Не стираем последнюю подтверждённую выдачу при временном сбое API:
+    # меню и проверка выбора продолжают использовать последний успешный snapshot.
+    bot_config["provider_models_check_ok"] = bool(old_ids)
+    bot_config["provider_models_last_error"] = " | ".join(errors)[:1500]
+    save_data()
+    return {"ok": False, "message": "Не удалось получить список моделей через GET /models. Проверьте Base URL, API key и поддержку endpoint. " + " | ".join(errors)[:900]}
+
+
+async def provider_model_monitor_loop():
+    while True:
+        previous_error = str(bot_config.get("provider_models_last_error", "") or "")
+        try:
+            result = await refresh_provider_models(notify=True)
+            if not result.get("ok"):
+                current_error = str(bot_config.get("provider_models_last_error", "") or result.get("message", ""))
+                if current_error and current_error != previous_error:
+                    try:
+                        await bot.send_message(
+                            ADMIN_ID,
+                            "⚠️ <b>AgentGPT: автоматическая проверка моделей не прошла</b>\n"
+                            + html.escape(current_error[:1400])
+                            + "\n\nСписок моделей не будет считаться подтверждённым, пока API снова не ответит на GET /models.",
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        pass
+        except Exception as exc:
+            print(f"[Model Monitor] {type(exc).__name__}: {exc}")
+        await asyncio.sleep(6 * 60 * 60)
+
+
+# =========================================================================
 # --- АДМИН-ПАНЕЛЬ ---
 # =========================================================================
 @dp.message(F.text == "👑 Админ-панель")
 @dp.message(Command("admin"))
 async def admin_panel_cmd(message: Message):
-    if message.from_user.id != ADMIN_ID:
+    if not owner_private_message(message):
         return
     admin_state.pop(ADMIN_ID, None)
     admin_reply_target.pop(ADMIN_ID, None)
     await message.answer(
-        "👑 <b>Панель управления ботом</b>\nВыберите нужный раздел:",
+        "👑 <b>Панель управления AgentGPT</b>\nВыберите нужный раздел:",
         reply_markup=get_admin_main_kb(),
         parse_mode="HTML"
     )
@@ -3348,7 +4534,7 @@ async def cb_adm_back_main(callback: CallbackQuery):
     admin_state.pop(ADMIN_ID, None)
     admin_reply_target.pop(ADMIN_ID, None)
     await callback.message.edit_text(
-        "👑 <b>Панель управления ботом</b>\nВыберите нужный раздел:",
+        "👑 <b>Панель управления AgentGPT</b>\nВыберите нужный раздел:",
         reply_markup=get_admin_main_kb(),
         parse_mode="HTML"
     )
@@ -3444,8 +4630,10 @@ async def cb_adm_limits_action(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
     if callback.data == "adm_reset_all_tokens":
+        new_reset_date = datetime.now() + timedelta(days=30)
         for u in users_db.values():
             u["tokens"] = 0
+            u["reset_date"] = new_reset_date
         save_data()
         await callback.answer("✅ Токены всех пользователей сброшены!", show_alert=True)
         return await cb_adm_limits(callback)
@@ -3626,7 +4814,8 @@ async def cb_adm_user_card_actions(callback: CallbackQuery):
         await callback.answer("Статус бана изменен!")
     elif act == "rst":
         u["tokens"] = 0
-        await callback.answer("Токены пользователя обнулены!")
+        u["reset_date"] = datetime.now() + timedelta(days=30)
+        await callback.answer("Токены пользователя обнулены, период отсчёта обновлён!")
 
     save_data()
     text, kb = render_user_manage_card(tid)
@@ -3911,6 +5100,7 @@ def save_short_followup_result(user: dict, original_task: str, user_reply: str) 
 def build_system_prompt(uid: int, u: dict) -> str:
     parts = [
         BASE_SYSTEM_PROMPT,
+        HOMEWORK_SOLVER_PROMPT,
         "[ПРАВИЛА АДАПТАЦИИ К ДИАЛОГУ]:\n"
         "- Учитывай предыдущие реплики, а не воспринимай каждое короткое сообщение изолированно.\n"
         "- Если пользователь отвечает на твой уточняющий вопрос, продолжай исходную задачу и используй ответ как недостающий параметр.\n"
@@ -3956,7 +5146,7 @@ def build_system_prompt(uid: int, u: dict) -> str:
 
 async def handle_admin_input(message: Message) -> bool:
     """Обрабатывает состояния админ-панели и ответы пользователям."""
-    if message.from_user.id != ADMIN_ID:
+    if not owner_private_message(message):
         return False
 
     if ADMIN_ID in admin_reply_target:
@@ -3978,11 +5168,204 @@ async def handle_admin_input(message: Message) -> bool:
         return True
 
     st = admin_state.get(ADMIN_ID)
-    if not st or not message.text:
+    if not st:
         return False
 
     act = st.get("action")
+    if act == "host_upload_file" and message.document:
+        dep_id = _safe_deployment_id(st.get("deployment_id", ""))
+        folder_path = str(st.get("folder_path", "/"))
+        try:
+            result = await upload_telegram_document_to_hosting(message, dep_id, folder_path)
+            admin_state.pop(ADMIN_ID, None)
+            size_kb = result["bytes"] / 1024
+            await message.answer(
+                f"✅ Файл <code>{html.escape(result['filename'])}</code> загружен в "
+                f"<code>{html.escape(result['folder'])}</code> деплоя <code>{html.escape(dep_id)}</code>. "
+                f"Размер: <code>{size_kb:.1f} КБ</code>. Изменения ещё не применены.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="Применить / перезапустить", callback_data=f"host_apply|{dep_id}")
+                ], [InlineKeyboardButton(text="К деплою", callback_data=f"host_open|{dep_id}")]]),
+                parse_mode="HTML",
+            )
+        except Exception as exc:
+            await message.answer(f"❌ Не удалось загрузить файл: {html.escape(str(exc)[:600])}")
+        return True
+
+    if not message.text:
+        return False
     txt = message.text.strip()
+
+    if act == "host_upload_dir":
+        folder_path = txt or "/"
+        if not folder_path.startswith("/") or ".." in folder_path or len(folder_path) > 240:
+            await message.answer("Введите безопасную абсолютную папку, например <code>/</code> или <code>/src</code>.", parse_mode="HTML")
+            return True
+        admin_state[ADMIN_ID] = {
+            "action": "host_upload_file",
+            "deployment_id": st.get("deployment_id"),
+            "folder_path": folder_path.rstrip("/") or "/",
+        }
+        await message.answer("Теперь отправьте файл документом. Размер — до 20 МБ.")
+        return True
+
+    if act == "owner_set_env":
+        key = str(st.get("key", ""))
+        secret_input = "KEY" in key or key == "BOT_HOSTING_API_KEY"
+        try:
+            sync_note = await apply_owner_setting(key, txt)
+            admin_state.pop(ADMIN_ID, None)
+            if secret_input:
+                try:
+                    await message.delete()
+                except Exception:
+                    pass
+            current_value = globals().get(key, "")
+            display = _mask_secret(current_value) if secret_input else str(current_value)
+            await message.answer(
+                f"✅ <code>{html.escape(key)}</code> сохранён. Текущее значение: <code>{html.escape(display)}</code>{sync_note}",
+                reply_markup=render_owner_tools_keyboard(), parse_mode="HTML",
+            )
+        except Exception as exc:
+            await message.answer(f"❌ Не удалось сохранить настройку: {html.escape(str(exc)[:500])}")
+        return True
+
+    if act == "owner_set_budget":
+        parts = [x.strip() for x in txt.split("|", 1)]
+        if len(parts) != 2 or not all(x.isdigit() for x in parts):
+            await message.answer("Введите два целых неотрицательных числа через |, например 1000000|100000.")
+            return True
+        budget, threshold = map(int, parts)
+        if budget > 10**15 or threshold > 10**15:
+            await message.answer("Слишком большое значение.")
+            return True
+        bot_config["global_token_budget"] = budget
+        bot_config["global_token_alert_threshold"] = threshold
+        bot_config["global_token_alert_month"] = ""
+        admin_state.pop(ADMIN_ID, None)
+        save_data()
+        _schedule_owner_low_token_alert()
+        await message.answer("✅ Бюджет и порог уведомления сохранены.\n\n" + owner_tokens_text(), parse_mode="HTML")
+        return True
+
+    if act == "host_set_env":
+        dep_id = _safe_deployment_id(st.get("deployment_id", ""))
+        parts = txt.split("|", 1)
+        if len(parts) != 2:
+            await message.answer("Формат: ИМЯ_ПЕРЕМЕННОЙ|ЗНАЧЕНИЕ")
+            return True
+        key, value = parts[0].strip(), parts[1].strip()
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]{1,63}", key) or not value:
+            await message.answer("Недопустимое имя переменной или пустое значение.")
+            return True
+        try:
+            await _get_owned_deployment(dep_id)
+            secret_flag = any(word in key for word in ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASS"))
+            result = await bot_host_api_request("POST", f"/deployments/{dep_id}/env", payload={"key": key, "value": value, "secret": secret_flag})
+            admin_state.pop(ADMIN_ID, None)
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            await message.answer(
+                f"✅ Переменная <code>{html.escape(key)}</code> записана в Bot-Hosting. "
+                "Изменение применяется после перезапуска деплоя.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Перезапустить деплой", callback_data=f"host_power|{dep_id}|restart")]]),
+                parse_mode="HTML",
+            )
+        except Exception as exc:
+            await message.answer(f"❌ Не удалось изменить переменную: {html.escape(str(exc)[:500])}")
+        return True
+
+    if act == "host_read_path":
+        file_path = txt.strip()
+        if not file_path.startswith("/") or ".." in file_path or len(file_path) > 240:
+            await message.answer("Укажите безопасный путь внутри деплоя, например /main.py.")
+            return True
+        dep_id = _safe_deployment_id(st.get("deployment_id", ""))
+        try:
+            await _get_owned_deployment(dep_id)
+            data = await bot_host_api_request("GET", f"/deployments/{dep_id}/files/content", params={"path": file_path, "offset": 0, "limit": 120})
+            content = str(data.get("content", "")) if isinstance(data, dict) else ""
+            # Keep secrets out of chat history even in the owner's file viewer.
+            redacted_lines = []
+            for line in content.splitlines():
+                if re.search(r"(?i)(?:API[_-]?KEY|BOT[_-]?TOKEN|ACCESS[_-]?TOKEN|SECRET|PASSWORD|PASSWD)\s*=", line):
+                    line = re.sub(r"(?<=\=).*", " ********", line, count=1)
+                redacted_lines.append(line)
+            safe_content = "\n".join(redacted_lines)
+            was_truncated = len(safe_content) > 3000
+            safe_content = safe_content[:3000]
+            admin_state.pop(ADMIN_ID, None)
+            await message.answer(
+                f"📖 <b>{html.escape(file_path)}</b>\n"
+                f"Строк в ответе API: <code>{html.escape(str(data.get('lines', '—')))}</code> / "
+                f"<code>{html.escape(str(data.get('totalLines', '—')))}</code>\n"
+                f"<pre>{html.escape(safe_content or 'Файл пустой или не содержит текста.')}</pre>"
+                + ("\n⚠️ Текст обрезан для лимита Telegram." if was_truncated or data.get("hasMore") else ""),
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="К деплою", callback_data=f"host_open|{dep_id}")]]),
+                parse_mode="HTML",
+            )
+        except Exception as exc:
+            await message.answer(f"❌ Не удалось прочитать файл: {html.escape(str(exc)[:500])}")
+        return True
+
+    if act == "host_search_query":
+        query = txt.strip()
+        if not query or len(query) > 180:
+            await message.answer("Введите поисковую строку длиной от 1 до 180 символов.")
+            return True
+        dep_id = _safe_deployment_id(st.get("deployment_id", ""))
+        try:
+            await _get_owned_deployment(dep_id)
+            data = await bot_host_api_request("GET", f"/deployments/{dep_id}/files/search", params={"query": query, "maxResults": 25})
+            matches = data.get("matches", []) if isinstance(data, dict) else []
+            rows = []
+            for item in matches[:25] if isinstance(matches, list) else []:
+                if isinstance(item, dict):
+                    rows.append(
+                        f"<code>{html.escape(str(item.get('path', ''))[:100])}:{html.escape(str(item.get('line', '?')))}</code>\n"
+                        f"<pre>{html.escape(str(item.get('text', ''))[:220])}</pre>"
+                    )
+            admin_state.pop(ADMIN_ID, None)
+            report = "\n\n".join(rows) if rows else "Совпадений не найдено."
+            await message.answer(
+                f"🔎 <b>Поиск:</b> <code>{html.escape(query)}</code>\n\n{report}"[:3900],
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="К деплою", callback_data=f"host_open|{dep_id}")]]),
+                parse_mode="HTML",
+            )
+        except Exception as exc:
+            await message.answer(f"❌ Поиск не выполнен: {html.escape(str(exc)[:500])}")
+        return True
+
+    if act == "host_edit_path":
+        path_value = txt.strip()
+        if not path_value.startswith("/") or ".." in path_value or len(path_value) > 240:
+            await message.answer("Укажите безопасный абсолютный путь внутри деплоя, например /main.py.")
+            return True
+        admin_state[ADMIN_ID] = {"action": "host_edit_content", "deployment_id": st.get("deployment_id"), "path": path_value}
+        await message.answer("Отправьте полный текст файла следующим сообщением (до 3500 символов). Запись заменит файл целиком.")
+        return True
+
+    if act == "host_edit_content":
+        dep_id = _safe_deployment_id(st.get("deployment_id", ""))
+        file_path = str(st.get("path", ""))
+        if len(txt) > 3500:
+            await message.answer("Текст больше 3500 символов. Для больших файлов используйте загрузку через панель Bot-Hosting.")
+            return True
+        try:
+            await _get_owned_deployment(dep_id)
+            await bot_host_api_request("POST", f"/deployments/{dep_id}/files/content", payload={"path": file_path, "content": txt, "mode": "overwrite"})
+            admin_state.pop(ADMIN_ID, None)
+            await message.answer(
+                f"✅ Файл <code>{html.escape(file_path)}</code> записан. Изменения пока не применены.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="Применить и перезапустить", callback_data=f"host_apply|{dep_id}")
+                ]]), parse_mode="HTML",
+            )
+        except Exception as exc:
+            await message.answer(f"❌ Не удалось записать файл: {html.escape(str(exc)[:500])}")
+        return True
 
     if act in ("adm_edit_free_lim", "adm_edit_sub_lim"):
         if not txt.isdigit():
@@ -4275,7 +5658,7 @@ async def send_group_onboarding(chat_id: int, title: str = "Группа", added
     delete_line = "✅ Удалять сообщения" if rights["can_delete_messages"] else "❌ Не выдано: удалять сообщения"
     restrict_line = "✅ Ограничивать и блокировать участников" if rights["can_restrict_members"] else "❌ Не выдано: ограничивать/блокировать участников"
     text_message = (
-        f"👋 <b>ШколоAI подключён к группе «{html.escape(str(title or 'Группа')[:100])}»!</b>\n\n"
+        f"👋 <b>AgentGPT подключён к группе «{html.escape(str(title or 'Группа')[:100])}»!</b>\n\n"
         f"{intro}\n\n"
         "<b>Рекомендуемые права администратора:</b>\n"
         "• Удаление сообщений — для цензора и антиспама.\n"
@@ -4365,7 +5748,7 @@ async def cb_group_menu(callback: CallbackQuery):
 
 
 GROUP_HELP_TEXT = (
-    "👥 <b>Команды группового агента ШколоAI</b>\n\n"
+    "👥 <b>Команды группового агента AgentGPT</b>\n\n"
     "<b>Начало работы</b>\n"
     "/groupmenu — интерактивные переключатели.\n"
     "/grouphelp, /help, +кмд, +help — инструкция.\n"
@@ -4898,7 +6281,7 @@ async def group_smalltalk_loop() -> None:
                 if now - last_activity < 3600 or now - last_auto < 6 * 3600:
                     continue
                 chat_id = int(key)
-                nickname = str(group.get("nickname", "ШколоAI"))[:32]
+                nickname = str(group.get("nickname", "AgentGPT"))[:32]
                 await bot.send_message(chat_id, f"💬 <b>{html.escape(nickname)}:</b> {random.choice(starters)}", parse_mode="HTML")
                 group["last_smalltalk_ts"] = now
                 save_data()
@@ -5045,7 +6428,7 @@ async def handle_group_natural_setting(message: Message, group: dict, user_text:
     if len(user_text) > 140 or not message.from_user:
         return False
 
-    nickname = str(group.get("nickname", "ШколоAI")).strip()
+    nickname = str(group.get("nickname", "AgentGPT")).strip()
     text = user_text.strip().casefold()
     if nickname:
         text = re.sub(r"^" + re.escape(nickname.casefold()) + r"(?:[,!: ]+|$)", "", text, count=1)
@@ -5239,7 +6622,7 @@ async def handle_group_message(message: Message, user: dict):
             names = ", ".join(html.escape(member.full_name) for member in welcomed_members[:8])
             save_data()
             return await message.answer(
-                f"👋 Добро пожаловать, {names}! Я {html.escape(str(group.get('nickname', 'ШколоAI')))}. "
+                f"👋 Добро пожаловать, {names}! Я {html.escape(str(group.get('nickname', 'AgentGPT')))}. "
                 "Напишите /grouphelp или +кмд, чтобы увидеть команды."
             )
         save_data()
@@ -5351,7 +6734,7 @@ async def handle_group_message(message: Message, user: dict):
 
     help_probe = user_text.casefold().strip()
     if help_probe:
-        nickname_probe = str(group.get("nickname", "ШколоAI")).strip().casefold()
+        nickname_probe = str(group.get("nickname", "AgentGPT")).strip().casefold()
         if nickname_probe:
             help_probe = re.sub(r"^" + re.escape(nickname_probe) + r"(?:[,!: ]+|$)", "", help_probe, count=1)
         if re.fullmatch(
@@ -5867,7 +7250,7 @@ async def handle_group_message(message: Message, user: dict):
         message.reply_to_message and message.reply_to_message.from_user and bot_id
         and message.reply_to_message.from_user.id == bot_id
     )
-    nickname = str(group.get("nickname", "ШколоAI")).strip()
+    nickname = str(group.get("nickname", "AgentGPT")).strip()
     nickname_match = re.match(
         r"^" + re.escape(nickname) + r"(?:\s*[,!:]\s*|\s+)(.*)$",
         user_text,
@@ -5920,7 +7303,7 @@ async def handle_group_message(message: Message, user: dict):
     if uid != ADMIN_ID and int(user.get("tokens", 0)) >= user_token_limit:
         return await message.reply(f"⚠️ Лимит токенов исчерпан: {user.get('tokens', 0)}/{user_token_limit}.")
 
-    nickname = str(group.get("nickname", "ШколоAI"))[:32]
+    nickname = str(group.get("nickname", "AgentGPT"))[:32]
     group_prompt = (
         f"Ты {nickname}, групповой ИИ-агент Telegram. Выполняй прямые просьбы, если они безопасны и понятны; "
         "не утверждай, что изменил настройки или применил модерацию, если действие фактически не выполнено. "
@@ -5985,7 +7368,7 @@ async def handle_group_message(message: Message, user: dict):
         usage = getattr(response, "usage", None)
         input_used = int(getattr(usage, "prompt_tokens", 0) or est_in)
         output_used = int(getattr(usage, "completion_tokens", 0) or estimate_request_tokens(answer))
-        record_ai_usage(user, input_used, output_used, reserved_cost_rub=group_reserved_cost)
+        record_ai_usage(user, input_used, output_used, reserved_cost_rub=group_reserved_cost, model_id=selected_model)
         save_data()
         try:
             await status.delete()
@@ -6058,7 +7441,7 @@ async def handle_all_messages(message: Message):
                 usage = getattr(response, "usage", None)
                 input_used = int(getattr(usage, "prompt_tokens", 0) or estimated_in)
                 output_used = int(getattr(usage, "completion_tokens", 0) or estimate_request_tokens(model_answer))
-                record_ai_usage(u, input_used, output_used, reserved_cost_rub=reserved)
+                record_ai_usage(u, input_used, output_used, reserved_cost_rub=reserved, model_id=u.get("current_model"))
                 if model_answer:
                     confirmation = model_answer
             except Exception as exc:
@@ -6283,7 +7666,7 @@ async def handle_all_messages(message: Message):
             update_pending_followup(u, task_for_followup, ans)
             input_est = estimated_in
             output_est = estimate_request_tokens(ans)
-            record_ai_usage(u, input_est, output_est, VISION_IMAGE_COST_RUB, reserved_cost_rub=vision_reserved_cost)
+            record_ai_usage(u, input_est, output_est, VISION_IMAGE_COST_RUB, reserved_cost_rub=vision_reserved_cost, model_id=model_id)
             save_data()
             remember_spy_answer(message, ans)
             return await send_smart_ai_response(message, ans, programming=u.get("programming_mode") == "general")
@@ -6420,7 +7803,7 @@ async def handle_all_messages(message: Message):
             total_prompt_tokens = estimate_request_tokens(full_user_prompt) + estimate_request_tokens(sys_prompt)
         if total_completion_tokens <= 0:
             total_completion_tokens = estimate_request_tokens(clean_reply)
-        record_ai_usage(u, total_prompt_tokens, total_completion_tokens, reserved_cost_rub=text_reserved_cost)
+        record_ai_usage(u, total_prompt_tokens, total_completion_tokens, reserved_cost_rub=text_reserved_cost, model_id=model_id)
         save_data()
         remember_spy_answer(message, clean_reply)
 
@@ -6439,16 +7822,18 @@ async def handle_all_messages(message: Message):
 async def main():
     mcp_runner = None
     smalltalk_task = None
+    model_monitor_task = None
     try:
         load_data()
         smalltalk_task = asyncio.create_task(group_smalltalk_loop())
+        model_monitor_task = asyncio.create_task(provider_model_monitor_loop())
         mcp_runner = await start_mcp_http_server()
 
         # Для polling удаляем webhook, но НЕ удаляем ожидающие обновления.
         # Важно: это не устраняет TelegramConflictError, если запущен второй
         # экземпляр бота с тем же BOT_TOKEN — должен работать только один.
         await bot.delete_webhook(drop_pending_updates=False)
-        print(f"🚀 Бот ШколоAI успешно запущен! Администратор: {ADMIN_ID}")
+        print(f"🚀 Бот AgentGPT успешно запущен! Администратор: {ADMIN_ID}")
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         print("⏳ Сохранение данных и остановка сервисов...")
@@ -6456,6 +7841,12 @@ async def main():
             smalltalk_task.cancel()
             try:
                 await smalltalk_task
+            except asyncio.CancelledError:
+                pass
+        if model_monitor_task is not None:
+            model_monitor_task.cancel()
+            try:
+                await model_monitor_task
             except asyncio.CancelledError:
                 pass
         try:

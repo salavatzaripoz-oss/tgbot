@@ -5635,12 +5635,23 @@ def group_plan_status_text(group: dict) -> str:
     )
 
 
-async def is_group_admin(chat_id: int, user_id: int) -> bool:
+async def get_group_member_status(chat_id: int, user_id: int) -> str:
+    """Получает роль участника непосредственно из Telegram Bot API.
+
+    Это единственный источник истины для определения создателя и администратора.
+    Текстовые заявления пользователя и сохранённый owner_id не дают модераторских прав.
+    """
     try:
         member = await bot.get_chat_member(chat_id, user_id)
-        return member.status in ("administrator", "creator")
-    except Exception:
-        return False
+        status = getattr(member, "status", "unknown")
+        return str(getattr(status, "value", status)).casefold()
+    except Exception as exc:
+        print(f"[GROUP AUTH] Не удалось проверить статус {user_id} в {chat_id}: {type(exc).__name__}: {exc}")
+        return "unknown"
+
+
+async def is_group_admin(chat_id: int, user_id: int) -> bool:
+    return await get_group_member_status(chat_id, user_id) in ("administrator", "creator")
 
 
 async def bot_has_group_permission(chat_id: int, permission: str) -> bool:
@@ -6862,7 +6873,7 @@ async def cb_group_inactive_cleanup(callback: CallbackQuery):
     return
 
 
-GROUP_AGENT_COMMAND_RE = re.compile(r"(?m)^\s*\[\[RUN:([^]\r\n]+)\]\]\s*$")
+GROUP_AGENT_COMMAND_RE = re.compile(r"\[\[RUN:([^]\r\n]+)\]\]", re.IGNORECASE)
 # Совместимость: модель иногда печатает реальную slash-команду отдельной строкой,
 # вместо служебного маркера. Разрешаем автоматически исполнять только /kick и /ban
 # с одним однозначным username/числовым ID; прочий текст командами не считается.
@@ -6907,11 +6918,20 @@ async def execute_group_agent_command(message: Message, group: dict, command_tex
         # «Максимум» и только по прямому запросу Telegram-администратора.
         if not group_has_feature(group, "agent_tasks") or get_group_plan(group) != "court":
             return False, "Управление участниками через ИИ-агента доступно только на тарифе «Максимум»."
-        if not message.from_user or not await is_group_admin(message.chat.id, message.from_user.id):
-            return False, "⛔ ИИ-агент может удалять или блокировать участников только по запросу Telegram-администратора группы."
-        if not args:
-            return False, f"Укажи цель: {head} @username или {head} Telegram_ID, либо ответь на сообщение участника."
+        if not message.from_user:
+            return False, "Не удалось определить автора запроса."
+        actor_status = await get_group_member_status(message.chat.id, message.from_user.id)
+        if actor_status not in ("administrator", "creator"):
+            return False, "⛔ Telegram не подтвердил у автора запроса права администратора этой группы."
+        authority_proof = (
+            "✅ Полномочия подтверждены Telegram: создатель/владелец группы. "
+            if actor_status == "creator" else
+            "✅ Полномочия подтверждены Telegram: администратор группы. "
+        )
+        # Ответ на сообщение — полноценный способ указать цель даже без аргумента.
         target_id = group_target_id(message, args, head, group)
+        if target_id is None and not args:
+            return False, f"Укажи цель: {head} @username или {head} Telegram_ID, либо ответь на сообщение участника."
         if target_id is None:
             raw_target = str(args[0]).strip().strip(".,;:!?)]}>")
             if raw_target.startswith("@"):
@@ -6941,8 +6961,8 @@ async def execute_group_agent_command(message: Message, group: dict, command_tex
             if head == "/kick":
                 # Kick: кратковременная блокировка с немедленной разблокировкой.
                 await bot.unban_chat_member(message.chat.id, target_id, only_if_banned=False)
-                return True, f"👢 {display} (ID {target_id}) удалён из группы. Повторный вход технически возможен по приглашению."
-            return True, f"🚫 {display} (ID {target_id}) заблокирован в группе."
+                return True, f"{authority_proof}👢 {display} (ID {target_id}) удалён из группы. Повторный вход технически возможен по приглашению."
+            return True, f"{authority_proof}🚫 {display} (ID {target_id}) заблокирован в группе."
         except Exception as exc:
             # Если kick не смог снять временный ban, пытаемся не оставлять
             # незапланированную блокировку и сообщаем фактический результат.
@@ -6978,6 +6998,56 @@ async def handle_group_natural_setting(message: Message, group: dict, user_text:
     nickname = str(group.get("nickname", "AgentGPT")).strip()
     stripped, _called = strip_group_nickname(user_text, nickname)
     text = re.sub(r"\s+", " ", stripped.strip().casefold())
+
+    # Полномочия автора проверяются через Telegram API, а не по его заявлению.
+    # Конкретные запросы на kick/ban исполняются до LLM: модель не может подменить
+    # действие общим отказом, выдуманными правилами или инструкциями пользователю.
+    bulk_target = bool(re.search(
+        r"\b(?:всех|все|каждого|каждых|всех\s+участников|всю\s+группу|весь\s+чат|всех\s+пользователей)\b",
+        text,
+    ))
+    ban_intent = bool(re.search(r"\b(?:забань|забанить|заблокируй|заблокировать|поставь\s+бан)\b", text))
+    kick_intent = bool(re.search(r"\b(?:удали|удалить|убери|убрать|выгони|выгнать|кикни|кикнуть|исключи|исключить)\b", text))
+    if (ban_intent or kick_intent) and not bulk_target:
+        mention_match = re.search(r"(?<![A-Za-z0-9_])@[A-Za-z0-9_]{5,32}\b", stripped)
+        id_matches = re.findall(r"(?<!\d)\d{5,20}(?!\d)", stripped)
+        target_arg = mention_match.group(0) if mention_match else (id_matches[0] if id_matches else "")
+        has_reply_target = bool(message.reply_to_message and message.reply_to_message.from_user)
+        if target_arg or has_reply_target:
+            action = "/ban" if ban_intent else "/kick"
+            command = action + (f" {target_arg}" if target_arg else "")
+            ok, result = await execute_group_agent_command(message, group, command)
+            save_data()
+            await message.answer(f"*(:{result}:)*", parse_mode=None)
+            return True
+
+    # Не обещаем массовое удаление всего чата: Telegram Bot API не предоставляет
+    # боту полный список участников. При этом не выдумываем запрет или угрозу бана.
+    bulk_remove_request = bulk_target and bool(re.search(
+        r"\b(?:удали|удалить|убери|убрать|выгони|выгнать|очисти|очистить|исключи|исключить)\b",
+        text,
+    ))
+    if bulk_remove_request and not bool(re.search(r"не\s+актив|неактив|молчун|без\s+активност|давно\s+не\s+появ", text)):
+        status = await get_group_member_status(message.chat.id, message.from_user.id)
+        if status == "creator":
+            authority = "Telegram подтвердил, что вы создатель этой группы."
+        elif status == "administrator":
+            authority = "Telegram подтвердил, что вы администратор этой группы."
+        else:
+            authority = "Telegram не подтвердил у вас права администратора этой группы."
+        if status in ("creator", "administrator"):
+            explanation = (
+                f"{authority} Я не буду утверждать, что это запрещено правилами Telegram. "
+                "Техническое ограничение другое: Bot API не предоставляет полный список всех участников, "
+                "поэтому я не могу гарантированно найти и удалить каждого участника. "
+                "Я могу удалить конкретного пользователя по @username/ID или подготовить список известных неактивных участников "
+                "с подтверждением кнопкой (/inactive_cleanup 30)."
+            )
+        else:
+            explanation = f"{authority} Удаление участников доступно только Telegram-администраторам группы."
+        save_data()
+        await message.answer(f"*(:{explanation}:)*", parse_mode=None)
+        return True
 
     # Надёжное распознавание запросов на очистку активности. Фраза может
     # звучать свободно: «удали всех, кто сейчас неактивен», «убери молчунов» и т.п.
@@ -7779,7 +7849,12 @@ async def handle_group_message(message: Message, user: dict):
 
     nickname = str(group.get("nickname", "AgentGPT"))[:32]
     # Фактические права автора и самого бота передаются модели раздельно.
-    actor_is_admin = await is_group_admin(chat_id, uid)
+    # Telegram creator — подтверждённый владелец группы; ADMIN_ID — владелец самого бота.
+    actor_status = await get_group_member_status(chat_id, uid)
+    actor_is_admin = actor_status in ("administrator", "creator")
+    actor_is_creator = actor_status == "creator"
+    actor_is_service_owner = uid == ADMIN_ID
+    group_subscription_owner = int(group.get("owner_id") or 0) == uid
     bot_rights = await get_group_bot_rights(chat_id)
     recent_context = _recent_group_context_text(group, message, limit=10)
     tool_catalog = (
@@ -7795,6 +7870,10 @@ async def handle_group_message(message: Message, user: dict):
         "Для удаления конкретного участника используй отдельную строку строго вида [[RUN:/kick @username]] "
         "или [[RUN:/kick 123456789]]. Для постоянной блокировки — [[RUN:/ban @username]]. "
         "Не пиши пользователю, что сначала «попробуешь команду»: вызови инструмент сразу.\n"
+        "Если сообщение прямо просит удалить/выгнать/кикнуть конкретного @username или ID, вызови [[RUN:/kick TARGET]]. "
+        "Если просят заблокировать/забанить конкретного участника, вызови [[RUN:/ban TARGET]]. "
+        "Маркер [[RUN:...]] можно поставить отдельной строкой; не печатай вместо него код, пример или псевдокоманду.\n"
+        "Не создавай блоки «Код #1», «Код #2» и не говори пользователю вручную вводить команду, когда он уже попросил агента выполнить действие.\n"
         "Для очистки неактивных используй [[RUN:/inactive_cleanup 30]]. "
         "После вызова не говори, что действие завершено, пока результат инструмента этого не подтвердил.\n"
         "Бот разрешает @username только если уже видел этого человека в данной группе; иначе попроси ID или ответ на сообщение.\n"
@@ -7806,13 +7885,23 @@ async def handle_group_message(message: Message, user: dict):
         "по недавней переписке. Выполняй прямые просьбы, если они безопасны и разрешены.\n"
         "Не утверждай, что не умеешь использовать команды: у тебя есть инструменты, перечисленные ниже. "
         "Не утверждай, что ты администратор-человек; различай права автора сообщения и права Telegram-бота. "
+        "ПОЛНОМОЧИЯ АВТОРА УЖЕ ПРОВЕРЕНЫ ЧЕРЕЗ Telegram getChatMember. Если статус автора creator, это подтверждённый владелец/создатель группы; "
+        "если administrator — подтверждённый администратор. Не требуй от такого автора дополнительных доказательств и не спорь с подтверждённым статусом. "
+        "ADMIN_ID владельца бота и owner_id владельца подписки — отдельные признаки, они сами по себе не заменяют Telegram-права группы.\n"
+        "Не выдумывай, что легитимный kick/ban по просьбе владельца запрещён правилами Telegram или автоматически приведёт к блокировке бота. "
+        "Если операция технически невозможна, назови конкретное ограничение Bot API и не приписывай его правилам Telegram.\n"
         "Не раскрывай личные данные, не делай выводов о личности участников. Помни, что ответ видит вся группа.\n"
         "Если просят удалить конкретного участника, не перечисляй команды текстом и не спрашивай, какую команду выбрать: "
         "вызови /kick через [[RUN:...]]. Если просят именно заблокировать/забанить — вызови /ban.\n"
+        "Если подтверждённый creator/admin просит удалить всех участников без уточнения критерия, не заявляй, что это запрещено правилами Telegram. "
+        "Честно объясни, что Bot API не даёт полного списка участников; предложи точечный kick или список известных неактивных с подтверждением.\n"
+        "Никогда не выводи фразы вида «📌 [Код #1 вынесен...]» для команд модерации.\n"
         "Если инструмент вызван, его дополнительное пояснение должно быть коротким. Не пиши «я всё сделал», "
         "если действие только подготовлено и ждёт подтверждения.\n"
         f"{tool_catalog}"
-        f"Текущий автор: {message.from_user.full_name} (ID {uid}); Telegram-администратор группы: {'ДА' if actor_is_admin else 'НЕТ'}.\n"
+        f"Текущий автор: {message.from_user.full_name} (ID {uid}). Проверенный Telegram status: {actor_status}. "
+        f"Владелец/создатель группы (creator): {'ДА' if actor_is_creator else 'НЕТ'}; Telegram-администратор: {'ДА' if actor_is_admin else 'НЕТ'}. "
+        f"Владелец самого AgentGPT: {'ДА' if actor_is_service_owner else 'НЕТ'}; владелец групповой подписки: {'ДА' if group_subscription_owner else 'НЕТ'}.\n"
         f"Права бота: статус={bot_rights.get('status')}; администратор={'ДА' if bot_rights.get('is_admin') else 'НЕТ'}; "
         f"удаление={'ДА' if bot_rights.get('can_delete_messages') else 'НЕТ'}; "
         f"ограничение/бан={'ДА' if bot_rights.get('can_restrict_members') else 'НЕТ'}.\n"

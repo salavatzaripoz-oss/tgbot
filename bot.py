@@ -75,24 +75,47 @@ MCP_PUBLIC_URL = clean_env("MCP_PUBLIC_URL", f"http://127.0.0.1:{MCP_PORT}").rst
 
 _SCRIPT_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
 _DATA_FILE_SETTING = clean_env("DATA_FILE", "bot_data.json")
-DATA_FILE = (
-    _DATA_FILE_SETTING if os.path.isabs(_DATA_FILE_SETTING)
-    else os.path.join(_SCRIPT_DIRECTORY, _DATA_FILE_SETTING)
-)
-# Если старая версия запускалась из другой рабочей директории, переносим
-# существующую базу в каталог скрипта вместо создания пустой базы.
-if not os.path.exists(DATA_FILE) and not os.path.isabs(_DATA_FILE_SETTING):
-    if os.path.exists(_DATA_FILE_SETTING):
-        try:
-            shutil.copy2(_DATA_FILE_SETTING, DATA_FILE)
-        except OSError as migration_exc:
-            print(f"[DB Recovery] Не удалось перенести старую базу: {migration_exc}")
+_DATA_FILE_EXPLICIT = bool(os.getenv("DATA_FILE"))
+if os.path.isabs(_DATA_FILE_SETTING):
+    DATA_FILE = os.path.abspath(os.path.expanduser(_DATA_FILE_SETTING))
+elif _DATA_FILE_EXPLICIT:
+    # Явно заданный относительный DATA_FILE сохраняет прежнюю семантику.
+    DATA_FILE = os.path.join(_SCRIPT_DIRECTORY, _DATA_FILE_SETTING)
+else:
+    # По умолчанию база размещается вне каталога исходного .py-файла.
+    # Поэтому загрузка новой версии скрипта/переименование файла не обнуляет данные.
+    _DATA_DIR_SETTING = clean_env("AGENTGPT_DATA_DIR", os.path.join(str(Path.home()), ".agentgpt"))
+    _DATA_DIRECTORY = os.path.abspath(os.path.expanduser(_DATA_DIR_SETTING))
+    os.makedirs(_DATA_DIRECTORY, exist_ok=True)
+    DATA_FILE = os.path.join(_DATA_DIRECTORY, os.path.basename(_DATA_FILE_SETTING))
+
+    # Однократно переносим файлы старых версий, если они ещё лежат рядом со скриптом
+    # или в текущей рабочей директории. Переносится и независимый журнал токенов.
+    if not os.path.exists(DATA_FILE):
+        legacy_candidates = [
+            os.path.join(_SCRIPT_DIRECTORY, _DATA_FILE_SETTING),
+            os.path.abspath(_DATA_FILE_SETTING),
+        ]
+        legacy_source = next((
+            p for p in legacy_candidates
+            if os.path.abspath(p) != os.path.abspath(DATA_FILE)
+            and any(os.path.isfile(p + suffix) for suffix in ("", ".bak", ".usage.json"))
+        ), None)
+        if legacy_source:
+            try:
+                for suffix in ("", ".bak", ".usage.json"):
+                    old_sidecar = legacy_source + suffix
+                    if os.path.isfile(old_sidecar):
+                        shutil.copy2(old_sidecar, DATA_FILE + suffix)
+                print(f"[DB Migration] Старые файлы базы перенесены в постоянный каталог: {DATA_FILE}")
+            except OSError as migration_exc:
+                print(f"[DB Recovery] Не удалось перенести старую базу: {migration_exc}")
 DATA_BACKUP_FILE = DATA_FILE + ".bak"
 USAGE_JOURNAL_FILE = DATA_FILE + ".usage.json"
 DOTENV_FILE = os.path.join(_SCRIPT_DIRECTORY, ".env")
 BOT_HOST_API_BASE = "https://bot-hosting.net/api/v1"
 BOT_HOSTING_API_KEY = clean_env("BOT_HOSTING_API_KEY", "")
-DATA_SCHEMA_VERSION = 3
+DATA_SCHEMA_VERSION = 4
 AUTO_MODERATION_MODEL = clean_env("AUTO_MODERATION_MODEL", "gemini-3.5-flash-lite")
 if AUTO_MODERATION_MODEL not in {"gemini-3.5-flash-lite", "deepseek-flash"}:
     AUTO_MODERATION_MODEL = "gemini-3.5-flash-lite"
@@ -317,6 +340,7 @@ def save_usage_journal():
             "users": {
                 str(uid): {
                     "tokens": max(0, int(user.get("tokens", 0) or 0)),
+                    "tokens_total": max(0, int(user.get("tokens_total", user.get("tokens", 0)) or 0)),
                     "reset_date": user.get("reset_date").isoformat() if isinstance(user.get("reset_date"), datetime) else user.get("reset_date"),
                 }
                 for uid, user in users_db.items() if isinstance(user, dict)
@@ -381,6 +405,7 @@ def load_usage_journal():
                         continue
                     journal_reset = _parse_saved_datetime(saved.get("reset_date"))
                     journal_tokens = max(0, int(saved.get("tokens", 0) or 0))
+                    journal_tokens_total = max(0, int(saved.get("tokens_total", journal_tokens) or 0))
                     if uid not in users_db:
                         # Основная база могла быть заменена при релизе; восстанавливаем
                         # минимальный профиль, чтобы личный расход не начинался с нуля.
@@ -388,7 +413,7 @@ def load_usage_journal():
                             "is_sub": False, "plan": "free", "plan_cost_rub": 0.0,
                             "api_cost_month_rub": 0.0, "api_cost_total_rub": 0.0,
                             "plan_month": datetime.now().strftime("%Y-%m"),
-                            "sub_end": None, "tokens": journal_tokens,
+                            "sub_end": None, "tokens": journal_tokens, "tokens_total": journal_tokens_total,
                             "reset_date": journal_reset or (datetime.now() + timedelta(days=30)),
                             "current_model": DEFAULT_MODEL, "custom_prompt": "", "web_search": False,
                             "banned": False, "strikes": 0, "history": [], "pending_followup": None,
@@ -402,6 +427,10 @@ def load_usage_journal():
                                        "endpoint_id": generate_rbx_endpoint_id()},
                         }
                     user = users_db[uid]
+                    user["tokens_total"] = max(
+                        int(user.get("tokens_total", user.get("tokens", 0)) or 0),
+                        journal_tokens_total,
+                    )
                     db_reset = _parse_saved_datetime(user.get("reset_date"))
                     db_tokens = max(0, int(user.get("tokens", 0) or 0))
                     if journal_reset and (not db_reset or journal_reset > db_reset):
@@ -409,6 +438,13 @@ def load_usage_journal():
                         user["tokens"] = journal_tokens
                     elif journal_reset and db_reset and journal_reset == db_reset:
                         user["tokens"] = max(db_tokens, journal_tokens)
+                    elif (journal_reset and db_reset and journal_reset > datetime.now()
+                          and journal_tokens > db_tokens and db_tokens == 0):
+                        # Если после выкладки база была создана заново с пустым
+                        # счётчиком и новым reset_date, но checkpoint ещё активен,
+                        # восстанавливаем прежний период вместо обнуления клиента.
+                        user["reset_date"] = journal_reset
+                        user["tokens"] = journal_tokens
                 except (TypeError, ValueError):
                     continue
         print("[Usage Journal] Счётчики токенов проверены и синхронизированы.")
@@ -593,6 +629,18 @@ def load_data():
                         "roblox": {"active": False, "token": generate_rbx_token(uid)},
                     }
                     user.update(saved_user)
+                    # Совместимость с прежними именами счётчика, если база была
+                    # экспортирована/пересобрана старой версией проекта.
+                    if "tokens" not in saved_user:
+                        for legacy_token_key in ("tokens_used", "used_tokens", "spent_tokens"):
+                            if legacy_token_key in saved_user:
+                                user["tokens"] = max(0, int(saved_user.get(legacy_token_key, 0) or 0))
+                                break
+                    user["tokens_total"] = max(
+                        0,
+                        int(user.get("tokens_total", 0) or 0),
+                        int(user.get("tokens", 0) or 0),
+                    )
                     # Миграция старых аккаунтов Premium в Pro.
                     if user.get("is_sub") and user.get("plan", "free") == "free":
                         user["plan"] = "pro"
@@ -603,6 +651,7 @@ def load_data():
                         user["plan"] = "pro"
                         user["is_sub"] = True
                     user.setdefault("plan", "pro" if user.get("is_sub") else "free")
+                    user.setdefault("tokens_total", int(user.get("tokens", 0) or 0))
                     user.setdefault("plan_cost_rub", 0.0)
                     user.setdefault("api_cost_month_rub", float(user.get("plan_cost_rub", 0.0) or 0.0))
                     user.setdefault("api_cost_total_rub", float(user.get("api_cost_month_rub", 0.0) or 0.0))
@@ -659,8 +708,21 @@ def load_data():
         # чтобы следующий save_data не затёр рабочую копию повреждённым JSON.
         if source_path == DATA_BACKUP_FILE:
             shutil.copy2(DATA_BACKUP_FILE, DATA_FILE)
-        # Сначала объединяем отдельный checkpoint, затем сохраняем уже восстановленное состояние.
+        # Сначала объединяем независимый checkpoint, затем применяем миграции ко
+        # всем существующим профилям и группам. Пользователям не нужно повторно
+        # нажимать /start, чтобы новые поля и настройки вступили в силу.
         load_usage_journal()
+        for uid in list(users_db.keys()):
+            try:
+                get_user(int(uid))
+            except Exception as migration_exc:
+                print(f"[DB Migration] user={uid}: {type(migration_exc).__name__}: {migration_exc}")
+        for chat_text in list(groups_db.keys()):
+            try:
+                chat_id = int(chat_text)
+                get_group(chat_id, str(groups_db.get(chat_text, {}).get("title", "Группа")))
+            except Exception as migration_exc:
+                print(f"[DB Migration] group={chat_text}: {type(migration_exc).__name__}: {migration_exc}")
         # Пересохраняем нормализованную базу после миграции старого формата.
         save_data()
     except Exception as exc:
@@ -2103,6 +2165,7 @@ def record_ai_usage(
     output_tokens = max(0, int(output_tokens))
     used_tokens = input_tokens + output_tokens
     user["tokens"] = int(user.get("tokens", 0) or 0) + used_tokens
+    user["tokens_total"] = int(user.get("tokens_total", user.get("tokens", 0) - used_tokens) or 0) + used_tokens
 
     # Единый счётчик всего AgentGPT — отдельно от индивидуальных месячных лимитов.
     if used_tokens:
@@ -2127,6 +2190,17 @@ def record_ai_usage(
         plan_current = max(0.0, float(user.get("plan_cost_rub", 0.0) or 0.0) - reserve)
         user["plan_cost_rub"] = round(plan_current + cost, 4)
     return cost
+
+
+def record_group_ai_usage(user_id: int, input_tokens: int, output_tokens: int, model_id: str | None = None) -> None:
+    """Учитывает групповой запрос у автора для общей статистики, не списывая личный лимит."""
+    used_tokens = max(0, int(input_tokens)) + max(0, int(output_tokens))
+    account = users_db.get(int(user_id)) if user_id else None
+    if isinstance(account, dict) and used_tokens:
+        account["tokens_total"] = max(0, int(account.get("tokens_total", account.get("tokens", 0)) or 0)) + used_tokens
+        save_usage_journal()
+    # Лимит и личный расход не затрагиваются: групповое использование относится к тарифу группы.
+    record_ai_usage({}, input_tokens, output_tokens, model_id=model_id)
 
 
 def check_and_consume_image_quota(user: dict, usage_type: str) -> tuple[bool, str]:
@@ -2185,6 +2259,10 @@ def get_user(user_id: int) -> dict:
     user.setdefault("history", [])
     user.setdefault("pending_followup", None)
     user.setdefault("tokens", 0)
+    user["tokens_total"] = max(
+        int(user.get("tokens_total", 0) or 0),
+        int(user.get("tokens", 0) or 0),
+    )
     user.setdefault("reset_date", now + timedelta(days=30))
 
     roblox = user.get("roblox") if isinstance(user.get("roblox"), dict) else {}
@@ -2251,12 +2329,14 @@ def get_group(chat_id: int, chat_title: str = "") -> dict:
             "auto_moderation_removed": 0,
             "role_wizards": {},
             "activity_enabled": False,
+            "activity_auto_migrated": False,
             "anti_spam_enabled": False,
             "anti_wave_enabled": False,
             "smalltalk_enabled": False,
             "roles_enabled": False,
             "custom_prompt": "",
             "moderation_context": [],
+            "conversation_context": [],
             "pending_inactive_cleanup": None,
             "model": None,
             "roles": json.loads(json.dumps(GROUP_DEFAULT_ROLES)),
@@ -2292,12 +2372,14 @@ def get_group(chat_id: int, chat_title: str = "") -> dict:
         "auto_moderation_removed": 0,
         "role_wizards": {},
         "activity_enabled": False,
+        "activity_auto_migrated": False,
         "anti_spam_enabled": False,
         "anti_wave_enabled": False,
         "smalltalk_enabled": False,
         "roles_enabled": False,
         "custom_prompt": "",
         "moderation_context": [],
+        "conversation_context": [],
         "pending_inactive_cleanup": None,
         "model": None,
         "roles": json.loads(json.dumps(GROUP_DEFAULT_ROLES)),
@@ -2316,6 +2398,11 @@ def get_group(chat_id: int, chat_title: str = "") -> dict:
         # не будут отменяться миграцией при каждом сообщении.
         group["ai_enabled"] = True
         group["ai_auto_default_migrated"] = True
+    # Для уже купленного тарифа «Максимум» включаем накопление активности
+    # один раз. После /activity_off выбор администратора не перезаписывается.
+    if get_group_plan(group) == "court" and not group.get("activity_auto_migrated"):
+        group["activity_enabled"] = True
+        group["activity_auto_migrated"] = True
     if not isinstance(group.get("roles"), dict):
         group["roles"] = json.loads(json.dumps(GROUP_DEFAULT_ROLES))
     if not isinstance(group.get("user_roles"), dict):
@@ -2332,6 +2419,9 @@ def get_group(chat_id: int, chat_title: str = "") -> dict:
     if not isinstance(group.get("moderation_context"), list):
         group["moderation_context"] = []
     del group["moderation_context"][:-12]
+    if not isinstance(group.get("conversation_context"), list):
+        group["conversation_context"] = []
+    del group["conversation_context"][:-18]
     group.setdefault("pending_inactive_cleanup", None)
     # Совместимость со старыми базами: старый переключатель ИИ-модератора
     # переносится на новый единый переключатель смыслового цензора.
@@ -3360,7 +3450,8 @@ async def show_profile(message: Message):
         f"🎮 Roblox Studio: {'🟢 Подключен (' + html.escape(rbx_place) + ')' if rbx_online else '🔴 Не подключен'}\n"
         f"🎨 Изображения сегодня: {u.get('image_analysis_count', 0)} анализов / {u.get('image_generation_count', 0)} генераций\n"
         f"🎨 Доступ к изображениям: {'✅ Pro/Max' if plan != 'free' or uid == ADMIN_ID else '🔒 Только Pro/Max'}\n"
-        f"📊 Токены: <code>{u['tokens']} / {limit}</code> ({pct:.1f}%)\n"
+        f"📊 Токены за период: <code>{u['tokens']} / {limit}</code> ({pct:.1f}%)\n"
+        f"🧾 Всего учтено за всё время: <code>{int(u.get('tokens_total', u['tokens']))}</code>\n"
         f"💳 Расходы подписки: <code>{spent:.2f} / {cost_cap:.2f} ₽</code> (осталось {remain:.2f} ₽)\n"
         f"🔄 Сброс лимита: {u['reset_date'].strftime('%d.%m.%Y')}",
         reply_markup=kb,
@@ -5757,7 +5848,8 @@ GROUP_HELP_TEXT = (
     "<b>Участники и команды</b>\n"
     "/warn, /warnings, /unwarn, /clearwarns, /mute, /unmute, /ban, /unban, /kick, /tempban, /purge.\n"
     "Команды принимают Telegram ID или известный боту @username; надёжнее всего — ответить на сообщение пользователя.\n"
-    "Фраза «агент, убери неактивных» или /inactive_cleanup [дней] на тарифе «Максимум» подготовит список и запросит подтверждение.\n\n"
+    "Фраза «агент, удали всех неактивных» или /inactive_cleanup [дней] на тарифе «Максимум» подготовит список и запросит подтверждение.\n"
+    "Агент также умеет сам вызывать инструменты /groupplan, /rules, /groupdiag и /grouphelp; результат действия проверяется до ответа.\n\n"
     "<b>Расширенные функции «Максимум»</b>\n"
     "/roles_on/off, /role_create, /role_set, /role_remove — роли и ранги.\n"
     "/groupmodels, /groupmodel ID — выбор модели; /gprompt текст — дополнительные инструкции агенту.\n"
@@ -5879,6 +5971,31 @@ def _moderation_context_text(group: dict, current_message: Message) -> str:
     if current and (not rows or rows[-1].split(": ", 1)[-1] != current[:350]):
         rows.append(f"{current_message.from_user.full_name}: {current[:350]}")
     return "\n".join(rows[-6:])
+
+
+def _recent_group_context_text(group: dict, current_message: Message, limit: int = 10) -> str:
+    """Возвращает недавние сообщения всей группы, а не только диалог с ботом."""
+    items = group.get("conversation_context")
+    if not isinstance(items, list) or not items:
+        items = group.get("moderation_context", [])
+    rows = []
+    current_id = int(getattr(current_message, "message_id", 0) or 0)
+    current_text = (getattr(current_message, "text", None) or getattr(current_message, "caption", None) or "").strip()
+    current_user_id = int(getattr(getattr(current_message, "from_user", None), "id", 0) or 0)
+    for item in items[-(limit + 1):]:
+        if not isinstance(item, dict):
+            continue
+        if current_id and int(item.get("message_id", 0) or 0) == current_id:
+            continue
+        value = str(item.get("text", "") or "").strip()
+        if current_text and value == current_text and int(item.get("user_id", 0) or 0) == current_user_id:
+            continue
+        if not value:
+            continue
+        name = str(item.get("name", "Участник"))[:36]
+        user_id = int(item.get("user_id", 0) or 0)
+        rows.append(f"{name} [ID {user_id}]: {value[:240]}")
+    return "\n".join(rows[-limit:])
 
 
 async def _get_sticker_image_data(message: Message) -> str | None:
@@ -6119,7 +6236,35 @@ def strip_group_nickname(text: str, nickname: str) -> tuple[str, bool]:
 
 
 def select_group_model_for_task(user: dict, group: dict, text: str) -> tuple[str, int]:
-    """Дешёвая модель для коротких задач, более сильная — для сложных запросов."""
+    """По умолчанию использует самую лёгкую настроенную модель; дорогая — только по явному выбору группы."""
+    provider_ids = set(str(x) for x in (bot_config.get("provider_model_ids") or []))
+    available = [mid for mid, info in models_db.items()
+                 if not info.get("premium") and (not provider_ids or mid in provider_ids)]
+
+    # Явная модель группы на тарифе «Максимум» — осознанная настройка администратора.
+    group_model = group.get("model")
+    if group_has_feature(group, "group_model") and group_model in models_db:
+        if not provider_ids or group_model in provider_ids:
+            selected = group_model
+        else:
+            selected = None
+    else:
+        selected = None
+
+    # Без явного выбора — фиксированный порядок лёгких моделей. Личную модель
+    # отправителя не используем: она могла быть дорогой и не имеет отношения к тарифу группы.
+    if not selected:
+        cheap_order = [
+            AUTO_MODERATION_MODEL,
+            "gemini-3.5-flash-lite",
+            "deepseek-flash",
+            "deepseek-v4.1-flash-1017",
+            "gemini-3.6-flash",
+        ]
+        selected = next((mid for mid in cheap_order if mid in available), None)
+    if not selected:
+        selected = available[0] if available else DEFAULT_MODEL
+
     value = (text or "").casefold()
     complex_markers = (
         "код", "скрипт", "программ", "разработ", "исправ", "ошибк", "домашн",
@@ -6127,17 +6272,7 @@ def select_group_model_for_task(user: dict, group: dict, text: str) -> tuple[str
         "проанализ", "сравни подробно", "составь проект", "архитектур",
     )
     complex_task = any(marker in value for marker in complex_markers)
-    provider_ids = set(str(x) for x in (bot_config.get("provider_model_ids") or []))
-    available = [mid for mid in models_db if not provider_ids or mid in provider_ids]
-    if group_has_feature(group, "group_model") and group.get("model") in available:
-        selected = group["model"]
-    elif complex_task:
-        preferred = user.get("current_model", DEFAULT_MODEL)
-        selected = preferred if preferred in available else (DEFAULT_MODEL if DEFAULT_MODEL in available else (available[0] if available else DEFAULT_MODEL))
-    else:
-        cheap_order = ["gemini-3.5-flash-lite", "deepseek-flash", "deepseek-v4.1-flash-1017", "gemini-3.6-flash"]
-        selected = next((mid for mid in cheap_order if mid in available), DEFAULT_MODEL if DEFAULT_MODEL in available else (available[0] if available else DEFAULT_MODEL))
-    return selected, (3000 if complex_task else 900)
+    return selected, (1600 if complex_task else 900)
 
 
 def should_auto_reply_to_group_message(text: str) -> bool:
@@ -6276,14 +6411,21 @@ def record_group_activity(message: Message, group: dict) -> None:
         context_text = "[анимация/GIF]"
     else:
         context_text = raw_text[:500]
-    context = group.setdefault("moderation_context", [])
-    context.append({
+    context_item = {
         "user_id": actor.id,
         "name": actor.full_name or "Участник",
+        "username": actor.username or "",
         "text": context_text,
         "timestamp": now,
-    })
+        "message_id": int(getattr(message, "message_id", 0) or 0),
+    }
+    context = group.setdefault("moderation_context", [])
+    context.append(context_item)
     del context[:-12]
+
+    conversation = group.setdefault("conversation_context", [])
+    conversation.append(dict(context_item))
+    del conversation[:-18]
 
     known = group.setdefault("known_users", {})
     known[str(actor.id)] = {
@@ -6510,6 +6652,7 @@ async def cb_group_plan_grant(callback: CallbackQuery):
     group["owner_id"] = requester_id
     if plan == "court":
         group["activity_enabled"] = True
+        group["activity_auto_migrated"] = True
     save_data()
     await callback.answer("Тариф группы подключён.", show_alert=True)
     try:
@@ -6681,22 +6824,98 @@ async def cb_group_inactive_cleanup(callback: CallbackQuery):
         await asyncio.sleep(0.05)
     save_data()
     await callback.answer("Очистка завершена.")
-    return await callback.message.edit_text(
+    await callback.message.edit_text(
         f"🧹 Очистка завершена. Удалено: {removed}; пропущено: {skipped}; ошибок: {failed}.",
     )
+    try:
+        await bot.send_message(chat_id, "*(:Я всё сделал:)*", parse_mode=None)
+    except Exception as marker_exc:
+        print(f"[INACTIVE CLEANUP] Не удалось отправить маркер завершения: {marker_exc}")
+    return
+
+
+GROUP_AGENT_COMMAND_RE = re.compile(r"(?m)^\s*\[\[RUN:([^]\r\n]+)\]\]\s*$")
+
+
+async def execute_group_agent_command(message: Message, group: dict, command_text: str) -> tuple[bool, str]:
+    """Выполняет только перечисленные в системном промпте инструменты и повторно проверяет права."""
+    parts = (command_text or "").strip().split()
+    if not parts:
+        return False, "Пустая команда агента."
+    head = parts[0].split("@")[0].casefold()
+    args = parts[1:]
+
+    if head == "/inactive_cleanup":
+        if not message.from_user or not await is_group_admin(message.chat.id, message.from_user.id):
+            return False, "Очистку неактивных участников может запускать только Telegram-администратор группы."
+        days = 30
+        if args:
+            try:
+                days = max(1, min(3650, int(args[0])))
+            except (TypeError, ValueError):
+                return False, "Срок должен быть числом дней."
+        previous_created = float((group.get("pending_inactive_cleanup") or {}).get("created_at", 0) or 0)
+        await prepare_inactive_cleanup(message, group, days)
+        pending = group.get("pending_inactive_cleanup")
+        prepared = (
+            isinstance(pending, dict)
+            and int(pending.get("actor_id", 0) or 0) == message.from_user.id
+            and float(pending.get("created_at", 0) or 0) > previous_created
+        )
+        return True, (
+            "Список подготовлен. Пользователю нужно проверить список и нажать кнопку подтверждения."
+            if prepared else
+            "Запрос обработан, но список не создан: проверьте тариф «Максимум», учёт активности, права администратора и права бота."
+        )
+
+    if head == "/groupplan":
+        return True, re.sub(r"<[^>]*>", "", group_plan_status_text(group))
+    if head == "/rules":
+        return True, "📜 Правила группы:\n" + str(group.get("rules", "Правила не заданы."))[:2500]
+    if head == "/grouphelp":
+        return True, re.sub(r"<[^>]*>", "", GROUP_HELP_TEXT[:3500])
+    if head == "/groupdiag":
+        rights = await get_group_bot_rights(message.chat.id)
+        return True, (
+            "Диагностика бота: "
+            f"статус={rights.get('status')}; администратор={'да' if rights.get('is_admin') else 'нет'}; "
+            f"удаление={'да' if rights.get('can_delete_messages') else 'нет'}; "
+            f"ограничения/бан={'да' if rights.get('can_restrict_members') else 'нет'}."
+        )
+
+    return False, "Эта команда не входит в список доступных инструментов агента."
 
 
 async def handle_group_natural_setting(message: Message, group: dict, user_text: str) -> bool:
-    if len(user_text) > 140 or not message.from_user:
+    if not user_text or not message.from_user:
         return False
 
     nickname = str(group.get("nickname", "AgentGPT")).strip()
     stripped, _called = strip_group_nickname(user_text, nickname)
-    text = stripped.strip().casefold()
-    if re.search(r"(?:убери|удали|кикни|очисти).*(?:неактив|молчун|не пишет)|(?:неактив).*(?:убери|удали|кикни)", text):
+    text = re.sub(r"\s+", " ", stripped.strip().casefold())
+
+    # Надёжное распознавание запросов на очистку активности. Фраза может
+    # звучать свободно: «удали всех, кто сейчас неактивен», «убери молчунов» и т.п.
+    inactive_intent = bool(re.search(
+        r"неактив|молчун|не\s+пиш|не\s+заход|давно\s+не\s+появ|без\s+активност",
+        text,
+    ))
+    remove_intent = bool(re.search(
+        r"удал|убер|кик|выгон|очист|исключ|убрать|удалить",
+        text,
+    ))
+    if inactive_intent and remove_intent:
         days_match = re.search(r"(\d{1,4})\s*(?:дн(?:ей|я)?|сут(?:ок|ки)?)", text)
         days = max(1, min(3650, int(days_match.group(1)))) if days_match else 30
-        return await prepare_inactive_cleanup(message, group, days)
+        created_before = float((group.get("pending_inactive_cleanup") or {}).get("created_at", 0) or 0)
+        await prepare_inactive_cleanup(message, group, days)
+        pending = group.get("pending_inactive_cleanup")
+        if isinstance(pending, dict) and int(pending.get("actor_id", 0) or 0) == message.from_user.id and float(pending.get("created_at", 0) or 0) > created_before:
+            await message.answer(
+                "*(:Я подготовил список неактивных участников. Проверьте его и подтвердите удаление кнопкой выше.:)*",
+                parse_mode=None,
+            )
+        return True
     match = re.fullmatch(
         r"(включи|включить|выключи|выключить)\s+"
         r"(автоответы|ии|агента|режим агента|цензор|цензуру|ии-модератор|автомодератор|активность|антиспам|анти-спам|"
@@ -7474,21 +7693,45 @@ async def handle_group_message(message: Message, user: dict):
     # полностью блокировал бы ответы агента в общем чате.
 
     nickname = str(group.get("nickname", "AgentGPT"))[:32]
+    # Фактические права автора и самого бота передаются модели раздельно.
+    actor_is_admin = await is_group_admin(chat_id, uid)
+    bot_rights = await get_group_bot_rights(chat_id)
+    recent_context = _recent_group_context_text(group, message, limit=10)
+    tool_catalog = (
+        "ДОСТУПНЫЕ ИНСТРУМЕНТЫ (только эти команды разрешено вызывать через маркер [[RUN:...]]):\n"
+        "1. /inactive_cleanup [дней] — подготовить список известных неактивных участников. Только тариф «Максимум», "
+        "только Telegram-администратор; удаление НЕ происходит сразу, обязательно подтверждение кнопкой.\n"
+        "2. /groupplan — показать тариф и включённые функции группы.\n"
+        "3. /rules — показать правила группы.\n"
+        "4. /groupdiag — проверить реальные права бота в Telegram.\n"
+        "5. /grouphelp — показать доступные пользователям команды.\n"
+        "Когда действие нужно выполнить, добавь отдельную строку строго вида [[RUN:/inactive_cleanup 30]] "
+        "(подставь число дней при наличии) или соответствующий другой инструмент из списка. "
+        "После вызова не говори, что действие завершено, пока результат инструмента этого не подтвердил.\n"
+        "Нельзя выдумывать команды, подделывать результат, обходить проверки прав или применять наказания без проверки.\n"
+    )
     group_prompt = (
-        f"Ты {nickname}, групповой ИИ-агент Telegram. Выполняй прямые просьбы, если они безопасны и понятны; "
-        "не утверждай, что изменил настройки или применил модерацию, если действие фактически не выполнено. "
-        "Не раскрывай личные данные, не делай выводов о личности участников. Помни, что ответ видит вся группа. "
-        "Отвечай дружелюбно, иногда уместно шути, но не спамь. При спорной просьбе уточняй детали.\n"
-        "Не выдавай наказания по догадке: санкции выполняются только обработчиками команд и только после проверки роли, "
-        "иерархии и Telegram-прав. Если действие не поддерживается, прямо скажи об этом.\n"
-        "Если участник отвечает на уточнение, продолжай контекст. Для кода сохраняй язык и формат запроса.\n"
+        f"Ты {nickname}, групповой ИИ-агент Telegram. Ты видишь общие сообщения группы и обязан использовать их как контекст, "
+        "даже если последнее сообщение не является ответом на твою реплику. Понимай местоимения и короткие ответы "
+        "по недавней переписке. Выполняй прямые просьбы, если они безопасны и разрешены.\n"
+        "Не утверждай, что не умеешь использовать команды: у тебя есть инструменты, перечисленные ниже. "
+        "Не утверждай, что ты администратор-человек; различай права автора сообщения и права Telegram-бота. "
+        "Не раскрывай личные данные, не делай выводов о личности участников. Помни, что ответ видит вся группа.\n"
+        "Если инструмент вызван, его дополнительное пояснение должно быть коротким. Не пиши «я всё сделал», "
+        "если действие только подготовлено и ждёт подтверждения.\n"
+        f"{tool_catalog}"
+        f"Текущий автор: {message.from_user.full_name} (ID {uid}); Telegram-администратор группы: {'ДА' if actor_is_admin else 'НЕТ'}.\n"
+        f"Права бота: статус={bot_rights.get('status')}; администратор={'ДА' if bot_rights.get('is_admin') else 'НЕТ'}; "
+        f"удаление={'ДА' if bot_rights.get('can_delete_messages') else 'НЕТ'}; "
+        f"ограничение/бан={'ДА' if bot_rights.get('can_restrict_members') else 'НЕТ'}.\n"
         f"Название группы: {group.get('title', 'Группа')}.\nПравила: {group.get('rules', '')}\n"
+        f"НЕДАВНИЕ СООБЩЕНИЯ ВСЕЙ ГРУППЫ (используй для контекста):\n{recent_context or 'Контекст ещё не накоплен.'}\n"
         f"Настройки агента: цензор={'вкл' if group.get('censor_enabled') else 'выкл'}, "
         f"антиспам={'вкл' if group.get('anti_spam_enabled') else 'выкл'}, автоответы={'вкл' if group.get('ai_enabled') else 'выкл'}.\n"
         f"Дополнительный промпт администратора: {group.get('custom_prompt', '') if group_has_feature(group, 'group_prompt') else ''}"
     )
     messages = [{"role": "system", "content": group_prompt}]
-    for item in group_history[-12:]:
+    for item in group_history[-8:]:
         if item.get("role") in ("user", "assistant"):
             messages.append({"role": item["role"], "content": item.get("content", "")})
     group_user_prompt = f"Участник {message.from_user.full_name}: {user_text}"
@@ -7523,6 +7766,33 @@ async def handle_group_message(message: Message, user: dict):
         answer = (response.choices[0].message.content or "").strip()
         if not answer:
             answer = "Не получилось сформировать ответ. Попробуйте переформулировать запрос."
+
+        # Модель может вызвать только whitelisted-инструмент. Маркер никогда не
+        # показывается как обычный текст: команда выполняется с повторной проверкой прав.
+        tool_match = GROUP_AGENT_COMMAND_RE.search(answer)
+        tool_was_run = False
+        tool_result = ""
+        if tool_match:
+            raw_tool = tool_match.group(1).strip()
+            answer = (answer[:tool_match.start()] + answer[tool_match.end():]).strip()
+            tool_was_run, tool_result = await execute_group_agent_command(message, group, raw_tool)
+            if not tool_was_run:
+                answer = (answer + "\n\n" if answer else "") + tool_result
+            else:
+                # Дополнение агента отправляется отдельным сообщением в требуемых маркерах.
+                tool_name = raw_tool.split(maxsplit=1)[0].casefold()
+                if tool_name == "/inactive_cleanup":
+                    # Команда предварительной очистки должна честно сообщать только
+                    # о подготовке списка, а не повторять возможную галлюцинацию модели.
+                    supplement = tool_result
+                    if "Список подготовлен" in tool_result and answer:
+                        supplement += "\n" + answer
+                else:
+                    supplement = tool_result + ("\n" + answer if answer else "")
+                if supplement:
+                    await message.answer(f"*(:{supplement[:1200]}:)*", parse_mode=None)
+                answer = tool_result
+
         group_history.extend([
             {"role": "user", "content": f"{message.from_user.full_name}: {user_text}"},
             {"role": "assistant", "content": answer},
@@ -7533,13 +7803,14 @@ async def handle_group_message(message: Message, user: dict):
         usage = getattr(response, "usage", None)
         input_used = int(getattr(usage, "prompt_tokens", 0) or est_in)
         output_used = int(getattr(usage, "completion_tokens", 0) or estimate_request_tokens(answer))
-        record_ai_usage({}, input_used, output_used, model_id=selected_model)
+        record_group_ai_usage(uid, input_used, output_used, model_id=selected_model)
         save_data()
         try:
             await status.delete()
         except Exception:
             pass
-        await send_smart_ai_response(message, answer, programming=user.get("programming_mode") == "general")
+        if not tool_was_run:
+            await send_smart_ai_response(message, answer, programming=user.get("programming_mode") == "general")
     except Exception as exc:
         try:
             await status.edit_text(f"❌ Ошибка ИИ: {html.escape(str(exc)[:300])}", parse_mode="HTML")

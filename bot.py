@@ -2366,6 +2366,7 @@ def get_group(chat_id: int, chat_title: str = "") -> dict:
             "user_roles": {},
             "user_stats": {},
             "known_users": {},
+            "username_index": {},
             "last_message_ts": time.time(),
             "last_smalltalk_ts": 0,
             "spam_strikes": {},
@@ -2410,6 +2411,7 @@ def get_group(chat_id: int, chat_title: str = "") -> dict:
         "user_roles": {},
         "user_stats": {},
         "known_users": {},
+        "username_index": {},
         "last_message_ts": time.time(),
         "last_smalltalk_ts": 0,
         "spam_strikes": {},
@@ -2442,6 +2444,8 @@ def get_group(chat_id: int, chat_title: str = "") -> dict:
         group["user_stats"] = {}
     if not isinstance(group.get("known_users"), dict):
         group["known_users"] = {}
+    if not isinstance(group.get("username_index"), dict):
+        group["username_index"] = {}
     # Архив переписки полностью отключён: удаляем старые данные, чтобы не
     # хранить лишний текст и не расходовать память.
     group.pop("chat_archive", None)
@@ -5820,6 +5824,25 @@ async def handle_group_bot_membership(event: ChatMemberUpdated):
         print(f"[GROUP ONBOARDING] chat={event.chat.id}: {type(exc).__name__}: {exc}")
 
 
+@dp.chat_member()
+async def handle_group_member_identity(event: ChatMemberUpdated):
+    """Кэширует новые username при входе/выходе/смене статуса участника.
+
+    Telegram отправляет chat_member updates, когда бот администратор и этот
+    тип явно включён в allowed_updates.
+    """
+    if event.chat.type not in ("group", "supergroup"):
+        return
+    group = get_group(event.chat.id, event.chat.title or "Группа")
+    old_user = getattr(event.old_chat_member, "user", None)
+    new_user = getattr(event.new_chat_member, "user", None)
+    if old_user:
+        cache_group_user_identity(group, old_user)
+    if new_user:
+        cache_group_user_identity(group, new_user)
+    save_data()
+
+
 @dp.callback_query(F.data.startswith("gmenu|"))
 async def cb_group_menu(callback: CallbackQuery):
     try:
@@ -5893,7 +5916,7 @@ GROUP_HELP_TEXT = (
     "/usercard — карточка участника ответом на его сообщение; /groupstats — статистика.\n\n"
     "<b>Участники и команды</b>\n"
     "/warn, /warnings, /unwarn, /clearwarns, /mute, /unmute, /ban, /unban, /kick, /tempban, /purge.\n"
-    "Команды принимают Telegram ID или известный боту @username; надёжнее всего — ответить на сообщение пользователя.\n"
+    "Команды принимают @username автоматически: бот обновляет список по сообщениям и событиям входа/выхода участников. Числовой ID вручную вводить не требуется.\n"
     "Администратор может написать агенту: «удали @user», «замути @user на 10 минут», «забань @user», «кикни @user», «предупреди @user» или «сними мут с @user».\n"
     "Фраза «агент, удали всех неактивных» или /inactive_cleanup [дней] на тарифе «Максимум» подготовит список и запросит подтверждение.\n"
     "Агент также умеет сам вызывать инструменты /groupplan, /rules, /groupdiag и /grouphelp; результат действия проверяется до ответа.\n\n"
@@ -5917,13 +5940,21 @@ def group_target_id(message: Message, args: list[str], command_name: str = "", g
         return int(raw.lstrip("@"))
     if raw.startswith("@") and group:
         username = raw[1:].strip().casefold()
+        indexed = group.get("username_index", {}).get(username)
+        if indexed is not None:
+            try:
+                return int(indexed)
+            except (TypeError, ValueError):
+                pass
         for source in (group.get("known_users", {}), group.get("user_stats", {})):
+            if not isinstance(source, dict):
+                continue
             for uid, entry in source.items():
-                if str(entry.get("username", "")).casefold() == username:
+                if isinstance(entry, dict) and str(entry.get("username", "")).strip().lstrip("@").casefold() == username:
                     try:
                         return int(uid)
                     except (TypeError, ValueError):
-                        return None
+                        continue
     return None
 
 
@@ -6488,6 +6519,148 @@ async def cb_group_role_rank_choice(callback: CallbackQuery):
     )
 
 
+def cache_group_user_identity(group: dict, user: Any) -> None:
+    """Сохраняет username -> user_id из настоящих Telegram updates."""
+    if not user:
+        return
+    try:
+        user_id = int(getattr(user, "id", 0) or 0)
+    except (TypeError, ValueError):
+        return
+    if user_id <= 0 or bool(getattr(user, "is_bot", False)):
+        return
+
+    known = group.setdefault("known_users", {})
+    if not isinstance(known, dict):
+        known = {}
+        group["known_users"] = known
+    username_index = group.setdefault("username_index", {})
+    if not isinstance(username_index, dict):
+        username_index = {}
+        group["username_index"] = username_index
+
+    username = str(getattr(user, "username", "") or "").strip().lstrip("@").casefold()
+    uid_key = str(user_id)
+    previous = known.get(uid_key, {})
+    previous_username = str(previous.get("username", "") or "").strip().lstrip("@").casefold()
+    if previous_username and previous_username != username and username_index.get(previous_username) == uid_key:
+        username_index.pop(previous_username, None)
+
+    known[uid_key] = {
+        "name": str(getattr(user, "full_name", "") or getattr(user, "first_name", "") or "Участник")[:100],
+        "username": username,
+        "last_seen": datetime.now().isoformat(timespec="minutes"),
+    }
+    if username:
+        username_index[username] = uid_key
+    # Храним только ограниченное количество последних известных участников.
+    while len(known) > 3000:
+        oldest_uid = next(iter(known))
+        old_entry = known.pop(oldest_uid, {})
+        old_username = str(old_entry.get("username", "") or "").casefold()
+        if old_username and username_index.get(old_username) == oldest_uid:
+            username_index.pop(old_username, None)
+    # Чистим осиротевшие ссылки индекса.
+    for indexed_username, indexed_uid in list(username_index.items()):
+        if str(indexed_uid) not in known:
+            username_index.pop(indexed_username, None)
+
+
+async def resolve_group_username(chat_id: int, group: dict, username: str):
+    """Автоматически разрешает @username в ID по данным, полученным от Telegram.
+
+    Bot API не имеет метода поиска произвольного участника по username. Поэтому
+    используется актуализируемый кэш сообщений/событий участников, а найденный
+    ID обязательно перепроверяется через getChatMember перед модерацией.
+    Возвращает (user_id, ChatMember) либо (None, None).
+    """
+    wanted = str(username or "").strip().lstrip("@").casefold()
+    if not wanted:
+        return None, None
+
+    known = group.setdefault("known_users", {})
+    username_index = group.setdefault("username_index", {})
+    candidate_ids: list[int] = []
+
+    indexed_id = username_index.get(wanted) if isinstance(username_index, dict) else None
+    if indexed_id is not None:
+        try:
+            candidate_ids.append(int(indexed_id))
+        except (TypeError, ValueError):
+            pass
+
+    def add_matching_ids(source):
+        if not isinstance(source, dict):
+            return
+        for uid, entry in source.items():
+            if not isinstance(entry, dict):
+                continue
+            value = str(entry.get("username", "") or "").strip().lstrip("@").casefold()
+            if value == wanted:
+                try:
+                    candidate_ids.append(int(uid))
+                except (TypeError, ValueError):
+                    continue
+
+    add_matching_ids(known)
+    add_matching_ids(group.get("user_stats", {}))
+
+    # Совместимость с username, присутствующими в ещё не мигрированном контексте.
+    for field in ("moderation_context", "conversation_context"):
+        entries = group.get(field, [])
+        if isinstance(entries, list):
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                value = str(entry.get("username", "") or "").strip().lstrip("@").casefold()
+                if value == wanted:
+                    try:
+                        candidate_ids.append(int(entry.get("user_id", 0) or 0))
+                    except (TypeError, ValueError):
+                        pass
+
+    checked: set[int] = set()
+    for candidate_id in candidate_ids:
+        if candidate_id <= 0 or candidate_id in checked:
+            continue
+        checked.add(candidate_id)
+        try:
+            member = await bot.get_chat_member(chat_id, candidate_id)
+        except Exception:
+            continue
+        member_user = getattr(member, "user", None)
+        actual_username = str(getattr(member_user, "username", "") or "").strip().lstrip("@").casefold()
+        if actual_username == wanted:
+            cache_group_user_identity(group, member_user)
+            return candidate_id, member
+
+        # Username мог быть переименован или передан другому аккаунту.
+        # Устаревшую привязку удаляем, чтобы не заблокировать не того человека.
+        uid_key = str(candidate_id)
+        if isinstance(known, dict):
+            stale_entry = known.get(uid_key)
+            stale_username = str((stale_entry or {}).get("username", "") or "").strip().lstrip("@").casefold()
+            if stale_username == wanted:
+                known.pop(uid_key, None)
+        if isinstance(username_index, dict) and str(username_index.get(wanted, "")) == uid_key:
+            username_index.pop(wanted, None)
+
+    # Если это администратор, Telegram всё ещё может предоставить его объект.
+    # Возвращаем ID, чтобы исполнитель ответил понятной защитой, а не ошибкой поиска.
+    try:
+        administrators = await bot.get_chat_administrators(chat_id)
+        for admin_member in administrators:
+            admin_user = getattr(admin_member, "user", None)
+            admin_username = str(getattr(admin_user, "username", "") or "").strip().lstrip("@").casefold()
+            if admin_username == wanted:
+                cache_group_user_identity(group, admin_user)
+                return int(admin_user.id), admin_member
+    except Exception as exc:
+        print(f"[GROUP USER LOOKUP] Не удалось проверить список администраторов: {type(exc).__name__}: {exc}")
+
+    return None, None
+
+
 def record_group_activity(message: Message, group: dict) -> None:
     """Сохраняет компактную активность и короткий контекст для смысловой модерации."""
     now = time.time()
@@ -6520,16 +6693,7 @@ def record_group_activity(message: Message, group: dict) -> None:
     conversation.append(dict(context_item))
     del conversation[:-18]
 
-    known = group.setdefault("known_users", {})
-    known[str(actor.id)] = {
-        "name": actor.full_name or "Участник",
-        "username": actor.username or "",
-        "last_seen": datetime.now().isoformat(timespec="minutes"),
-    }
-    if len(known) > 1200:
-        oldest = next(iter(known))
-        if oldest != str(actor.id):
-            known.pop(oldest, None)
+    cache_group_user_identity(group, actor)
 
     if group_has_feature(group, "activity") and group.get("activity_enabled"):
         stats = group.setdefault("user_stats", {})
@@ -6990,20 +7154,13 @@ async def execute_group_agent_command(message: Message, group: dict, command_tex
             elif target_token is None:
                 target_token = arg
         target_id = None
+        target_member = None
         if target_token:
             clean_target = target_token.strip().strip(".,;:!?)]}>")
             if clean_target.startswith("@"):
-                wanted_username = clean_target[1:].casefold()
-                for source in (group.get("known_users", {}), group.get("user_stats", {})):
-                    for known_id, entry in source.items():
-                        if str(entry.get("username", "")).casefold() == wanted_username:
-                            try:
-                                target_id = int(known_id)
-                            except (TypeError, ValueError):
-                                target_id = None
-                            break
-                    if target_id is not None:
-                        break
+                target_id, target_member = await resolve_group_username(
+                    message.chat.id, group, clean_target
+                )
             elif clean_target.isdigit():
                 target_id = int(clean_target)
         elif message.reply_to_message and message.reply_to_message.from_user:
@@ -7012,19 +7169,22 @@ async def execute_group_agent_command(message: Message, group: dict, command_tex
         if target_id is None:
             if target_token and str(target_token).startswith("@"):
                 return False, (
-                    f"Не удалось определить Telegram ID для {target_token}. Бот сможет найти username, "
-                    "если уже видел этого участника в группе; иначе ответьте на его сообщение или укажите ID."
+                    f"Не удалось найти {target_token} среди участников, чьи данные Telegram уже передавал боту. "
+                    "Я автоматически обновляю поиск по сообщениям и событиям входа/выхода. "
+                    "Bot API не предоставляет отдельный поиск всех участников по username; "
+                    "если этот пользователь ещё ни разу не появлялся перед ботом, потребуется его сообщение или вход в группу."
                 )
-            return False, f"Укажи цель: {head} @username/ID либо ответь на сообщение участника."
+            return False, f"Укажи цель: {head} @username либо ответь на сообщение участника. Числовой ID вручную не нужен."
         if target_id == message.from_user.id:
             return False, "Нельзя применить это действие к самому себе."
 
-        try:
-            target_member = await bot.get_chat_member(message.chat.id, target_id)
-        except Exception as exc:
-            # Для уже вышедшего участника getChatMember может вернуть left;
-            # в таком случае повторный kick/mute не имеет смысла.
-            return False, f"Не удалось проверить участника {target_id}: {str(exc)[:180]}"
+        if target_member is None:
+            try:
+                target_member = await bot.get_chat_member(message.chat.id, target_id)
+            except Exception as exc:
+                # Для уже вышедшего участника getChatMember может вернуть left;
+                # в таком случае повторный kick/mute не имеет смысла.
+                return False, f"Не удалось проверить участника {target_id}: {str(exc)[:180]}"
         raw_target_status = getattr(target_member, "status", "unknown")
         target_status = str(getattr(raw_target_status, "value", raw_target_status)).casefold()
         if target_status in ("administrator", "creator"):
@@ -7383,6 +7543,9 @@ async def handle_group_message(message: Message, user: dict):
     user_text = (message.text or message.caption or "").strip()
 
     if message.new_chat_members:
+        for joined_user in message.new_chat_members:
+            cache_group_user_identity(group, joined_user)
+        save_data()
         try:
             current_bot = await bot.get_me()
             welcomed_members = [member for member in message.new_chat_members if member.id != current_bot.id]
@@ -7856,9 +8019,12 @@ async def handle_group_message(message: Message, user: dict):
             group["warnings"] = {}
             save_data()
             return await message.reply("✅ Все предупреждения в этой группе очищены.")
-        target_id = group_target_id(message, args, head, group)
+        if not message.reply_to_message and args and str(args[0]).startswith("@"):
+            target_id, _resolved_member = await resolve_group_username(chat_id, group, args[0])
+        else:
+            target_id = group_target_id(message, args, head, group)
         if target_id is None:
-            return await message.reply("Ответьте командой на сообщение участника, укажите числовой Telegram ID или @username, который бот уже видел в этой группе. Для /mute укажите длительность после ID или ответьте на сообщение.")
+            return await message.reply("Не удалось найти этот @username среди известных Telegram участников. Бот автоматически обновляет список по сообщениям и событиям входа; вручную вводить ID не нужно. Для пользователя, которого бот ещё ни разу не видел, ответьте на его сообщение или дождитесь его появления в группе.")
         if not await can_group_manage_target(chat_id, group, uid, target_id):
             return await message.reply("⛔ Нельзя применять это действие к себе или участнику с равной/более высокой ролью.")
         warnings = group.setdefault("warnings", {})
@@ -8045,7 +8211,7 @@ async def handle_group_message(message: Message, user: dict):
         "Если администратор прямо просит удалить/выгнать/кикнуть конкретного участника — вызови /kick. "
         "Если прямо просит заблокировать/забанить — /ban. Если просит замутить — /mute с указанным сроком. "
         "Если просит снять мут — /unmute. Если просит предупредить — /warn. Не предлагай ему вручную вводить команду.\n"
-        "Бот разрешает @username только если уже видел этого человека в группе; иначе запроси Telegram ID или ответ на сообщение.\n"
+        "При @username бот автоматически ищет совпадение в кэше сообщений, новых участников и событий chat_member; никогда не требуй от администратора вручную доставать числовой ID. Если username ещё неизвестен Bot API, попроси пользователя дождаться его сообщения/входа или ответить на его сообщение.\n"
         "Не трогай Telegram-администраторов, самого автора или владельца группы. Не обходи защиту ролей и Telegram-права. "
         "Не заявляй, что действия модерации запрещены правилами Telegram: проверяй реальные права и исполняй допустимый запрос.\n"
         "Для массовой очистки неактивных сначала подготавливай список, затем требуй подтверждение кнопкой. "
@@ -8629,7 +8795,9 @@ async def main():
         # экземпляр бота с тем же BOT_TOKEN — должен работать только один.
         await bot.delete_webhook(drop_pending_updates=False)
         print(f"🚀 Бот AgentGPT успешно запущен! Администратор: {ADMIN_ID}")
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        used_updates = set(dp.resolve_used_update_types())
+        used_updates.add("chat_member")
+        await dp.start_polling(bot, allowed_updates=sorted(used_updates))
     finally:
         print("⏳ Сохранение данных и остановка сервисов...")
         if smalltalk_task is not None:

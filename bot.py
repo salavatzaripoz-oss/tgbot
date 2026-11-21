@@ -116,9 +116,28 @@ DOTENV_FILE = os.path.join(_SCRIPT_DIRECTORY, ".env")
 BOT_HOST_API_BASE = "https://bot-hosting.net/api/v1"
 BOT_HOSTING_API_KEY = clean_env("BOT_HOSTING_API_KEY", "")
 DATA_SCHEMA_VERSION = 4
-AUTO_MODERATION_MODEL = clean_env("AUTO_MODERATION_MODEL", "gemini-3.5-flash-lite")
-if AUTO_MODERATION_MODEL not in {"gemini-3.5-flash-lite", "deepseek-flash"}:
-    AUTO_MODERATION_MODEL = "gemini-3.5-flash-lite"
+# Единый allowlist моделей, доступных в подключённом API.
+# Не добавляй сюда модели, которых нет в ответе провайдера /models.
+SUPPORTED_MODEL_IDS = frozenset({
+    "gpt-6.1-sol",
+    "gpt-6-astra",
+    "gpt-6-sol",
+    "gpt-6-luna",
+    "opus-5.5",
+    "opus-5",
+    "sonnet-5.5",
+    "fable-5.2",
+    "fable-5.1",
+    "sonnet-5",
+    "deepseek-v4.1-flash",
+    "deepseek-reasoner",
+    "deepseek-coder",
+})
+
+# Для групп, модерации и простых запросов по умолчанию берём Flash-модель.
+AUTO_MODERATION_MODEL = clean_env("AUTO_MODERATION_MODEL", "deepseek-v4.1-flash").strip()
+if AUTO_MODERATION_MODEL not in SUPPORTED_MODEL_IDS:
+    AUTO_MODERATION_MODEL = "deepseek-v4.1-flash"
 
 # Подписки и контроль расходов. Фактические ставки провайдера задаются через .env.
 PLAN_CONFIG = {
@@ -261,24 +280,23 @@ def rebuild_photo_clients():
 
 DEFAULT_MODEL = "gpt-6-luna"
 
+# Каталог ограничен моделями, которые пользователь подтвердил как доступные.
+# Vision-флаги сохранены для ранее поддерживаемых мультимодальных семейств;
+# DeepSeek и Fable оставлены текстовыми, пока провайдер не подтвердит Vision.
 models_db = {
-    "deepseek-flash": {"name": "DeepSeek Flash", "premium": False, "vision": False},
-    "deepseek-v4.1-flash-1017": {"name": "DeepSeek v4.1", "premium": False, "vision": False},
-    "gemini-3.5-flash-lite": {"name": "Gemini 3.5 Lite", "premium": False, "vision": False},
-    "gemini-3.6-flash": {"name": "Gemini 3.6 Flash", "premium": False, "vision": True},
-    "gemini-3.8-flash": {"name": "Gemini 3.8 Flash", "premium": False, "vision": True},
+    "deepseek-v4.1-flash": {"name": "DeepSeek V4.1 Flash", "premium": False, "vision": False},
+    "deepseek-reasoner": {"name": "DeepSeek Reasoner", "premium": True, "vision": False},
+    "deepseek-coder": {"name": "DeepSeek Coder", "premium": False, "vision": False},
     "gpt-6-luna": {"name": "GPT-6 Luna", "premium": False, "vision": True},
-    "gpt-6-so": {"name": "GPT-6 SO", "premium": False, "vision": True},
-    "sonnet-5": {"name": "Claude 5 Sonnet", "premium": False, "vision": True},
-    "fable-5.1": {"name": "Claude 5.1 Fable", "premium": False, "vision": False},
+    "gpt-6-sol": {"name": "GPT-6 Sol", "premium": False, "vision": True},
+    "sonnet-5": {"name": "Sonnet 5", "premium": False, "vision": True},
+    "fable-5.1": {"name": "Fable 5.1", "premium": False, "vision": False},
+    "fable-5.2": {"name": "Fable 5.2", "premium": False, "vision": False},
     "gpt-6.1-sol": {"name": "GPT-6.1 Sol", "premium": True, "vision": True},
     "gpt-6-astra": {"name": "GPT-6 Astra", "premium": True, "vision": True},
-    "opus-5.5": {"name": "Claude 5.5 Opus", "premium": True, "vision": True},
-    "opus-5": {"name": "Claude 5 Opus", "premium": True, "vision": True},
-    "sonnet-5.5": {"name": "Claude 5.5 Sonnet", "premium": True, "vision": True},
-    "gemini-4-argon": {"name": "Gemini 4 Argon", "premium": True, "vision": True},
-    "grok-4.7": {"name": "Grok 4.7", "premium": True, "vision": True},
-    "deepseek-r1": {"name": "DeepSeek R1", "premium": True, "vision": False}
+    "opus-5.5": {"name": "Opus 5.5", "premium": True, "vision": True},
+    "opus-5": {"name": "Opus 5", "premium": True, "vision": True},
+    "sonnet-5.5": {"name": "Sonnet 5.5", "premium": True, "vision": True},
 }
 
 users_db = {}
@@ -549,6 +567,10 @@ def load_data():
         bot_config.setdefault("global_token_alert_threshold", int(clean_env("GLOBAL_TOKEN_ALERT_THRESHOLD", "0")))
         bot_config.setdefault("global_token_alert_month", "")
         bot_config.setdefault("provider_model_ids", [])
+        bot_config["provider_model_ids"] = [
+            str(model_id) for model_id in bot_config.get("provider_model_ids", [])
+            if str(model_id) in SUPPORTED_MODEL_IDS
+        ]
         bot_config.setdefault("provider_models_checked_at", "")
         bot_config.setdefault("provider_models_check_ok", False)
         bot_config.setdefault("provider_models_last_error", "")
@@ -566,13 +588,14 @@ def load_data():
         stored_models = payload.get("models_db")
         if isinstance(stored_models, dict):
             for model_id, info in stored_models.items():
-                if isinstance(info, dict):
-                    current = models_db.get(model_id, {})
-                    current.update(info)
+                # Старые модели из прежней базы игнорируем: каталог выше — источник истины.
+                if model_id in SUPPORTED_MODEL_IDS and model_id in models_db and isinstance(info, dict):
+                    current = models_db[model_id]
+                    # Сохраняем ручные настройки тарифа/Vision только для известных моделей.
+                    current.update({key: value for key, value in info.items() if key in {"name", "premium", "vision"}})
                     current.setdefault("name", model_id)
                     current.setdefault("premium", False)
                     current.setdefault("vision", False)
-                    models_db[model_id] = current
 
         stored_reviews = payload.get("reviews_db")
         if isinstance(stored_reviews, list):
@@ -1680,9 +1703,8 @@ def get_vision_fallback_models(preferred_model: str) -> list[str]:
         candidates.append(preferred_model)
 
     priority_vision = [
-        "gpt-6-luna", "gemini-3.8-flash", "gemini-3.6-flash",
-        "gpt-6-so", "sonnet-5", "gpt-6.1-sol", "gemini-4-argon",
-        "opus-5.5", "sonnet-5.5", "grok-4.7"
+        "opus-5.5", "gpt-6-astra", "gpt-6.1-sol", "sonnet-5.5",
+        "opus-5", "gpt-6-sol", "gpt-6-luna", "sonnet-5",
     ]
     for m in priority_vision:
         if m in permitted and m in models_db and m not in candidates:
@@ -4534,13 +4556,16 @@ async def refresh_provider_models(notify: bool = False) -> dict:
                     entries = data.get("data", []) if isinstance(data, dict) else []
                     raw_ids = {str(item.get("id", "")).strip() for item in entries if isinstance(item, dict) and item.get("id")}
                     # IDs are embedded in Telegram callback_data (64-byte limit).
-                    ids = sorted(x for x in raw_ids if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,55}", x))
+                    ids = sorted(
+                        x for x in raw_ids
+                        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,55}", x)
+                        and x in SUPPORTED_MODEL_IDS
+                    )
                     if not ids:
-                        errors.append(f"{url}: ответ /models не содержит data[].id")
+                        errors.append(
+                            f"{url}: API не вернул ни одной модели из подтверждённого списка AgentGPT"
+                        )
                         continue
-                    for model_id in ids:
-                        if model_id not in models_db:
-                            models_db[model_id] = {"name": model_id, "premium": True, "vision": False}
                     bot_config["provider_model_ids"] = ids
                     bot_config["provider_models_checked_at"] = datetime.now().isoformat(timespec="seconds")
                     bot_config["provider_models_check_ok"] = True
@@ -6102,7 +6127,7 @@ async def run_group_auto_moderation(message: Message, group: dict) -> bool:
             premium_vision = [mid for mid in premium_vision if mid in provider_ids]
         # Наиболее дорогой класс выбирается первым; если провайдер не публикует
         # модели, используем локальный каталог, но не подменяем его дешёвой моделью.
-        preference = ["opus-5.5", "gpt-6-astra", "gpt-6.1-sol", "gemini-4-argon", "grok-4.7", "sonnet-5.5"]
+        preference = ["opus-5.5", "gpt-6-astra", "gpt-6.1-sol", "sonnet-5.5", "opus-5"]
         sticker_model = next((mid for mid in preference if mid in premium_vision), None)
         if not sticker_model:
             return False
@@ -6256,10 +6281,13 @@ def select_group_model_for_task(user: dict, group: dict, text: str) -> tuple[str
     if not selected:
         cheap_order = [
             AUTO_MODERATION_MODEL,
-            "gemini-3.5-flash-lite",
-            "deepseek-flash",
-            "deepseek-v4.1-flash-1017",
-            "gemini-3.6-flash",
+            "deepseek-v4.1-flash",
+            "fable-5.1",
+            "fable-5.2",
+            "deepseek-coder",
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "sonnet-5",
         ]
         selected = next((mid for mid in cheap_order if mid in available), None)
     if not selected:

@@ -5890,11 +5890,11 @@ def group_target_id(message: Message, args: list[str], command_name: str = "", g
         return None
     if not args:
         return None
-    raw = args[0].strip()
+    raw = args[0].strip().strip(".,;:!?)]}>")
     if raw.lstrip("@").isdigit():
         return int(raw.lstrip("@"))
     if raw.startswith("@") and group:
-        username = raw[1:].casefold()
+        username = raw[1:].strip().casefold()
         for source in (group.get("known_users", {}), group.get("user_stats", {})):
             for uid, entry in source.items():
                 if str(entry.get("username", "")).casefold() == username:
@@ -6863,6 +6863,12 @@ async def cb_group_inactive_cleanup(callback: CallbackQuery):
 
 
 GROUP_AGENT_COMMAND_RE = re.compile(r"(?m)^\s*\[\[RUN:([^]\r\n]+)\]\]\s*$")
+# Совместимость: модель иногда печатает реальную slash-команду отдельной строкой,
+# вместо служебного маркера. Разрешаем автоматически исполнять только /kick и /ban
+# с одним однозначным username/числовым ID; прочий текст командами не считается.
+GROUP_AGENT_PLAIN_MOD_COMMAND_RE = re.compile(
+    r"(?mi)^\s*(/kick|/ban)\s+(@[A-Za-z0-9_]{5,32}|[0-9]{5,20})\s*$"
+)
 
 
 async def execute_group_agent_command(message: Message, group: dict, command_text: str) -> tuple[bool, str]:
@@ -6895,6 +6901,57 @@ async def execute_group_agent_command(message: Message, group: dict, command_tex
             if prepared else
             "Запрос обработан, но список не создан: проверьте тариф «Максимум», учёт активности, права администратора и права бота."
         )
+
+    if head in ("/kick", "/ban"):
+        # Команды модерации, вызываемые самим ИИ-агентом, доступны на тарифе
+        # «Максимум» и только по прямому запросу Telegram-администратора.
+        if not group_has_feature(group, "agent_tasks") or get_group_plan(group) != "court":
+            return False, "Управление участниками через ИИ-агента доступно только на тарифе «Максимум»."
+        if not message.from_user or not await is_group_admin(message.chat.id, message.from_user.id):
+            return False, "⛔ ИИ-агент может удалять или блокировать участников только по запросу Telegram-администратора группы."
+        if not args:
+            return False, f"Укажи цель: {head} @username или {head} Telegram_ID, либо ответь на сообщение участника."
+        target_id = group_target_id(message, args, head, group)
+        if target_id is None:
+            raw_target = str(args[0]).strip().strip(".,;:!?)]}>")
+            if raw_target.startswith("@"):
+                return False, (
+                    f"Не удалось определить Telegram ID для {raw_target}. Бот может разрешить только username, "
+                    "который уже встречался в этой группе. Попросите участника написать сообщение или используйте его ID/ответ на сообщение."
+                )
+            return False, "Не удалось определить участника. Укажи Telegram ID или ответь на его сообщение."
+        if target_id == message.from_user.id:
+            return False, "Нельзя применить это действие к самому себе."
+        try:
+            target_member = await bot.get_chat_member(message.chat.id, target_id)
+        except Exception as exc:
+            return False, f"Не удалось проверить участника {target_id}: {str(exc)[:180]}"
+        if target_member.status in ("administrator", "creator"):
+            return False, "Защита сработала: ИИ-агент не может удалять или блокировать администраторов группы."
+        if not await can_group_manage_target(message.chat.id, group, message.from_user.id, target_id):
+            return False, "Недостаточно полномочий для управления этим участником."
+        if not await bot_has_group_permission(message.chat.id, "can_restrict_members"):
+            return False, "У бота нет права Telegram «Блокировать участников» (can_restrict_members)."
+        target_user = getattr(target_member, "user", None)
+        target_name = getattr(target_user, "full_name", "Участник")
+        target_username = getattr(target_user, "username", None)
+        display = f"@{target_username}" if target_username else target_name
+        try:
+            await bot.ban_chat_member(message.chat.id, target_id)
+            if head == "/kick":
+                # Kick: кратковременная блокировка с немедленной разблокировкой.
+                await bot.unban_chat_member(message.chat.id, target_id, only_if_banned=False)
+                return True, f"👢 {display} (ID {target_id}) удалён из группы. Повторный вход технически возможен по приглашению."
+            return True, f"🚫 {display} (ID {target_id}) заблокирован в группе."
+        except Exception as exc:
+            # Если kick не смог снять временный ban, пытаемся не оставлять
+            # незапланированную блокировку и сообщаем фактический результат.
+            if head == "/kick":
+                try:
+                    await bot.unban_chat_member(message.chat.id, target_id, only_if_banned=False)
+                except Exception:
+                    pass
+            return False, f"Telegram не выполнил {head} для {display}: {str(exc)[:200]}"
 
     if head == "/groupplan":
         return True, re.sub(r"<[^>]*>", "", group_plan_status_text(group))
@@ -7729,13 +7786,18 @@ async def handle_group_message(message: Message, user: dict):
         "ДОСТУПНЫЕ ИНСТРУМЕНТЫ (только эти команды разрешено вызывать через маркер [[RUN:...]]):\n"
         "1. /inactive_cleanup [дней] — подготовить список известных неактивных участников. Только тариф «Максимум», "
         "только Telegram-администратор; удаление НЕ происходит сразу, обязательно подтверждение кнопкой.\n"
-        "2. /groupplan — показать тариф и включённые функции группы.\n"
-        "3. /rules — показать правила группы.\n"
-        "4. /groupdiag — проверить реальные права бота в Telegram.\n"
-        "5. /grouphelp — показать доступные пользователям команды.\n"
-        "Когда действие нужно выполнить, добавь отдельную строку строго вида [[RUN:/inactive_cleanup 30]] "
-        "(подставь число дней при наличии) или соответствующий другой инструмент из списка. "
+        "2. /kick @username|ID — удалить одного участника из группы без постоянного бана. Только «Максимум» и запрос Telegram-администратора.\n"
+        "3. /ban @username|ID — заблокировать одного участника. Используй ТОЛЬКО если администратор прямо просит забанить/заблокировать, а не просто удалить.\n"
+        "4. /groupplan — показать тариф и включённые функции группы.\n"
+        "5. /rules — показать правила группы.\n"
+        "6. /groupdiag — проверить реальные права бота в Telegram.\n"
+        "7. /grouphelp — показать доступные пользователям команды.\n"
+        "Для удаления конкретного участника используй отдельную строку строго вида [[RUN:/kick @username]] "
+        "или [[RUN:/kick 123456789]]. Для постоянной блокировки — [[RUN:/ban @username]]. "
+        "Не пиши пользователю, что сначала «попробуешь команду»: вызови инструмент сразу.\n"
+        "Для очистки неактивных используй [[RUN:/inactive_cleanup 30]]. "
         "После вызова не говори, что действие завершено, пока результат инструмента этого не подтвердил.\n"
+        "Бот разрешает @username только если уже видел этого человека в данной группе; иначе попроси ID или ответ на сообщение.\n"
         "Нельзя выдумывать команды, подделывать результат, обходить проверки прав или применять наказания без проверки.\n"
     )
     group_prompt = (
@@ -7745,6 +7807,8 @@ async def handle_group_message(message: Message, user: dict):
         "Не утверждай, что не умеешь использовать команды: у тебя есть инструменты, перечисленные ниже. "
         "Не утверждай, что ты администратор-человек; различай права автора сообщения и права Telegram-бота. "
         "Не раскрывай личные данные, не делай выводов о личности участников. Помни, что ответ видит вся группа.\n"
+        "Если просят удалить конкретного участника, не перечисляй команды текстом и не спрашивай, какую команду выбрать: "
+        "вызови /kick через [[RUN:...]]. Если просят именно заблокировать/забанить — вызови /ban.\n"
         "Если инструмент вызван, его дополнительное пояснение должно быть коротким. Не пиши «я всё сделал», "
         "если действие только подготовлено и ждёт подтверждения.\n"
         f"{tool_catalog}"
@@ -7798,11 +7862,16 @@ async def handle_group_message(message: Message, user: dict):
         # Модель может вызвать только whitelisted-инструмент. Маркер никогда не
         # показывается как обычный текст: команда выполняется с повторной проверкой прав.
         tool_match = GROUP_AGENT_COMMAND_RE.search(answer)
+        plain_tool_match = None if tool_match else GROUP_AGENT_PLAIN_MOD_COMMAND_RE.search(answer)
         tool_was_run = False
         tool_result = ""
-        if tool_match:
-            raw_tool = tool_match.group(1).strip()
-            answer = (answer[:tool_match.start()] + answer[tool_match.end():]).strip()
+        if tool_match or plain_tool_match:
+            if tool_match:
+                raw_tool = tool_match.group(1).strip()
+                answer = (answer[:tool_match.start()] + answer[tool_match.end():]).strip()
+            else:
+                raw_tool = f"{plain_tool_match.group(1)} {plain_tool_match.group(2)}"
+                answer = (answer[:plain_tool_match.start()] + answer[plain_tool_match.end():]).strip()
             tool_was_run, tool_result = await execute_group_agent_command(message, group, raw_tool)
             if not tool_was_run:
                 answer = (answer + "\n\n" if answer else "") + tool_result

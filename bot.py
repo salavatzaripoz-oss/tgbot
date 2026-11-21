@@ -76,40 +76,75 @@ MCP_PUBLIC_URL = clean_env("MCP_PUBLIC_URL", f"http://127.0.0.1:{MCP_PORT}").rst
 _SCRIPT_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
 _DATA_FILE_SETTING = clean_env("DATA_FILE", "bot_data.json")
 _DATA_FILE_EXPLICIT = bool(os.getenv("DATA_FILE"))
+
+# Храним также список старых мест расположения БД. Это нужно, потому что
+# предыдущие версии могли сохранять bot_data.json рядом со скриптом/в CWD,
+# а новые версии используют постоянный каталог ~/.agentgpt.
+_LEGACY_DATA_PATHS = []
+for _candidate_dir in (_SCRIPT_DIRECTORY, os.getcwd()):
+    _candidate = os.path.abspath(os.path.join(_candidate_dir, os.path.basename(_DATA_FILE_SETTING)))
+    if _candidate not in _LEGACY_DATA_PATHS:
+        _LEGACY_DATA_PATHS.append(_candidate)
+
 if os.path.isabs(_DATA_FILE_SETTING):
     DATA_FILE = os.path.abspath(os.path.expanduser(_DATA_FILE_SETTING))
 elif _DATA_FILE_EXPLICIT:
     # Явно заданный относительный DATA_FILE сохраняет прежнюю семантику.
     DATA_FILE = os.path.join(_SCRIPT_DIRECTORY, _DATA_FILE_SETTING)
 else:
-    # По умолчанию база размещается вне каталога исходного .py-файла.
-    # Поэтому загрузка новой версии скрипта/переименование файла не обнуляет данные.
     _DATA_DIR_SETTING = clean_env("AGENTGPT_DATA_DIR", os.path.join(str(Path.home()), ".agentgpt"))
     _DATA_DIRECTORY = os.path.abspath(os.path.expanduser(_DATA_DIR_SETTING))
     os.makedirs(_DATA_DIRECTORY, exist_ok=True)
     DATA_FILE = os.path.join(_DATA_DIRECTORY, os.path.basename(_DATA_FILE_SETTING))
 
-    # Однократно переносим файлы старых версий, если они ещё лежат рядом со скриптом
-    # или в текущей рабочей директории. Переносится и независимый журнал токенов.
-    if not os.path.exists(DATA_FILE):
-        legacy_candidates = [
-            os.path.join(_SCRIPT_DIRECTORY, _DATA_FILE_SETTING),
-            os.path.abspath(_DATA_FILE_SETTING),
-        ]
-        legacy_source = next((
-            p for p in legacy_candidates
-            if os.path.abspath(p) != os.path.abspath(DATA_FILE)
-            and any(os.path.isfile(p + suffix) for suffix in ("", ".bak", ".usage.json"))
-        ), None)
-        if legacy_source:
+    # Не ограничиваем перенос условием "нового файла ещё нет": после неудачного
+    # первого запуска там мог появиться пустой JSON, а настоящая БД осталась
+    # рядом со старым скриптом. Выбираем наиболее содержательный источник.
+    def _db_file_score(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if not isinstance(payload, dict):
+                return (0, 0, 0, 0, 0)
+            groups = payload.get("groups_db", {}) if isinstance(payload.get("groups_db"), dict) else {}
+            users = payload.get("users_db", {}) if isinstance(payload.get("users_db"), dict) else {}
+            paid_groups = sum(1 for value in groups.values() if isinstance(value, dict) and str(value.get("plan", "free")).lower() not in ("", "free"))
+            paid_users = sum(1 for value in users.values() if isinstance(value, dict) and (value.get("is_sub") or str(value.get("plan", "free")).lower() not in ("", "free")))
+            return (paid_groups, paid_users, len(groups), len(users), os.path.getsize(path))
+        except Exception:
+            return (0, 0, 0, 0, 0)
+
+    _existing_legacy = [candidate for path in _LEGACY_DATA_PATHS
+                        for candidate in (path, path + ".bak")
+                        if os.path.abspath(candidate) != os.path.abspath(DATA_FILE)
+                        and os.path.isfile(candidate)]
+    if _existing_legacy:
+        _best_legacy = max(_existing_legacy, key=_db_file_score)
+        _target_is_readable = False
+        if os.path.isfile(DATA_FILE) and os.path.getsize(DATA_FILE) > 0:
             try:
-                for suffix in ("", ".bak", ".usage.json"):
-                    old_sidecar = legacy_source + suffix
-                    if os.path.isfile(old_sidecar):
-                        shutil.copy2(old_sidecar, DATA_FILE + suffix)
-                print(f"[DB Migration] Старые файлы базы перенесены в постоянный каталог: {DATA_FILE}")
-            except OSError as migration_exc:
-                print(f"[DB Recovery] Не удалось перенести старую базу: {migration_exc}")
+                with open(DATA_FILE, "r", encoding="utf-8") as _target_file:
+                    _target_payload = json.load(_target_file)
+                _target_is_readable = isinstance(_target_payload, dict)
+            except Exception:
+                _target_is_readable = False
+        # Существующую корректную БД не перезаписываем старым файлом:
+        # недостающие подписки и профили будут объединены позже адресно.
+        if not _target_is_readable:
+            try:
+                if _best_legacy.endswith(".bak"):
+                    shutil.copy2(_best_legacy, DATA_FILE)
+                    _legacy_base = _best_legacy[:-4]
+                    if os.path.isfile(_legacy_base + ".usage.json"):
+                        shutil.copy2(_legacy_base + ".usage.json", DATA_FILE + ".usage.json")
+                else:
+                    for _suffix in ("", ".bak", ".usage.json"):
+                        _src = _best_legacy + _suffix
+                        if os.path.isfile(_src):
+                            shutil.copy2(_src, DATA_FILE + _suffix)
+                print(f"[DB Migration] Восстановлена предыдущая БД: {_best_legacy} -> {DATA_FILE}")
+            except OSError as _migration_exc:
+                print(f"[DB Recovery] Не удалось перенести предыдущую БД: {_migration_exc}")
 DATA_BACKUP_FILE = DATA_FILE + ".bak"
 USAGE_JOURNAL_FILE = DATA_FILE + ".usage.json"
 DOTENV_FILE = os.path.join(_SCRIPT_DIRECTORY, ".env")
@@ -523,8 +558,179 @@ def _parse_saved_datetime(value, fallback=None):
         return fallback
 
 
+def _canonical_group_plan(value) -> str:
+    value = str(value or "free").strip().lower()
+    aliases = {
+        "max": "court", "maximum": "court", "максимум": "court",
+        "court": "court", "premium": "court",
+        "ai_filter": "filter", "filter_ai": "filter",
+        "protection": "shield", "strong": "storm",
+    }
+    value = aliases.get(value, value)
+    return value if value in GROUP_PLAN_CONFIG else "free"
+
+
+def _subscription_is_active(plan_value, end_value) -> bool:
+    plan = _canonical_group_plan(plan_value)
+    end = _parse_saved_datetime(end_value)
+    if plan == "free" or end is None:
+        return False
+    try:
+        # Даты из базы должны быть локальными naive datetime. При наличии timezone
+        # приводим обе стороны к naive, чтобы не получить ошибку сравнения.
+        if end.tzinfo is not None:
+            end = end.astimezone().replace(tzinfo=None)
+        return datetime.now() < end
+    except (TypeError, ValueError):
+        return False
+
+
+def merge_legacy_subscription_data():
+    """Поднимает активные тарифы из прежней БД, если новый файл создался пустым.
+
+    Не перезаписывает активный тариф в текущей базе. Переносит только платные
+    подписки, которых в текущей записи нет/они стали free при первичной миграции.
+    """
+    restored_groups = 0
+    restored_users = 0
+    candidates = []
+    for base_path in _LEGACY_DATA_PATHS:
+        for candidate in (base_path, base_path + ".bak"):
+            if os.path.abspath(candidate) == os.path.abspath(DATA_FILE) or not os.path.isfile(candidate):
+                continue
+            try:
+                with open(candidate, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                if isinstance(payload, dict):
+                    candidates.append((candidate, payload))
+            except Exception as exc:
+                print(f"[DB Recovery] Не удалось прочитать старую БД {candidate}: {exc}")
+
+    now = datetime.now()
+    for source_path, payload in candidates:
+        legacy_groups = payload.get("groups_db", {})
+        if isinstance(legacy_groups, dict):
+            for raw_chat_id, legacy_group in legacy_groups.items():
+                if not isinstance(legacy_group, dict):
+                    continue
+                old_plan = _canonical_group_plan(legacy_group.get("plan"))
+                old_end = _parse_saved_datetime(legacy_group.get("sub_end"))
+                old_active = False
+                if old_plan != "free" and old_end is not None:
+                    try:
+                        if old_end.tzinfo is not None:
+                            old_end = old_end.astimezone().replace(tzinfo=None)
+                        old_active = old_end > now
+                    except TypeError:
+                        old_active = False
+
+                chat_key = str(raw_chat_id)
+                current_group = groups_db.get(chat_key)
+                if not isinstance(current_group, dict):
+                    groups_db[chat_key] = dict(legacy_group)
+                    restored_groups += 1
+                    continue
+                if not old_active:
+                    continue
+
+                current_plan = _canonical_group_plan(current_group.get("plan"))
+                current_end = _parse_saved_datetime(current_group.get("sub_end"))
+                current_active = False
+                if current_plan != "free" and current_end is not None:
+                    try:
+                        if current_end.tzinfo is not None:
+                            current_end = current_end.astimezone().replace(tzinfo=None)
+                        current_active = current_end > now
+                    except TypeError:
+                        current_active = False
+
+                # Важная защита: активная подписка из текущей БД всегда имеет
+                # приоритет. Старый backup используется только против пустого/free
+                # профиля или записи платного плана с потерянной датой окончания.
+                if not current_active:
+                    current_group["plan"] = old_plan
+                    current_group["sub_end"] = old_end.isoformat()
+                    if not current_group.get("owner_id"):
+                        current_group["owner_id"] = legacy_group.get("owner_id")
+                    for field in ("activity_enabled", "activity_auto_migrated", "censor_enabled",
+                                  "censor_auto_default_migrated", "anti_spam_enabled",
+                                  "anti_wave_enabled", "smalltalk_enabled", "roles_enabled"):
+                        if field not in current_group and field in legacy_group:
+                            current_group[field] = legacy_group[field]
+                    restored_groups += 1
+
+        legacy_users = payload.get("users_db", {})
+        if isinstance(legacy_users, dict):
+            for raw_uid, legacy_user in legacy_users.items():
+                if not isinstance(legacy_user, dict):
+                    continue
+                old_plan = str(legacy_user.get("plan") or ("pro" if legacy_user.get("is_sub") else "free")).lower()
+                if old_plan not in PLAN_CONFIG:
+                    old_plan = "pro" if legacy_user.get("is_sub") else "free"
+                try:
+                    uid = int(raw_uid)
+                except (TypeError, ValueError):
+                    continue
+                if uid not in users_db:
+                    copied_user = dict(legacy_user)
+                    copied_user["sub_end"] = _parse_saved_datetime(copied_user.get("sub_end"))
+                    copied_user["reset_date"] = _parse_saved_datetime(
+                        copied_user.get("reset_date"), now + timedelta(days=30)
+                    )
+                    users_db[uid] = copied_user
+                    restored_users += 1
+                    continue
+                old_end = _parse_saved_datetime(legacy_user.get("sub_end"))
+                if old_plan == "free" or not legacy_user.get("is_sub", True) or old_end is None:
+                    continue
+                try:
+                    if old_end.tzinfo is not None:
+                        old_end = old_end.astimezone().replace(tzinfo=None)
+                    if old_end <= now:
+                        continue
+                except TypeError:
+                    continue
+                current_user = users_db.get(uid)
+                if not isinstance(current_user, dict):
+                    users_db[uid] = dict(legacy_user)
+                    restored_users += 1
+                    continue
+                current_plan = str(current_user.get("plan") or ("pro" if current_user.get("is_sub") else "free")).lower()
+                current_end = _parse_saved_datetime(current_user.get("sub_end"))
+                current_active = current_plan in PLAN_CONFIG and current_plan != "free" and bool(current_user.get("is_sub")) and current_end is not None
+                if current_active:
+                    try:
+                        if current_end.tzinfo is not None:
+                            current_end = current_end.astimezone().replace(tzinfo=None)
+                        current_active = current_end > now
+                    except TypeError:
+                        current_active = False
+                if not current_active:
+                    current_user["plan"] = old_plan
+                    current_user["is_sub"] = True
+                    current_user["sub_end"] = old_end
+                    # Не теряем расход клиента, если текущий файл был создан заново.
+                    current_user["tokens"] = max(
+                        int(current_user.get("tokens", 0) or 0),
+                        int(legacy_user.get("tokens", legacy_user.get("tokens_used", 0)) or 0),
+                    )
+                    current_user["tokens_total"] = max(
+                        int(current_user.get("tokens_total", 0) or 0),
+                        int(legacy_user.get("tokens_total", current_user["tokens"]) or 0),
+                    )
+                    for field in ("plan_cost_rub", "api_cost_month_rub", "api_cost_total_rub"):
+                        if field in legacy_user and not current_user.get(field):
+                            current_user[field] = legacy_user[field]
+                    restored_users += 1
+
+    if restored_groups or restored_users:
+        print(f"[DB Recovery] Восстановлены подписки из предыдущих файлов: групп={restored_groups}, пользователей={restored_users}.")
+        save_data()
+
+
 def load_data():
     global reviews_db, groups_db, spy_answers_db
+    print(f"[DB] Рабочая база данных: {DATA_FILE}")
     if not os.path.exists(DATA_FILE) and not os.path.exists(DATA_BACKUP_FILE) and not os.path.exists(USAGE_JOURNAL_FILE):
         return
 
@@ -726,6 +932,9 @@ def load_data():
                 except Exception as user_exc:
                     print(f"[DB Warning] Не удалось загрузить пользователя {uid_text}: {user_exc}")
 
+        # Восстанавливаем активные тарифы, если при обновлении была создана
+        # новая/пустая БД в другом каталоге, а старая база осталась рядом со скриптом.
+        merge_legacy_subscription_data()
         rebuild_rbx_token_index()
         # Если восстановились из .bak, сначала возвращаем её в основной файл,
         # чтобы следующий save_data не затёр рабочую копию повреждённым JSON.
@@ -2468,8 +2677,7 @@ def get_group(chat_id: int, chat_title: str = "") -> dict:
         group["role_wizards"] = {}
     if chat_title:
         group["title"] = chat_title
-    if group.get("plan") not in GROUP_PLAN_CONFIG:
-        group["plan"] = "free"
+    group["plan"] = _canonical_group_plan(group.get("plan"))
     return group
 
 
@@ -5577,10 +5785,10 @@ async def handle_admin_input(message: Message) -> bool:
 # --- ГРУППОВОЙ АГЕНТ, ПОДПИСКИ, МОДЕРАЦИЯ И КОНТЕКСТ ---
 # =========================================================================
 def get_group_plan(group: dict) -> str:
-    plan = str(group.get("plan", "free")).lower()
-    if plan not in GROUP_PLAN_CONFIG:
-        plan = "free"
+    plan = _canonical_group_plan(group.get("plan", "free"))
     sub_end = _parse_saved_datetime(group.get("sub_end"))
+    if sub_end is not None and sub_end.tzinfo is not None:
+        sub_end = sub_end.astimezone().replace(tzinfo=None)
     if plan != "free" and (sub_end is None or datetime.now() >= sub_end):
         group["plan"] = "free"
         group["sub_end"] = None
